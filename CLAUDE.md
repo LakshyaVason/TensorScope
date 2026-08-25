@@ -5,92 +5,179 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 TensorScope inspects the *exact* intermediate tensors produced during a real local LLM
-forward pass (model `gpt-oss:20b`). It has two halves that talk over HTTP/JSONL:
+forward pass, so a reader can watch an actual model answer an actual prompt. It is a
+single PyQt5 desktop app:
 
-- **`TensorScope.py`** — a PyQt5 desktop app (client). Sends a prompt, receives streamed
-  capture records, validates them, persists them to SQLite, and renders a read-only
-  "Computation Recap" (tokenization, embeddings, per-layer Q/K/V, attention scores/weights,
-  attention output, layer output, plus an attention-weight heatmap).
-- **`instrumented-llama.cpp/`** — a fork of llama.cpp. The added
-  `examples/tensorscope-runner/` builds `tensorscope-capture-runner`, a single-purpose
-  local HTTP server that runs inference and streams the real GPU tensors back.
+- **`TensorScope.py`** — loads a Hugging Face causal LM **in-process**, runs it with a
+  custom eager attention implementation plus forward hooks, persists every captured
+  tensor to SQLite, and renders a read-only "Computation Recap" (tokenization,
+  embeddings, per-layer Q/K/V before and after RoPE, attention scores/weights, attention
+  block output, layer output, plus an attention-weight heatmap).
+- **`verify_capture.py`** — loads a real model and proves the capture is faithful and
+  complete. This is the test suite that matters; `--self-test` only covers the
+  torch-free helpers.
 
-The design invariant that shapes almost everything: **no tensor is ever inferred,
-simulated, or reconstructed in Python.** Every displayed value must come from the
-instrumented runtime. The client aggressively validates this and rejects captures
-(and plain Ollama endpoints) that can't prove it.
+The design invariant that shapes everything: **no tensor is ever inferred, simulated, or
+reconstructed.** Every displayed value must be a tensor the running model actually
+produced. The client refuses to save or display a capture that cannot prove this.
+
+### History: there is no llama.cpp any more
+
+Earlier versions shipped `instrumented-llama.cpp/`, a fork whose
+`tensorscope-capture-runner` streamed tensors over HTTP/JSONL. **That fork is deleted and
+must not come back.** Requiring users to build a CUDA C++ project made the app
+undistributable as open source. PyTorch forward hooks give the same guarantee — real GPU
+tensors, no reconstruction — with `pip install -r requirements.txt`. If you find leftover
+references to `TENSORSCOPE_RUNNER_URL`, `CaptureClient`, `/v1/capture/generate`,
+`k_tensor_names`, or `gpt-oss:20b`, they are stale.
 
 ## Commands
 
-### Python client
 ```bash
-python TensorScope.py            # launch the GUI
-python TensorScope.py --self-test  # dependency-light checks for persistence + display helpers
+python -m venv .venv                                        # see requirements.txt: MUST be a venv
+./.venv/Scripts/python.exe -m pip install -r requirements.txt
+
+./.venv/Scripts/python.exe TensorScope.py                   # launch the GUI
+./.venv/Scripts/python.exe TensorScope.py --self-test       # torch-free: persistence + display helpers
+./.venv/Scripts/python.exe verify_capture.py                # real model, real capture, full assertions
+./.venv/Scripts/python.exe verify_capture.py Qwen/Qwen3-4B  # verify the default model too
 ```
-Dependencies (no requirements file at repo root — install manually): `numpy`, `requests`,
-`matplotlib`, `PyQt5`. There is no lint/test framework beyond `--self-test`.
 
-Configure the runner endpoint via env var `TENSORSCOPE_RUNNER_URL`
-(default `http://127.0.0.1:11435/v1/capture/generate`) or the URL field in the GUI.
+`verify_capture.py` defaults to `Qwen/Qwen2.5-0.5B-Instruct` because it exercises the
+mechanism cheaply. Run it against `Qwen/Qwen3-4B` as well before trusting a change: Qwen3
+adds QK-norm and a head_dim decoupled from `hidden_size / num_heads`, which has caught
+shape assumptions that the 0.5B model does not.
 
-### C++ capture runner
-Built as part of the llama.cpp CMake tree (it's registered in
-`instrumented-llama.cpp/examples/CMakeLists.txt`):
-```bash
-cd instrumented-llama.cpp
-cmake -B build -DGGML_CUDA=ON        # CUDA build; the runner is designed for GPU capture
-cmake --build build --target tensorscope-capture-runner -j
+### Environment landmines (both cost real debugging time)
 
-./build/bin/tensorscope-capture-runner --model /path/to/gpt-oss-20b.gguf \
-    --port 11435 --context-size 2048 --max-tokens 128
+- **Never install torch into an Anaconda base env.** Conda's MKL and pip's torch both
+  ship `libiomp5md.dll`, giving `OMP: Error #15`. The documented workaround
+  (`KMP_DUPLICATE_LIB_OK=TRUE`) warns it "may silently produce incorrect results", which
+  disqualifies it for a tool whose entire purpose is exact numerics. Use a venv.
+- **Blackwell / sm_120 (RTX 50-series) needs cu128 wheels.** Default PyPI torch has no
+  kernels for it. `pip install --index-url https://download.pytorch.org/whl/cu128 torch`.
+
+## How capture works
+
+`ModelCapture` (in `TensorScope.py`) installs two mechanisms:
+
+1. **A registered attention backend.** `CaptureAttention` mirrors the model file's own
+   `eager_attention_forward` line for line and keeps the pre-softmax `scores` tensor it
+   hands to softmax. Scores are not recoverable from hooks — nothing exposes them — so
+   mirroring the function is the only way, and the mirror is checked (below).
+2. **Forward hooks** on `embed_tokens`, `input_layernorm`, `q_proj`/`k_proj`/`v_proj`,
+   `o_proj`, and the decoder layer itself, for the tensors that *are* module outputs.
+   A `register_forward_pre_hook` on each `self_attn` points `CaptureAttention.sink` at
+   that layer's slot before the module runs.
+
+`attn_implementation="eager"` is mandatory. Fused/flash/SDPA kernels never materialize the
+full attention matrix, so it cannot be captured — the same reason the old llama.cpp runner
+disabled Flash Attention. Do not "optimize" this.
+
+### Registering the backend: the trap that silently corrupts every capture
+
+Register with `.register(name, fn)`, **never** `registry[name] = fn`, and register in
+*both* registries:
+
+```python
+ALL_ATTENTION_FUNCTIONS.register(name, self.attention)          # transformers.modeling_utils
+ALL_MASK_ATTENTION_FUNCTIONS.register(name, masks["eager"])     # transformers.masking_utils
 ```
-For general llama.cpp build/lint/test guidance, see `instrumented-llama.cpp/CLAUDE.md`
-and `instrumented-llama.cpp/AGENTS.md`.
 
-## Capture protocol (the contract between the two halves)
+Why: `GeneralInterface.__setitem__` writes to a per-instance `_local_mapping`, while
+`masking_utils._preprocess_mask_arguments` tests membership against the class-wide
+`_global_mapping` and treats a miss as "custom backend that needs no mask" — returning
+`None`. A `None` mask makes the eager path skip masking entirely, so **attention becomes
+bidirectional**: the model reads the future, every tensor still looks plausible, and every
+value is genuinely computed, so nothing looks wrong. This bug produced `<|im_end|>` as the
+answer to "What is the capital of France?". `_register_implementation` now asserts the name
+reached `_global_mapping` and raises if it did not.
 
-The runner replies to `POST /v1/capture/generate` with newline-delimited JSON. Health check
-is `GET /v1/capture/health`. Record `type`s the client consumes (`_consume_record` in
-`TensorScope.py`, produced in `runner::generate` in `tensorscope-runner.cpp`):
+### The three verification gates
 
-- `metadata` — must include `capture_source: "instrumented-runtime"` or the client rejects it.
-- `tokenization` — prompt `ids` + `tokens` (lengths must match).
-- `token` — one generated token (`id`, `text`); appended to the response.
-- `tensor` — `name`, optional `layer`, `phase` (`prefill` | `first_generated_token`), and
-  `data`. Tensor encodings: JSON list, `npy-zlib-base64`, or `raw-f32-base64`.
-- `complete` / `error`.
+Any one of these failing makes `RunCapture.validate()` reject the run, so a corrupt
+capture can never be saved or displayed:
 
-**Capture scope is fixed**: prompt prefill + the first generated token only. Both phases must
-cover the same layers, and every layer must carry all of `REQUIRED_LAYER_TENSORS`
-(`normalized_input, q, k, v, attention_scores, attention_weights, attention_output,
-layer_output`) plus an `embedding`. `RunCapture.validate()` enforces all of this; changing the
-captured tensor set means editing **both** `REQUIRED_LAYER_TENSORS` (Python) and
-`k_tensor_names` (C++) together.
+| Gate | Metadata key | What it catches |
+| --- | --- | --- |
+| `capture_source` | `capture_source == "pytorch-forward-hooks"` | tensors from anywhere but the real capture path |
+| Attention mirrors upstream, **on every captured call** | `faithful_to_upstream_eager`, `attention_calls_verified` | a transformers upgrade changing the eager math |
+| Prefill logits identical to stock eager, bit for bit | `logits_match_stock_eager`, `logits_max_abs_diff_vs_stock_eager == 0.0` | capture perturbing the computation at all |
 
-## How the runner captures tensors
+The last gate is the one that actually matters, and it is why the bidirectional-mask bug
+was caught rather than shipped. Faithfulness alone is not sufficient: a perfect mirror of
+the eager math fed a wrongly-built mask is still wrong, and it reported
+`faithful: True` while the answer was garbage. `_verify_undisturbed` re-runs the same
+prefill under stock `"eager"` and requires `delta == 0.0` exactly — not a tolerance.
 
-- It registers `capture_callback` as llama.cpp's `cb_eval` (`ggml` scheduler post-node hook).
-  The callback is invoked *after* the assigned backend (incl. CUDA) computes each node, so
-  values are real GPU outputs copied to host, converted to f32, and streamed as base64.
-- Tensors are matched by graph-node name: llama.cpp's `cb(tensor, "<stem>", layer)` produces
-  names like `q_projection-0`. `k_tensor_names` maps those stems to protocol names. The
-  gpt-oss graph instrumentation that emits these names lives in
-  `instrumented-llama.cpp/src/models/openai-moe.cpp` (e.g. `q_projection`, `k_projection`,
-  `attn_norm`); `split_layer_name` parses the `-<layer>` suffix.
-- **Flash Attention is deliberately disabled** (`LLAMA_FLASH_ATTN_TYPE_DISABLED`). A fused
-  flash-attention kernel never materializes the full attention matrix, so it couldn't be
-  captured. Do not "optimize" this back on.
-- The runner is **single-request-at-a-time** (a `request_mutex`), clears KV memory before and
-  after each request, and locks to `gpt-oss:20b`. Each capture is a complete, isolated forward
-  pass — concurrency would corrupt captures.
+Verification must also *cover* the run. `faithful` originally checked only layer 0's first
+call and gave a false pass; `CaptureAttention` now re-runs upstream's implementation on
+every call while a sink is attached, i.e. every layer of both captured phases.
+
+## Capture scope and tensor set
+
+Fixed scope: **prompt prefill + the first generated token.** Remaining tokens are
+generated with capture off, purely so the reader sees a complete answer.
+
+`REQUIRED_LAYER_TENSORS`: `normalized_input, q, k, v, q_attended, k_attended, v_attended,
+attention_scores, attention_weights, attention_output, layer_output` — plus an
+`embedding`. Both phases must cover the same layers and every layer must carry all of
+them; `RunCapture.validate()` enforces it.
+
+Two labeling distinctions the UI must keep honest, both of which were wrong once:
+
+- `q`/`k`/`v` are raw projection outputs, **before RoPE** (and before QK-norm). The
+  tensors that actually enter QKᵀ are `q_attended`/`k_attended`/`v_attended`, captured
+  inside the attention call, post-RoPE and post-`repeat_kv` (so GQA is already expanded).
+- `attention_output` is `o_proj`'s output — `W_o · concat(heads)`, the attention block's
+  output. It is **not** "attention × V". Calling it that was a real mislabel.
+
+If you change the captured set, update `REQUIRED_LAYER_TENSORS` and `TENSOR_LABELS`
+together; `--self-test` asserts every required tensor has a label.
+
+`MAX_CAPTURE_TOKENS = 256` bounds the prompt, because attention tensors grow with the
+square of prompt length.
+
+## Model support
+
+Default is `DEFAULT_MODEL_ID = "Qwen/Qwen3-4B"`, configurable in the GUI. Requirements for
+any model you point it at:
+
+- It must answer real prompts coherently — the point is showing how an LLM *works*, and a
+  tiny model that emits nonsense teaches nothing.
+- It must be **dense, not MoE.** `REQUIRED_LAYER_TENSORS` describes a dense
+  attention-then-MLP block; MoE routes through a router and experts between
+  `attention_output` and `layer_output`, which the tensor set does not model. This is why
+  the old `gpt-oss:20b` target is gone.
+- The model file must expose `repeat_kv` and `eager_attention_forward` at module level;
+  `CaptureAttention.__init__` raises `CaptureProtocolError` if not.
+
+Measured VRAM: Qwen2.5-0.5B ≈ 1.0 GiB, Qwen3-4B ≈ 7.6 GiB peak (bf16, 36 layers, all
+attention matrices retained). An 8B model in bf16 (~16.4 GB) does not fit 15.9 GB.
 
 ## Client architecture notes
 
-- `CaptureClient` speaks the protocol; `GenerationWorker` (a `QThread`) runs it off the Qt
-  event loop and marshals text/results/errors back via signals.
-- `RunDatabase` (SQLite, `tensorscope_runs.sqlite3`) stores runs + tensors. Generated-token
-  tensors are stored under a `first_generated_token:` name prefix and the embedding at
-  `layer_index = -1`; `load()` reverses this convention. Arrays are `np.save` + zlib blobs
-  (`array_to_blob`/`blob_to_array`) — exact dtype is preserved, never downcast.
-- `numeric_sample` / `display_matrix` sample tensors **for display only** (5×5 text preview,
-  ≤96×96 heatmap). They must never mutate or replace persisted data.
+- `ModelCapture` does the loading and capture. `LoadWorker` and `GenerationWorker`
+  (`QThread`) keep both off the Qt event loop and marshal progress/text/results/errors
+  back via signals.
+- `RunDatabase` (SQLite, `tensorscope_runs.sqlite3`) stores runs + tensors.
+  Generated-token tensors are stored under a `first_generated_token:` name prefix and the
+  embedding at `layer_index = -1`; `load()` reverses this convention. Arrays are `np.save`
+  + zlib blobs (`array_to_blob`/`blob_to_array`) — dtype is preserved exactly, never
+  downcast. `verify_capture.py` asserts a bit-exact round-trip.
+- `tensor_to_numpy` widens bf16 to float32 because numpy has no bfloat16 dtype. This is a
+  *widening* cast: lossless, and not the forbidden downcast. Everything else passes
+  through untouched.
+- `numeric_sample` / `display_matrix` sample tensors **for display only** (5×5 text
+  preview, ≤96×96 heatmap). They must never mutate or replace persisted data.
+- `LayerSection` is collapsible and builds its body lazily on first expand — a 36-layer
+  model would otherwise construct 70+ matplotlib canvases up front.
+
+### On the softmax cross-check
+
+`softmax(captured_scores)` matches `captured_weights` to ~2e-3, not exactly, and the
+tolerance is `4e-3`. That is not slop: upstream computes softmax in float32 then casts
+back to the model dtype, and bf16 has an 8-bit mantissa, so the relative step is
+2⁻⁸ ≈ 0.0039. The measured disagreement (1.9e-3) sits right where that predicts. Don't
+"fix" it by loosening further or by recomputing in float32 — the captured weights are the
+ones the model used.

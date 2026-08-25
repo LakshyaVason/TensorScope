@@ -1,0 +1,26 @@
+# TensorScope dependencies.
+#
+# IMPORTANT — install into a clean virtual environment, NOT an Anaconda base env.
+# Conda's MKL and pip's torch both bundle libiomp5md.dll, which produces
+# "OMP: Error #15". The only workaround (KMP_DUPLICATE_LIB_OK=TRUE) warns that it
+# "may silently produce incorrect results", which is disqualifying for a tool whose
+# whole purpose is exact numerics.
+#
+#   python -m venv .venv
+#   ./.venv/Scripts/python.exe -m pip install -r requirements.txt        # Windows
+#   ./.venv/bin/python -m pip install -r requirements.txt                # Linux/macOS
+#
+# NVIDIA Blackwell cards (RTX 50-series, sm_120) need CUDA 12.8 wheels; the default
+# PyPI torch build has no kernels for them. Install torch first from:
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch
+#
+# Verify your card is covered with:
+#   python -c "import torch; print(torch.cuda.get_arch_list())"
+
+torch>=2.7
+transformers>=5.0
+accelerate>=1.0
+numpy>=1.24
+matplotlib>=3.7
+PyQt5>=5.15

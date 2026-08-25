@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Matplotlib cache (kept beside the app when a user profile is locked down)
+.matplotlib/
+
+# Captured runs — these hold real tensor blobs and grow quickly
+*.sqlite3
