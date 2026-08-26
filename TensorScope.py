@@ -56,10 +56,16 @@ from PyQt5.QtWidgets import (
 )
 
 
-try:
-    from platformdirs import user_data_dir as _user_data_dir
-    DB_PATH = Path(_user_data_dir("TensorScope", "TensorScope")) / "tensorscope_runs.sqlite3"
-except ImportError:
+# In a packaged (frozen) bundle write to the OS app-data directory so the DB
+# survives app updates.  In source runs keep it beside the script so existing
+# captures are found immediately.
+if getattr(sys, "frozen", False):
+    try:
+        from platformdirs import user_data_dir as _user_data_dir
+        DB_PATH = Path(_user_data_dir("TensorScope", "TensorScope")) / "tensorscope_runs.sqlite3"
+    except ImportError:
+        DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
+else:
     DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
 
 SCHEMA_VERSION = 3
@@ -89,61 +95,182 @@ MAX_CAPTURE_TOKENS = 256
 # How many of the final scores the recap names.  The scores themselves are all kept.
 FINAL_LOGITS_TOP_K = 8
 
-# ── Design tokens ────────────────────────────────────────────────────────────────
-C_BG      = "#fafafa"   # window / panel background
-C_SURFACE = "#ffffff"   # card / input surface
-C_BORDER  = "#e2e8f0"   # subtle borders
-C_MUTED   = "#94a3b8"   # captions, hints
-C_TEXT    = "#0f172a"   # primary text
-C_TEXT2   = "#334155"   # secondary text
-C_ACCENT  = "#2563eb"   # interactive blue (hover, selected)
-C_SUCCESS = "#166534"   # verified / ready banner (kept from original)
-C_CARD_BG = "#f8fafc"   # StoryCard background (kept from original)
+# ── Design token tables ──────────────────────────────────────────────────────────
+#
+# | token          | dark        | light       | role                           |
+# |----------------|-------------|-------------|--------------------------------|
+# | bg             | #111114     | #f5f5f7     | window / page background       |
+# | sidebar_bg     | #0d0d10     | #eeeef2     | sidebar panel background       |
+# | card_bg        | #1c1c20     | #ffffff     | card / input surface           |
+# | border         | #2e2e33     | #d8d8de     | 1-px borders and dividers      |
+# | text_primary   | #f0f0f2     | #111114     | main readable text             |
+# | text_secondary | #9f9fa8     | #52525c     | secondary / label text         |
+# | text_muted     | #636370     | #8e8e9a     | captions, hints, status        |
+# | accent         | #3b82f6     | #3b82f6     | interactive blue (both modes)  |
+# | nav_active_bg  | #202028     | #dddde4     | active nav-item highlight      |
+# | success        | #16a34a     | #15803d     | verified / ready banner        |
 
-APP_QSS = f"""
-QMainWindow, QDialog, QWidget          {{ background:{C_BG}; color:{C_TEXT}; }}
-QScrollArea                            {{ border:none; background:transparent; }}
-QFrame                                 {{ border:none; }}
-#storyCard                             {{ background:{C_CARD_BG}; border:1px solid {C_BORDER};
-                                          border-radius:6px; margin-top:4px; }}
-QFrame[frameShape="5"]                 {{ border:1px solid {C_BORDER};
-                                          border-radius:4px; background:{C_SURFACE}; }}
-QPushButton                            {{ background:{C_SURFACE}; color:{C_TEXT};
-                                          border:1px solid {C_BORDER}; border-radius:4px;
-                                          padding:6px 14px; }}
-QPushButton:hover                      {{ background:#f1f5f9; border-color:{C_ACCENT}; }}
-QPushButton:pressed                    {{ background:#dbeafe; }}
-QPushButton:checked                    {{ background:{C_ACCENT}; color:white;
-                                          border-color:{C_ACCENT}; }}
-QPushButton:disabled                   {{ color:{C_MUTED}; border-color:{C_BORDER}; }}
-QPushButton#navItem                    {{ text-align:left; border:none; border-radius:4px;
-                                          padding:5px 10px; background:transparent; }}
-QPushButton#navItem:hover              {{ background:#f1f5f9; }}
-QPushButton#navItem:checked            {{ background:#eff6ff; color:{C_ACCENT};
-                                          font-weight:600; }}
-QLineEdit, QTextEdit, QComboBox        {{ background:{C_SURFACE}; border:1px solid {C_BORDER};
-                                          border-radius:4px; padding:4px 8px; }}
-QListWidget                            {{ background:{C_SURFACE}; border:1px solid {C_BORDER};
-                                          border-radius:4px; outline:none; }}
-QListWidget::item                      {{ padding:4px 8px; border-radius:3px; }}
-QListWidget::item:hover                {{ background:#f1f5f9; }}
-QListWidget::item:selected             {{ background:#eff6ff; color:{C_TEXT}; }}
-QSplitter::handle                      {{ background:{C_BORDER}; }}
-QSplitter::handle:horizontal           {{ width:1px; }}
-QLabel                                 {{ background:transparent; }}
+_TOKENS_DARK: dict = {
+    "bg":            "#111114",
+    "sidebar_bg":    "#0d0d10",
+    "card_bg":       "#1c1c20",
+    "border":        "#2e2e33",
+    "text_primary":  "#f0f0f2",
+    "text_secondary":"#9f9fa8",
+    "text_muted":    "#636370",
+    "accent":        "#3b82f6",
+    "nav_active_bg": "#202028",
+    "success":       "#16a34a",
+}
+_TOKENS_LIGHT: dict = {
+    "bg":            "#f5f5f7",
+    "sidebar_bg":    "#eeeef2",
+    "card_bg":       "#ffffff",
+    "border":        "#d8d8de",
+    "text_primary":  "#111114",
+    "text_secondary":"#52525c",
+    "text_muted":    "#8e8e9a",
+    "accent":        "#3b82f6",
+    "nav_active_bg": "#dddde4",
+    "success":       "#15803d",
+}
+# Module-level dict, replaced in __main__ after theme detection.
+TOKENS: dict = _TOKENS_DARK
+
+
+def _make_qss(T: dict) -> str:
+    return f"""
+QMainWindow, QDialog, QWidget {{
+    background: {T['bg']}; color: {T['text_primary']}; font-size: 13px;
+}}
+QScrollArea {{ border: none; background: transparent; }}
+QFrame {{ border: none; }}
+QLabel {{ background: transparent; color: {T['text_primary']}; }}
+
+/* sidebar panel */
+#sidebar {{
+    background: {T['sidebar_bg']};
+    border-right: 1px solid {T['border']};
+}}
+#logoPlaceholder {{ background: {T['text_muted']}; border-radius: 6px; }}
+
+/* sidebar nav items */
+QPushButton#sidebarNav {{
+    text-align: left; border: none; border-radius: 8px;
+    padding: 9px 12px; background: transparent;
+    color: {T['text_secondary']}; font-size: 13px;
+}}
+QPushButton#sidebarNav:hover {{ background: {T['nav_active_bg']}; color: {T['text_primary']}; }}
+QPushButton#sidebarNav:checked {{
+    background: {T['nav_active_bg']}; color: {T['text_primary']}; font-weight: 600;
+}}
+
+/* screen headers */
+#screenTitle {{ font-size: 20px; font-weight: 700; color: {T['text_primary']}; }}
+#screenSubtitle {{ font-size: 12px; color: {T['text_muted']}; margin-top: 2px; }}
+
+/* cards */
+#card {{
+    background: {T['card_bg']};
+    border: 1px solid {T['border']};
+    border-radius: 10px;
+}}
+#rowDivider {{
+    background: {T['border']}; max-height: 1px; min-height: 1px; border: none;
+}}
+#cardTitle {{ font-size: 13px; font-weight: 600; color: {T['text_primary']}; }}
+#rowLabel  {{ font-weight: 600; color: {T['text_primary']}; }}
+#rowValue  {{ color: {T['text_secondary']}; font-size: 12px; }}
+#statusLabel {{ font-size: 12px; color: {T['text_muted']}; padding-top: 2px; }}
+#emptyState  {{ color: {T['text_muted']}; font-size: 13px; padding: 32px; }}
+
+/* standard buttons */
+QPushButton {{
+    background: {T['card_bg']}; color: {T['text_primary']};
+    border: 1px solid {T['border']}; border-radius: 6px; padding: 6px 14px;
+}}
+QPushButton:hover  {{ border-color: {T['text_secondary']}; }}
+QPushButton:pressed {{ background: {T['nav_active_bg']}; }}
+QPushButton:disabled {{ color: {T['text_muted']}; border-color: {T['border']}; }}
+
+/* ghost button */
+QPushButton#ghost {{
+    background: transparent; border: 1px solid {T['border']};
+    border-radius: 6px; padding: 4px 10px;
+    color: {T['text_secondary']}; font-size: 12px;
+}}
+QPushButton#ghost:hover {{ border-color: {T['text_secondary']}; color: {T['text_primary']}; }}
+
+/* navItem buttons (ComputationRecap left panel) */
+QPushButton#navItem {{
+    text-align: left; border: none; border-radius: 6px;
+    padding: 6px 10px; background: transparent; color: {T['text_secondary']};
+}}
+QPushButton#navItem:hover   {{ background: {T['nav_active_bg']}; color: {T['text_primary']}; }}
+QPushButton#navItem:checked {{
+    background: {T['nav_active_bg']}; color: {T['text_primary']}; font-weight: 600;
+}}
+
+/* inputs */
+QLineEdit, QTextEdit, QComboBox {{
+    background: {T['card_bg']}; color: {T['text_primary']};
+    border: 1px solid {T['border']}; border-radius: 6px; padding: 5px 8px;
+    selection-background-color: {T['accent']}44;
+}}
+QLineEdit:focus, QTextEdit:focus {{ border-color: {T['accent']}; }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+
+/* list widget */
+QListWidget {{
+    background: {T['card_bg']}; border: 1px solid {T['border']};
+    border-radius: 8px; outline: none;
+}}
+QListWidget::item {{ padding: 7px 10px; border-radius: 4px; color: {T['text_primary']}; }}
+QListWidget::item:hover    {{ background: {T['nav_active_bg']}; }}
+QListWidget::item:selected {{ background: {T['nav_active_bg']}; color: {T['text_primary']}; }}
+
+/* splitter */
+QSplitter::handle {{ background: {T['border']}; }}
+QSplitter::handle:horizontal {{ width: 1px; }}
+
+/* scrollbar */
+QScrollBar:vertical {{
+    background: transparent; width: 8px; margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {T['border']}; border-radius: 4px; min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {T['text_muted']}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+
+/* story cards and StyledPanel frames */
+#storyCard {{
+    background: {T['card_bg']}; border: 1px solid {T['border']};
+    border-radius: 8px; margin-top: 4px;
+}}
+QFrame[frameShape="6"] {{
+    background: {T['card_bg']}; border: 1px solid {T['border']}; border-radius: 8px;
+}}
 """
 
-MPLSTYLE = {
-    "figure.facecolor": C_BG,
-    "axes.facecolor":   C_SURFACE,
-    "axes.edgecolor":   C_BORDER,
-    "axes.labelcolor":  C_TEXT2,
-    "xtick.color":      C_MUTED,
-    "ytick.color":      C_MUTED,
-    "text.color":       C_TEXT,
-    "axes.titlesize":   11,
-    "axes.grid":        False,
-}
+
+def _make_mplstyle(T: dict) -> dict:
+    return {
+        "figure.facecolor": T["bg"],
+        "axes.facecolor":   T["card_bg"],
+        "axes.edgecolor":   T["border"],
+        "axes.labelcolor":  T["text_secondary"],
+        "xtick.color":      T["text_muted"],
+        "ytick.color":      T["text_muted"],
+        "text.color":       T["text_primary"],
+        "axes.titlesize":   11,
+        "axes.grid":        False,
+    }
+
+
+APP_QSS  = _make_qss(TOKENS)
+MPLSTYLE = _make_mplstyle(TOKENS)
 
 
 class CaptureProtocolError(RuntimeError):
@@ -1125,7 +1252,8 @@ def tensor_card(key: str, tensor: np.ndarray, parent: QWidget | None = None) -> 
 
 def plain_section(title: str, body: str) -> QFrame:
     """The original recap's section block, unchanged, still used by full-detail mode."""
-    box = QFrame(); box.setFrameShape(QFrame.StyledPanel); layout = QVBoxLayout(box)
+    box = QFrame(); box.setObjectName("card"); box.setFrameShape(QFrame.StyledPanel)
+    layout = QVBoxLayout(box)
     label = QLabel(title); label.setStyleSheet("font-size:15px;font-weight:bold;"); layout.addWidget(label)
     text = QLabel(body); text.setTextInteractionFlags(Qt.TextSelectableByMouse); text.setWordWrap(True); layout.addWidget(text)
     return box
@@ -1145,6 +1273,7 @@ class LayerSection(QFrame):
         super().__init__(parent)
         self.layer = layer
         self.explain = explain
+        self.setObjectName("card")
         self.setFrameShape(QFrame.StyledPanel)
         self._layout = QVBoxLayout(self)
         self.toggle = QPushButton(f"▶  Layer {index}")
@@ -1376,8 +1505,10 @@ class ComputationRecap(QDialog):
             "CAPTURED FROM THE RUNNING MODEL — no tensors are inferred or simulated"
         )
         banner = QLabel(banner_text)
-        banner.setStyleSheet("background:#14532d;color:white;font-weight:bold;"
-                             "padding:9px;border-radius:0px;margin:0px;")
+        banner.setStyleSheet(
+            f"background:{TOKENS['success']};color:white;font-weight:600;"
+            "padding:9px;border-radius:0px;margin:0px;"
+        )
         root.addWidget(banner)
 
         # ── Splitter: left nav  |  right content ─────────────────────────────────
@@ -1386,6 +1517,7 @@ class ComputationRecap(QDialog):
 
         # Left panel ──────────────────────────────────────────────────────────────
         left = QWidget()
+        left.setObjectName("sidebar")
         left.setMinimumWidth(160); left.setMaximumWidth(240)
         ll = QVBoxLayout(left); ll.setContentsMargins(10, 10, 10, 10); ll.setSpacing(4)
 
@@ -1395,11 +1527,11 @@ class ComputationRecap(QDialog):
 
         model_lbl = QLabel(str(capture.metadata.get("model", "unknown")))
         model_lbl.setWordWrap(True)
-        model_lbl.setStyleSheet(f"font-size:11px;color:{C_MUTED};")
+        model_lbl.setStyleSheet(f"font-size:11px;color:{TOKENS['text_muted']};")
         ll.addWidget(model_lbl)
 
         def _sep() -> QFrame:
-            f = QFrame(); f.setFixedHeight(1); f.setStyleSheet(f"background:{C_BORDER};"); return f
+            f = QFrame(); f.setObjectName("rowDivider"); return f
 
         ll.addWidget(_sep())
 
@@ -1508,49 +1640,393 @@ class HistoryDialog(QDialog):
 
 
 class TensorScopeMainWindow(QMainWindow):
-    """Primary application UI and coordination point for capture, storage, and recap."""
-    def __init__(self) -> None:
+    """Compact utility window — fixed sidebar nav + four content screens."""
+
+    def __init__(self, start_in_browse: bool = False, db_path: Path | None = None) -> None:
         super().__init__()
-        self.database = RunDatabase()
+        self.database = RunDatabase(db_path or DB_PATH)
         self.capture_model = ModelCapture(os.getenv("TENSORSCOPE_MODEL", DEFAULT_MODEL_ID))
         self.worker: GenerationWorker | None = None
         self.loader: LoadWorker | None = None
+        self._open_recaps: list[ComputationRecap] = []
 
-        self.setWindowTitle("TensorScope"); self.resize(980, 700)
-        central = QWidget(); self.setCentralWidget(central); layout = QVBoxLayout(central)
-        title = QLabel("TensorScope"); title.setStyleSheet("font-size:27px;font-weight:bold;"); layout.addWidget(title)
-        subtitle = QLabel("Local inference with exact, captured intermediate tensors")
-        subtitle.setStyleSheet("color:#475569;"); layout.addWidget(subtitle)
+        self.setWindowTitle("TensorScope")
+        self.setMinimumWidth(640)
+        self.resize(760, 580)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        settings = QHBoxLayout(); settings.addWidget(QLabel("Model:"))
-        self.model_id = QLineEdit(self.capture_model.model_id); settings.addWidget(self.model_id)
-        self.load_button = QPushButton("Load model"); settings.addWidget(self.load_button)
-        layout.addLayout(settings)
+        # ── Sidebar ───────────────────────────────────────────────────────────
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(170)
+        sl = QVBoxLayout(sidebar)
+        sl.setContentsMargins(12, 18, 12, 18)
+        sl.setSpacing(2)
 
-        layout.addWidget(QLabel("Prompt")); self.prompt = QTextEdit()
-        self.prompt.setPlaceholderText("Ask the model something...")
-        self.prompt.setFixedHeight(125); layout.addWidget(self.prompt)
-        buttons = QHBoxLayout(); self.run_button = QPushButton("Run Model")
-        self.history_button = QPushButton("View Saved Runs")
-        self.run_button.setEnabled(False)
-        buttons.addWidget(self.run_button); buttons.addWidget(self.history_button)
-        buttons.addStretch(1); layout.addLayout(buttons)
-        layout.addWidget(QLabel("Model answer")); self.output = QTextEdit()
-        self.output.setReadOnly(True); layout.addWidget(self.output)
-        self.status = QLabel("Load a model to begin.")
-        self.status.setStyleSheet("color:#334155;"); layout.addWidget(self.status)
+        logo_row = QHBoxLayout()
+        logo = QLabel()
+        logo.setFixedSize(28, 28)
+        logo.setObjectName("logoPlaceholder")
+        logo_row.addWidget(logo)
+        logo_row.addStretch(1)
+        sl.addLayout(logo_row)
+        sl.addSpacing(20)
 
+        self._nav_btns: list[QPushButton] = []
+        for label, idx in [
+            ("▶  Live Capture", 0),
+            ("≡  Saved Runs",   1),
+            ("⚙  Settings",     2),
+            ("·  About",        3),
+        ]:
+            btn = QPushButton(label)
+            btn.setObjectName("sidebarNav")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _, i=idx: self._nav_to(i))
+            sl.addWidget(btn)
+            self._nav_btns.append(btn)
+
+        sl.addStretch(1)
+        root.addWidget(sidebar)
+
+        # ── Content screens ───────────────────────────────────────────────────
+        self.screens = QStackedWidget()
+        root.addWidget(self.screens)
+
+        def _card() -> tuple:
+            frame = QFrame(); frame.setObjectName("card")
+            fl = QVBoxLayout(frame)
+            fl.setContentsMargins(22, 16, 22, 16); fl.setSpacing(10)
+            return frame, fl
+
+        def _divider() -> QFrame:
+            line = QFrame(); line.setObjectName("rowDivider"); return line
+
+        def _screen(title: str, subtitle: str) -> tuple:
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            inner = QWidget(); scroll.setWidget(inner)
+            l = QVBoxLayout(inner)
+            l.setContentsMargins(32, 28, 32, 28); l.setSpacing(14)
+            l.setAlignment(Qt.AlignTop)
+            hdr = QWidget(); hl = QVBoxLayout(hdr)
+            hl.setContentsMargins(0, 0, 0, 4); hl.setSpacing(2)
+            t = QLabel(title); t.setObjectName("screenTitle"); hl.addWidget(t)
+            if subtitle:
+                s = QLabel(subtitle); s.setObjectName("screenSubtitle"); hl.addWidget(s)
+            l.addWidget(hdr)
+            return scroll, l
+
+        # Screen 0: Live Capture ──────────────────────────────────────────────
+        live_scr, live_l = _screen(
+            "Live Capture",
+            "Load a model in Settings, then run a prompt to capture tensors.",
+        )
+
+        ms_card, ms_cl = _card()
+        ms_row = QHBoxLayout(); ms_row.setContentsMargins(0, 0, 0, 0)
+        ms_lbl = QLabel("Model"); ms_lbl.setObjectName("rowLabel"); ms_row.addWidget(ms_lbl)
+        ms_row.addStretch(1)
+        self.live_model_status = QLabel("No model loaded")
+        self.live_model_status.setObjectName("rowValue")
+        self._goto_settings_btn = QPushButton("Open Settings →")
+        self._goto_settings_btn.setObjectName("ghost")
+        self._goto_settings_btn.clicked.connect(lambda: self._nav_to(2))
+        ms_row.addWidget(self.live_model_status)
+        ms_row.addSpacing(8); ms_row.addWidget(self._goto_settings_btn)
+        ms_cl.addLayout(ms_row)
+        live_l.addWidget(ms_card)
+
+        pr_card, pr_cl = _card()
+        pr_lbl = QLabel("Prompt"); pr_lbl.setObjectName("rowLabel"); pr_cl.addWidget(pr_lbl)
+        self.prompt = QTextEdit()
+        self.prompt.setPlaceholderText("Ask the model something…")
+        self.prompt.setFixedHeight(108); pr_cl.addWidget(self.prompt)
+        run_row = QHBoxLayout()
+        self.run_button = QPushButton("Run Capture"); self.run_button.setEnabled(False)
+        run_row.addWidget(self.run_button); run_row.addStretch(1)
+        pr_cl.addLayout(run_row)
+        live_l.addWidget(pr_card)
+
+        self._out_card, out_cl = _card()
+        out_lbl = QLabel("Response"); out_lbl.setObjectName("rowLabel"); out_cl.addWidget(out_lbl)
+        self.output = QTextEdit(); self.output.setReadOnly(True)
+        self.output.setFixedHeight(130); out_cl.addWidget(self.output)
+        self._out_card.setVisible(False)
+        live_l.addWidget(self._out_card)
+
+        self.status = QLabel("Load a model in Settings to begin.")
+        self.status.setObjectName("statusLabel"); live_l.addWidget(self.status)
+        self.screens.addWidget(live_scr)  # index 0
+
+        # Screen 1: Saved Runs ────────────────────────────────────────────────
+        runs_scr, runs_l = _screen("Saved Runs", "Browse captures without loading a model.")
+
+        self._browse_inner = QStackedWidget()
+
+        runs_list_w = QWidget()
+        rll = QVBoxLayout(runs_list_w)
+        rll.setContentsMargins(0, 0, 0, 0); rll.setSpacing(8)
+        self.runs_list = QListWidget(); rll.addWidget(self.runs_list)
+        browse_btns_row = QHBoxLayout()
+        self.open_recap_btn = QPushButton("Open Recap"); self.open_recap_btn.setEnabled(False)
+        _refresh_btn = QPushButton("Refresh")
+        browse_btns_row.addWidget(self.open_recap_btn); browse_btns_row.addWidget(_refresh_btn)
+        browse_btns_row.addStretch(1); rll.addLayout(browse_btns_row)
+        self._browse_inner.addWidget(runs_list_w)  # index 0
+
+        self._empty_label = QLabel(
+            "No saved runs yet.\n\n"
+            "Switch to Live Capture on a machine with a GPU,\n"
+            "run a prompt, then come back here to browse it.\n\n"
+            "Or pass --db /path/to/runs.sqlite3 to point at\n"
+            "an existing database."
+        )
+        self._empty_label.setAlignment(Qt.AlignCenter)
+        self._empty_label.setWordWrap(True)
+        self._empty_label.setObjectName("emptyState")
+        self._browse_inner.addWidget(self._empty_label)  # index 1
+
+        runs_l.addWidget(self._browse_inner)
+        self.browse_status = QLabel(); self.browse_status.setObjectName("statusLabel")
+        runs_l.addWidget(self.browse_status)
+        self.screens.addWidget(runs_scr)  # index 1
+
+        # Screen 2: Settings ──────────────────────────────────────────────────
+        settings_scr, settings_l = _screen("Settings", "")
+
+        mdl_card, mdl_cl = _card()
+        mdl_title = QLabel("Model"); mdl_title.setObjectName("cardTitle"); mdl_cl.addWidget(mdl_title)
+        mdl_cl.addWidget(_divider())
+        mdl_row = QHBoxLayout()
+        mdl_lbl = QLabel("Model ID"); mdl_lbl.setObjectName("rowLabel"); mdl_row.addWidget(mdl_lbl)
+        mdl_row.addStretch(1)
+        self.model_id = QLineEdit(self.capture_model.model_id)
+        self.model_id.setMinimumWidth(200); self.model_id.setMaximumWidth(300)
+        mdl_row.addWidget(self.model_id)
+        self.load_button = QPushButton("Load"); mdl_row.addWidget(self.load_button)
+        mdl_cl.addLayout(mdl_row)
+        mdl_cl.addWidget(_divider())
+        self.load_status = QLabel("No model loaded.")
+        self.load_status.setObjectName("rowValue"); mdl_cl.addWidget(self.load_status)
+        settings_l.addWidget(mdl_card)
+
+        db_card, db_cl = _card()
+        db_title = QLabel("Database"); db_title.setObjectName("cardTitle"); db_cl.addWidget(db_title)
+        db_cl.addWidget(_divider())
+        db_row = QHBoxLayout()
+        db_lbl = QLabel("Path"); db_lbl.setObjectName("rowLabel"); db_row.addWidget(db_lbl)
+        db_row.addSpacing(16)
+        db_val = QLabel(str(self.database.path))
+        db_val.setObjectName("rowValue"); db_val.setWordWrap(True)
+        db_val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        db_row.addWidget(db_val, 1); db_cl.addLayout(db_row)
+        settings_l.addWidget(db_card)
+        self.screens.addWidget(settings_scr)  # index 2
+
+        # Screen 3: About ─────────────────────────────────────────────────────
+        about_scr, about_l = _screen("About", "")
+
+        about_card, about_cl = _card()
+        about_name = QLabel("TensorScope"); about_name.setObjectName("cardTitle")
+        about_cl.addWidget(about_name); about_cl.addWidget(_divider())
+        about_body = QLabel(
+            "Inspects the exact intermediate tensors produced during a local LLM forward pass.\n\n"
+            "Every displayed value — Q, K, V, attention scores and weights, layer outputs — "
+            "is a tensor the running model actually produced. "
+            "No inference, simulation, or reconstruction."
+        )
+        about_body.setWordWrap(True); about_body.setObjectName("rowValue")
+        about_cl.addWidget(about_body)
+        about_l.addWidget(about_card); about_l.addStretch(1)
+        self.screens.addWidget(about_scr)  # index 3
+
+        # Signals ─────────────────────────────────────────────────────────────
         self.run_button.clicked.connect(self.run_model)
-        self.history_button.clicked.connect(lambda: HistoryDialog(self.database, self).exec_())
         self.load_button.clicked.connect(self.load_model)
+        self.open_recap_btn.clicked.connect(self._open_selected_run)
+        _refresh_btn.clicked.connect(self._reload_runs)
+        self.runs_list.itemDoubleClicked.connect(lambda _: self._open_selected_run())
+        self.runs_list.currentItemChanged.connect(
+            lambda item, _: self.open_recap_btn.setEnabled(item is not None)
+        )
 
-    def _say(self, message: str, colour: str = "#334155") -> None:
-        self.status.setText(message); self.status.setStyleSheet(f"color:{colour};")
+        self._reload_runs()
+        self._nav_to(1 if start_in_browse else 0)
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+
+    def _nav_to(self, index: int) -> None:
+        self.screens.setCurrentIndex(index)
+        for i, btn in enumerate(self._nav_btns):
+            btn.setChecked(i == index)
+
+    # (stub to satisfy old code paths — not a separate mode any more)
+    def _set_mode(self, _mode: str) -> None:
+        pass
+
+        self.content_stack = QStackedWidget()
+        layout.addWidget(self.content_stack)
+
+        # ── Live panel (index 0) ──────────────────────────────────────────────
+        live_panel = QWidget()
+        live_layout = QVBoxLayout(live_panel)
+        live_layout.setContentsMargins(0, 4, 0, 0)
+
+        settings = QHBoxLayout()
+        settings.addWidget(QLabel("Model:"))
+        self.model_id = QLineEdit(self.capture_model.model_id)
+        settings.addWidget(self.model_id)
+        self.load_button = QPushButton("Load model")
+        settings.addWidget(self.load_button)
+        live_layout.addLayout(settings)
+
+        live_layout.addWidget(QLabel("Prompt"))
+        self.prompt = QTextEdit()
+        self.prompt.setPlaceholderText("Ask the model something...")
+        self.prompt.setFixedHeight(125)
+        live_layout.addWidget(self.prompt)
+
+        run_row = QHBoxLayout()
+        self.run_button = QPushButton("Run Model")
+        self.run_button.setEnabled(False)
+        run_row.addWidget(self.run_button)
+        run_row.addStretch(1)
+        live_layout.addLayout(run_row)
+
+        live_layout.addWidget(QLabel("Model answer"))
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        live_layout.addWidget(self.output)
+
+        self.status = QLabel("Load a model to begin.")
+        self.status.setStyleSheet(f"color:{C_TEXT2};")
+        live_layout.addWidget(self.status)
+
+        self.content_stack.addWidget(live_panel)
+
+        # ── Browse panel (index 1) ────────────────────────────────────────────
+        browse_panel = QWidget()
+        browse_layout = QVBoxLayout(browse_panel)
+        browse_layout.setContentsMargins(0, 4, 0, 0)
+
+        self._browse_inner = QStackedWidget()
+
+        self.runs_list = QListWidget()
+        self._browse_inner.addWidget(self.runs_list)  # index 0 — populated list
+
+        self._empty_label = QLabel(
+            "No saved runs yet.\n\n"
+            "Switch to Live Mode on a machine with a GPU, run a prompt,\n"
+            "and the capture will appear here.\n\n"
+            "Or point TensorScope at an existing database:\n"
+            "  python TensorScope.py --db /path/to/runs.sqlite3"
+        )
+        self._empty_label.setAlignment(Qt.AlignCenter)
+        self._empty_label.setWordWrap(True)
+        self._empty_label.setStyleSheet(f"color:{C_MUTED};font-size:13px;padding:32px;")
+        self._browse_inner.addWidget(self._empty_label)  # index 1 — empty state
+
+        browse_layout.addWidget(self._browse_inner)
+
+        browse_buttons = QHBoxLayout()
+        self.open_recap_btn = QPushButton("Open Recap")
+        self.open_recap_btn.setEnabled(False)
+        _refresh_btn = QPushButton("Refresh")
+        browse_buttons.addWidget(self.open_recap_btn)
+        browse_buttons.addWidget(_refresh_btn)
+        browse_buttons.addStretch(1)
+        browse_layout.addLayout(browse_buttons)
+
+        self.browse_status = QLabel()
+        self.browse_status.setStyleSheet(f"color:{C_MUTED};font-size:12px;")
+        browse_layout.addWidget(self.browse_status)
+
+        self.content_stack.addWidget(browse_panel)
+
+        # Signals
+        self.run_button.clicked.connect(self.run_model)
+        self.load_button.clicked.connect(self.load_model)
+        self._live_btn.clicked.connect(lambda: self._set_mode("live"))
+        self._browse_btn.clicked.connect(lambda: self._set_mode("browse"))
+        self.open_recap_btn.clicked.connect(self._open_selected_run)
+        _refresh_btn.clicked.connect(self._reload_runs)
+        self.runs_list.itemDoubleClicked.connect(lambda _: self._open_selected_run())
+        self.runs_list.currentItemChanged.connect(
+            lambda item, _: self.open_recap_btn.setEnabled(item is not None)
+        )
+
+        self._reload_runs()
+        self._set_mode("browse" if start_in_browse else "live")
+
+    # ── Mode toggle ───────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode: str) -> None:
+        is_live = mode == "live"
+        self.content_stack.setCurrentIndex(0 if is_live else 1)
+        self._live_btn.setChecked(is_live)
+        self._browse_btn.setChecked(not is_live)
+
+    # ── Browse helpers ────────────────────────────────────────────────────────
+
+    def _reload_runs(self) -> None:
+        self.runs_list.clear()
+        rows = self.database.list_runs()
+        for row in rows:
+            ts = (row["created_at"] or "")[:16].replace("T", " ")
+            text = f"#{row['id']}  {ts}  |  {row['prompt'][:120]}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, row["id"])
+            self.runs_list.addItem(item)
+        n = len(rows)
+        self._browse_inner.setCurrentIndex(0 if n > 0 else 1)
+        self.open_recap_btn.setEnabled(False)
+        if n > 0:
+            self.browse_status.setText(
+                f"{n} saved run{'s' if n != 1 else ''}  ·  {self.database.path}"
+            )
+        else:
+            self.browse_status.setText(f"Database: {self.database.path}")
+
+    def _open_selected_run(self) -> None:
+        item = self.runs_list.currentItem()
+        if not item:
+            return
+        try:
+            run_id = item.data(Qt.UserRole)
+            recap = ComputationRecap(self.database.load(run_id), run_id, self)
+            self._open_recaps.append(recap)
+            recap.finished.connect(
+                lambda: self._open_recaps.remove(recap) if recap in self._open_recaps else None
+            )
+            recap.show()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot open run", str(exc))
+
+    # ── Live Capture helpers ──────────────────────────────────────────────────
+
+    def _say(self, message: str, colour: str | None = None) -> None:
+        col = colour or TOKENS["text_muted"]
+        self.status.setText(message)
+        self.status.setStyleSheet(f"color:{col};font-size:12px;padding-top:2px;")
+        self.load_status.setText(message)
+        self.load_status.setStyleSheet(f"color:{col};font-size:12px;")
+
+    def _set_live_model_label(self, text: str, loaded: bool = False) -> None:
+        self.live_model_status.setText(text)
+        col = TOKENS["accent"] if loaded else TOKENS["text_muted"]
+        self.live_model_status.setStyleSheet(f"color:{col};font-size:12px;")
+        self._goto_settings_btn.setVisible(not loaded)
 
     def load_model(self) -> None:
         wanted = self.model_id.text().strip()
         if not wanted:
-            QMessageBox.information(self, "Model required", "Enter a Hugging Face model id."); return
+            QMessageBox.information(self, "Model required", "Enter a Hugging Face model id.")
+            return
         try:
             import torch
             if torch.cuda.is_available():
@@ -1560,38 +2036,46 @@ class TensorScopeMainWindow(QMainWindow):
                         self, "VRAM warning",
                         f"Your GPU has ~{total_gb:.1f} GB VRAM.\n"
                         "Qwen3-4B needs ~7.6 GB peak (bf16).  "
-                        "Consider using Qwen/Qwen2.5-0.5B-Instruct instead, "
-                        "or set a smaller model id above.",
+                        "Consider Qwen/Qwen2.5-0.5B-Instruct instead.",
                     )
         except ImportError:
             pass
         self.capture_model = ModelCapture(wanted)
-        self.load_button.setEnabled(False); self.run_button.setEnabled(False)
-        self._say("Loading model...", "#1d4ed8")
+        self.load_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self._say("Loading model…", TOKENS["accent"])
+        self._set_live_model_label("Loading…")
         self.loader = LoadWorker(self.capture_model)
-        self.loader.progress.connect(lambda message: self._say(message, "#1d4ed8"))
+        self.loader.progress.connect(lambda msg: self._say(msg, TOKENS["accent"]))
         self.loader.loaded.connect(self.model_ready)
         self.loader.failed.connect(self.load_failed)
         self.loader.start()
 
     def model_ready(self, description: str) -> None:
-        self.load_button.setEnabled(True); self.run_button.setEnabled(True)
-        self._say(f"Ready — {description}", "#166534")
+        self.load_button.setEnabled(True)
+        self.run_button.setEnabled(True)
+        self._say(f"Ready — {description}", TOKENS["success"])
+        self._set_live_model_label(self.capture_model.model_id, loaded=True)
 
     def load_failed(self, message: str) -> None:
         self.load_button.setEnabled(True)
-        self._say("Model could not be loaded.", "#b91c1c")
+        self._say("Model could not be loaded.", "#dc2626")
+        self._set_live_model_label("Load failed")
         QMessageBox.critical(self, "Model load failed", message)
 
     def run_model(self) -> None:
-        prompt = self.prompt.toPlainText().strip()
-        if not prompt:
-            QMessageBox.information(self, "Prompt required", "Enter a prompt before running the model."); return
+        prompt_text = self.prompt.toPlainText().strip()
+        if not prompt_text:
+            QMessageBox.information(self, "Prompt required", "Enter a prompt before running.")
+            return
         if not self.capture_model.loaded:
-            QMessageBox.information(self, "Model required", "Load a model first."); return
-        self.output.clear(); self.run_button.setEnabled(False)
-        self._say("Running the forward pass and capturing tensors...", "#1d4ed8")
-        self.worker = GenerationWorker(self.capture_model, prompt)
+            QMessageBox.information(self, "Model required", "Load a model in Settings first.")
+            return
+        self.output.clear()
+        self._out_card.setVisible(True)
+        self.run_button.setEnabled(False)
+        self._say("Running the forward pass and capturing tensors…", TOKENS["accent"])
+        self.worker = GenerationWorker(self.capture_model, prompt_text)
         self.worker.text_received.connect(self.output.insertPlainText)
         self.worker.finished_capture.connect(self.persist_and_show)
         self.worker.failed.connect(self.run_failed)
@@ -1600,83 +2084,25 @@ class TensorScopeMainWindow(QMainWindow):
     def persist_and_show(self, capture: RunCapture) -> None:
         try:
             run_id = self.database.save(capture)
-            self._say(f"Saved exact capture as run #{run_id}.", "#166534")
-            ComputationRecap(capture, run_id, self).exec_()
+            self._say(f"Saved exact capture as run #{run_id}.", TOKENS["success"])
+            recap = ComputationRecap(capture, run_id, self)
+            self._open_recaps.append(recap)
+            recap.finished.connect(
+                lambda: self._open_recaps.remove(recap) if recap in self._open_recaps else None
+            )
+            recap.show()
+            self._reload_runs()
         except Exception as exc:
-            self._say("Generation completed but the capture could not be saved.", "#b91c1c")
+            self._say("Generation completed but the capture could not be saved.", "#dc2626")
             QMessageBox.critical(self, "Database error", str(exc))
         finally:
             self.run_button.setEnabled(True)
 
     def run_failed(self, message: str) -> None:
         self.run_button.setEnabled(True)
-        self._say("Run failed: an exact capture was not available.", "#b91c1c")
+        self._say("Run failed: an exact capture was not available.", "#dc2626")
         QMessageBox.critical(self, "Capture failed", message)
 
-
-class DemoMainWindow(QMainWindow):
-    """Browse and open saved TensorScope runs without loading a model.
-
-    Requires only numpy, matplotlib, and PyQt5 — torch and transformers are not
-    imported in this path.  Use --demo or run in an environment without torch.
-    """
-
-    def __init__(self, db_path: Path = DB_PATH) -> None:
-        super().__init__()
-        self.database = RunDatabase(db_path)
-        self._open_recaps: list[ComputationRecap] = []  # prevent GC of non-modal windows
-
-        self.setWindowTitle("TensorScope — Browse Runs")
-        self.resize(720, 520)
-        central = QWidget(); self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-
-        title = QLabel("TensorScope"); title.setStyleSheet("font-size:27px;font-weight:bold;")
-        layout.addWidget(title)
-        subtitle = QLabel("Browse saved captures (demo mode — no model required)")
-        subtitle.setStyleSheet("color:#475569;"); layout.addWidget(subtitle)
-
-        self.runs = QListWidget(); layout.addWidget(self.runs)
-
-        buttons = QHBoxLayout()
-        self.open_button = QPushButton("Open Recap")
-        refresh_button = QPushButton("Refresh")
-        buttons.addWidget(self.open_button); buttons.addWidget(refresh_button)
-        buttons.addStretch(1); layout.addLayout(buttons)
-
-        self.status_label = QLabel(); self.status_label.setStyleSheet("color:#475569;")
-        layout.addWidget(self.status_label)
-
-        self.open_button.clicked.connect(self.open_selected)
-        refresh_button.clicked.connect(self.reload)
-        self.runs.itemDoubleClicked.connect(lambda _: self.open_selected())
-        self.reload()
-
-    def reload(self) -> None:
-        self.runs.clear()
-        rows = self.database.list_runs()
-        for row in rows:
-            ts = (row["created_at"] or "")[:16].replace("T", " ")
-            text = f"#{row['id']}  {ts}  |  {row['prompt'][:120]}"
-            item = QListWidgetItem(text); item.setData(Qt.UserRole, row["id"])
-            self.runs.addItem(item)
-        n = len(rows)
-        self.status_label.setText(f"{n} saved run{'s' if n != 1 else ''}  ·  {self.database.path}")
-        self.open_button.setEnabled(n > 0)
-
-    def open_selected(self) -> None:
-        item = self.runs.currentItem()
-        if not item:
-            return
-        try:
-            run_id = item.data(Qt.UserRole)
-            recap = ComputationRecap(self.database.load(run_id), run_id, self)
-            self._open_recaps.append(recap)
-            recap.finished.connect(lambda: self._open_recaps.remove(recap)
-                                   if recap in self._open_recaps else None)
-            recap.show()
-        except Exception as exc:
-            QMessageBox.critical(self, "Cannot open run", str(exc))
 
 
 def self_test() -> None:
@@ -1777,7 +2203,7 @@ if __name__ == "__main__":
         if not demo_mode:
             try:
                 import torch as _torch_probe  # noqa: F401 — probe only, not used here
-            except ImportError:
+            except Exception:
                 demo_mode = True
 
         db_path: Path | None = None
@@ -1786,17 +2212,26 @@ if __name__ == "__main__":
             if idx + 1 < len(sys.argv):
                 db_path = Path(sys.argv[idx + 1])
 
-        import matplotlib
-        matplotlib.rcParams.update(MPLSTYLE)
-
         from PyQt5.QtGui import QFont
         application = QApplication(sys.argv)
-        application.setStyleSheet(APP_QSS)
+
+        # Detect system theme from the palette before any widgets are built.
+        # Direct assignment at module level updates TOKENS so every widget
+        # __init__ that references TOKENS[...] picks up the right theme.
+        _lum = application.palette().window().color().lightness()
+        TOKENS = _TOKENS_DARK if _lum < 128 else _TOKENS_LIGHT
+        _qss = _make_qss(TOKENS)
+        _mpl = _make_mplstyle(TOKENS)
+
+        import matplotlib
+        matplotlib.rcParams.update(_mpl)
+
+        application.setStyleSheet(_qss)
         application.setFont(QFont("Segoe UI", 10))
 
-        if demo_mode:
-            window: QMainWindow = DemoMainWindow(**({"db_path": db_path} if db_path else {}))
-        else:
-            window = TensorScopeMainWindow()
+        window = TensorScopeMainWindow(
+            start_in_browse=demo_mode,
+            **({"db_path": db_path} if db_path else {}),
+        )
         window.show()
         sys.exit(application.exec_())
