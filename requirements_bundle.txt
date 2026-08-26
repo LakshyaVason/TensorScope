@@ -1,0 +1,12 @@
+# TensorScope bundled-app dependencies (CPU-only torch for the distributable installer).
+#
+# GPU users: after installing the packaged app, replace torch with a CUDA build:
+#   See INSTALL_GPU.md for platform-specific instructions.
+
+torch>=2.7
+transformers>=5.0
+accelerate>=1.0
+numpy>=1.24
+matplotlib>=3.7
+PyQt5>=5.15
+platformdirs>=4.0

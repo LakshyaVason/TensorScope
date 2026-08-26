@@ -1,0 +1,66 @@
+name: Build and release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: dist/TensorScope
+            name: TensorScope-windows
+          - os: macos-latest
+            artifact: dist/TensorScope
+            name: TensorScope-macos
+          - os: ubuntu-latest
+            artifact: dist/TensorScope
+            name: TensorScope-linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements_bundle.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller build/tensorscope.spec --distpath dist --workpath build/work
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip each platform build
+        run: |
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            zip -r "artifacts/${name}.zip" "$dir"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true

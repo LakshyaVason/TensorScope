@@ -1,0 +1,13 @@
+# TensorScope demo-mode dependencies — browse saved runs without a GPU or model.
+#
+# Demo mode loads runs from tensorscope_runs.sqlite3 and renders them through the
+# same ComputationRecap display pipeline a live run uses, but needs no model weights
+# and never imports torch or transformers.
+#
+#   python -m venv .venv-demo
+#   ./.venv-demo/Scripts/python.exe -m pip install -r requirements_demo.txt
+#   ./.venv-demo/Scripts/python.exe TensorScope.py --demo
+
+numpy>=1.24
+matplotlib>=3.7
+PyQt5>=5.15

@@ -50,13 +50,18 @@ from matplotlib.figure import Figure
 from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QSplitter, QStackedWidget, QTextEdit, QVBoxLayout,
     QWidget,
 )
 
 
-DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
+try:
+    from platformdirs import user_data_dir as _user_data_dir
+    DB_PATH = Path(_user_data_dir("TensorScope", "TensorScope")) / "tensorscope_runs.sqlite3"
+except ImportError:
+    DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
+
 SCHEMA_VERSION = 3
 CAPTURE_SOURCE = "pytorch-forward-hooks"
 
@@ -83,6 +88,62 @@ MAX_CAPTURE_TOKENS = 256
 
 # How many of the final scores the recap names.  The scores themselves are all kept.
 FINAL_LOGITS_TOP_K = 8
+
+# ── Design tokens ────────────────────────────────────────────────────────────────
+C_BG      = "#fafafa"   # window / panel background
+C_SURFACE = "#ffffff"   # card / input surface
+C_BORDER  = "#e2e8f0"   # subtle borders
+C_MUTED   = "#94a3b8"   # captions, hints
+C_TEXT    = "#0f172a"   # primary text
+C_TEXT2   = "#334155"   # secondary text
+C_ACCENT  = "#2563eb"   # interactive blue (hover, selected)
+C_SUCCESS = "#166534"   # verified / ready banner (kept from original)
+C_CARD_BG = "#f8fafc"   # StoryCard background (kept from original)
+
+APP_QSS = f"""
+QMainWindow, QDialog, QWidget          {{ background:{C_BG}; color:{C_TEXT}; }}
+QScrollArea                            {{ border:none; background:transparent; }}
+QFrame                                 {{ border:none; }}
+#storyCard                             {{ background:{C_CARD_BG}; border:1px solid {C_BORDER};
+                                          border-radius:6px; margin-top:4px; }}
+QFrame[frameShape="5"]                 {{ border:1px solid {C_BORDER};
+                                          border-radius:4px; background:{C_SURFACE}; }}
+QPushButton                            {{ background:{C_SURFACE}; color:{C_TEXT};
+                                          border:1px solid {C_BORDER}; border-radius:4px;
+                                          padding:6px 14px; }}
+QPushButton:hover                      {{ background:#f1f5f9; border-color:{C_ACCENT}; }}
+QPushButton:pressed                    {{ background:#dbeafe; }}
+QPushButton:checked                    {{ background:{C_ACCENT}; color:white;
+                                          border-color:{C_ACCENT}; }}
+QPushButton:disabled                   {{ color:{C_MUTED}; border-color:{C_BORDER}; }}
+QPushButton#navItem                    {{ text-align:left; border:none; border-radius:4px;
+                                          padding:5px 10px; background:transparent; }}
+QPushButton#navItem:hover              {{ background:#f1f5f9; }}
+QPushButton#navItem:checked            {{ background:#eff6ff; color:{C_ACCENT};
+                                          font-weight:600; }}
+QLineEdit, QTextEdit, QComboBox        {{ background:{C_SURFACE}; border:1px solid {C_BORDER};
+                                          border-radius:4px; padding:4px 8px; }}
+QListWidget                            {{ background:{C_SURFACE}; border:1px solid {C_BORDER};
+                                          border-radius:4px; outline:none; }}
+QListWidget::item                      {{ padding:4px 8px; border-radius:3px; }}
+QListWidget::item:hover                {{ background:#f1f5f9; }}
+QListWidget::item:selected             {{ background:#eff6ff; color:{C_TEXT}; }}
+QSplitter::handle                      {{ background:{C_BORDER}; }}
+QSplitter::handle:horizontal           {{ width:1px; }}
+QLabel                                 {{ background:transparent; }}
+"""
+
+MPLSTYLE = {
+    "figure.facecolor": C_BG,
+    "axes.facecolor":   C_SURFACE,
+    "axes.edgecolor":   C_BORDER,
+    "axes.labelcolor":  C_TEXT2,
+    "xtick.color":      C_MUTED,
+    "ytick.color":      C_MUTED,
+    "text.color":       C_TEXT,
+    "axes.titlesize":   11,
+    "axes.grid":        False,
+}
 
 
 class CaptureProtocolError(RuntimeError):
@@ -635,6 +696,7 @@ class RunDatabase:
         return connection
 
     def _setup(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as db:
             db.executescript("""
                 PRAGMA foreign_keys = ON;
@@ -1013,13 +1075,13 @@ class StoryCard(QFrame):
         title = QLabel(heading)
         title.setTextFormat(Qt.RichText)
         title.setWordWrap(True)
-        title.setStyleSheet("font-size:16px;font-weight:bold;color:#0f172a;border:none;")
+        title.setStyleSheet("font-size:16px;font-weight:bold;")
         self._layout.addWidget(title)
         if plain:
             body = QLabel(plain)
             body.setTextFormat(Qt.RichText)
             body.setWordWrap(True)
-            body.setStyleSheet("font-size:14px;color:#334155;border:none;")
+            body.setStyleSheet("font-size:14px;color:#334155;")
             body.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self._layout.addWidget(body)
 
@@ -1038,7 +1100,6 @@ class StoryCard(QFrame):
         label = QLabel(f"<pre>{html.escape(text)}</pre>")
         label.setTextFormat(Qt.RichText)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setStyleSheet("color:#1e293b;border:none;")
         return self.add(label)
 
     def add_prose(self, fields: list[tuple[str, str]]) -> QLabel:
@@ -1048,7 +1109,6 @@ class StoryCard(QFrame):
         label.setTextFormat(Qt.RichText)
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setStyleSheet("color:#1e293b;border:none;")
         return self.add(label)
 
 
@@ -1125,12 +1185,10 @@ class LayerSection(QFrame):
 
 
 class StoryView(QWidget):
-    """The guided walkthrough: one narrated trip through the prompt-prefill forward pass.
+    """The guided walkthrough: one stage at a time, driven by the left navigation panel.
 
-    Scope is the prefill pass, which is the one with a whole prompt to attend over; the
-    closing stage explains that the generated-token pass re-runs the same stack, and points
-    at full detail for it.  Only the layer currently being narrated is ever built, so this
-    opens as fast as the collapsed detail view.
+    Scope is the prefill pass.  The closing stage explains that the generated-token pass
+    re-runs the same stack, and points at full detail for it.
     """
 
     def __init__(self, capture: RunCapture, parent: QWidget | None = None) -> None:
@@ -1138,18 +1196,55 @@ class StoryView(QWidget):
         self.capture = capture
         self.facts = story_facts(capture)
         self.layer_section: LayerSection | None = None
+        self._stage_widget: QWidget | None = None
+        self._stage_key: str = ""
+        self._on_stage_change: Callable[[str], None] | None = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._opening())
-        layout.addWidget(self._tokenization())
-        layout.addWidget(self._embedding())
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._stage_layout = QVBoxLayout()
+        outer.addLayout(self._stage_layout)
+        outer.addStretch(1)
+        self.go_to("prompt")
 
+    def go_to(self, key: str) -> None:
+        """Replace the visible stage with the one identified by key."""
+        if self._stage_widget is not None:
+            self._stage_widget.setParent(None)
+            self._stage_widget.deleteLater()
+            self._stage_widget = None
+            self.layer_section = None  # was a child of the old stage widget
+        widget = self._build_stage(key)
+        self._stage_key = key
+        self._stage_widget = widget
+        self._stage_layout.addWidget(widget)
+        if self._on_stage_change:
+            self._on_stage_change(key)
+
+    def _build_stage(self, key: str) -> QWidget:
+        if key == "prompt":
+            return self._opening()
+        if key == "tokenization":
+            return self._tokenization()
+        if key == "embedding":
+            return self._embedding()
+        if key == "layers":
+            return self._layers_stage()
+        if key == "logits":
+            return self._word_choice()
+        if key == "coda":
+            return self._card("coda")
+        return self._card(key)
+
+    def _layers_stage(self) -> QWidget:
+        """A container holding the layers narrative card, layer picker, and LayerSection."""
+        container = QWidget()
+        layout = QVBoxLayout(container); layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._card("layers"))
         picker_row = QHBoxLayout()
         picker_row.addWidget(QLabel("Narrate:"))
         self.picker = QComboBox()
-        for index in sorted(capture.layers):
+        for index in sorted(self.capture.layers):
             self.picker.addItem(f"Layer {index}", index)
         self.picker.currentIndexChanged.connect(self._layer_changed)
         picker_row.addWidget(self.picker)
@@ -1157,11 +1252,8 @@ class StoryView(QWidget):
         layout.addLayout(picker_row)
         self.layer_host = QVBoxLayout()
         layout.addLayout(self.layer_host)
-        self._show_layer(sorted(capture.layers)[0])
-
-        layout.addWidget(self._word_choice())
-        layout.addWidget(self._card("coda"))
-        layout.addStretch(1)
+        self._show_layer(sorted(self.capture.layers)[0])
+        return container
 
     def _card(self, key: str) -> StoryCard:
         stage = STORY_STAGE_INDEX[key]
@@ -1266,9 +1358,8 @@ class DetailView(QWidget):
 class ComputationRecap(QDialog):
     """Read-only view of one persisted or just-captured real forward pass, in two modes.
 
-    Story mode leads, because the previous default -- 72 collapsed layers and no framing --
-    showed a first-time reader math before it showed them meaning.  Full detail is the same
-    exhaustive view as before, one click away.  Banner and provenance are shared by both.
+    A left navigation panel drives stage-by-stage story mode; full detail shows the
+    exhaustive layer list on demand.  Banner is shared by both.
     """
     def __init__(self, capture: RunCapture, run_id: int | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1276,25 +1367,67 @@ class ComputationRecap(QDialog):
         self.setWindowTitle("TensorScope — Computation Recap")
         self.resize(1100, 800)
         root = QVBoxLayout(self)
-        banner = QLabel("CAPTURED FROM THE RUNNING MODEL — no tensors are inferred or simulated")
-        banner.setStyleSheet("background:#14532d;color:white;font-weight:bold;padding:9px;border-radius:4px;")
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        banner_text = (
+            f"SAVED RUN #{run_id} — real captured data, loaded from disk"
+            if run_id is not None else
+            "CAPTURED FROM THE RUNNING MODEL — no tensors are inferred or simulated"
+        )
+        banner = QLabel(banner_text)
+        banner.setStyleSheet("background:#14532d;color:white;font-weight:bold;"
+                             "padding:9px;border-radius:0px;margin:0px;")
         root.addWidget(banner)
 
-        modes = QHBoxLayout()
+        # ── Splitter: left nav  |  right content ─────────────────────────────────
+        body = QSplitter(Qt.Horizontal)
+        root.addWidget(body)
+
+        # Left panel ──────────────────────────────────────────────────────────────
+        left = QWidget()
+        left.setMinimumWidth(160); left.setMaximumWidth(240)
+        ll = QVBoxLayout(left); ll.setContentsMargins(10, 10, 10, 10); ll.setSpacing(4)
+
+        run_lbl = QLabel(f"Run #{run_id}" if run_id else "Current run")
+        run_lbl.setStyleSheet("font-size:14px;font-weight:600;")
+        ll.addWidget(run_lbl)
+
+        model_lbl = QLabel(str(capture.metadata.get("model", "unknown")))
+        model_lbl.setWordWrap(True)
+        model_lbl.setStyleSheet(f"font-size:11px;color:{C_MUTED};")
+        ll.addWidget(model_lbl)
+
+        def _sep() -> QFrame:
+            f = QFrame(); f.setFixedHeight(1); f.setStyleSheet(f"background:{C_BORDER};"); return f
+
+        ll.addWidget(_sep())
+
         self.story_button = QPushButton("Guided walkthrough")
-        self.detail_button = QPushButton(f"Full detail — all {len(capture.layers)} layers")
-        for button in (self.story_button, self.detail_button):
-            button.setCheckable(True)
-            button.setStyleSheet("padding:7px 14px;font-weight:bold;")
-            modes.addWidget(button)
-        modes.addStretch(1)
-        root.addLayout(modes)
+        self.story_button.setObjectName("navItem"); self.story_button.setCheckable(True)
+        self.detail_button = QPushButton(f"Full detail  ({len(capture.layers)} layers)")
+        self.detail_button.setObjectName("navItem"); self.detail_button.setCheckable(True)
+        ll.addWidget(self.story_button); ll.addWidget(self.detail_button)
 
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); root.addWidget(scroll)
-        content = QWidget(); layout = QVBoxLayout(content); scroll.setWidget(content)
+        ll.addWidget(_sep())
 
-        title = QLabel(f"Run #{run_id}" if run_id else "Current run")
-        title.setStyleSheet("font-size:20px;font-weight:bold;"); layout.addWidget(title)
+        self._nav_container = QWidget()
+        nl = QVBoxLayout(self._nav_container); nl.setContentsMargins(0, 0, 0, 0); nl.setSpacing(2)
+        self._nav_buttons: dict[str, QPushButton] = {}
+        for key, label in [("prompt", "Overview"), ("tokenization", "Tokenization"),
+                            ("embedding", "Embedding"), ("layers", "Layers"),
+                            ("logits", "Word Choice"), ("coda", "Coda")]:
+            btn = QPushButton(label); btn.setObjectName("navItem"); btn.setCheckable(True)
+            btn.clicked.connect(lambda _, k=key: self._nav_to(k))
+            nl.addWidget(btn); self._nav_buttons[key] = btn
+        ll.addWidget(self._nav_container)
+        ll.addStretch(1)
+        body.addWidget(left)
+
+        # Right panel ─────────────────────────────────────────────────────────────
+        right_scroll = QScrollArea(); right_scroll.setWidgetResizable(True)
+        rc = QWidget(); rl = QVBoxLayout(rc); right_scroll.setWidget(rc)
+
         info = QFormLayout()
         info.addRow("Model", QLabel(str(capture.metadata.get("model", "unknown"))))
         info.addRow("Backend / GPU", QLabel(str(capture.metadata.get("backend", "unknown"))))
@@ -1304,30 +1437,46 @@ class ComputationRecap(QDialog):
         info.addRow("Attention verified", QLabel(
             "bitwise identical to upstream eager_attention_forward"
             if capture.metadata.get("faithful_to_upstream_eager") else "NOT VERIFIED"))
-        layout.addLayout(info)
+        rl.addLayout(info)
 
+        self.story_view = StoryView(capture, rc)
+        self.story_view._on_stage_change = self._on_story_stage_change
         self.stack = QStackedWidget()
-        self.stack.addWidget(StoryView(capture, content))
+        self.stack.addWidget(self.story_view)
         self.detail: DetailView | None = None
-        layout.addWidget(self.stack)
-        layout.addStretch(1)
+        rl.addWidget(self.stack)
+        rl.addStretch(1)
+        body.addWidget(right_scroll)
+
+        body.setStretchFactor(0, 0); body.setStretchFactor(1, 1)
+        body.setSizes([200, 900])
 
         self.story_button.clicked.connect(self._show_story)
         self.detail_button.clicked.connect(self._show_detail)
         self._show_story()
 
+    def _nav_to(self, key: str) -> None:
+        self._show_story()
+        self.story_view.go_to(key)
+
+    def _on_story_stage_change(self, key: str) -> None:
+        for k, btn in self._nav_buttons.items():
+            btn.setChecked(k == key)
+
     def _show_story(self) -> None:
         self.stack.setCurrentIndex(0)
         self.story_button.setChecked(True)
         self.detail_button.setChecked(False)
+        self._nav_container.setVisible(True)
 
     def _show_detail(self) -> None:
-        if self.detail is None:  # built on first use, like LayerSection bodies
+        if self.detail is None:
             self.detail = DetailView(self.capture, self.stack)
             self.stack.addWidget(self.detail)
         self.stack.setCurrentWidget(self.detail)
         self.story_button.setChecked(False)
         self.detail_button.setChecked(True)
+        self._nav_container.setVisible(False)
 
 
 class HistoryDialog(QDialog):
@@ -1345,7 +1494,6 @@ class HistoryDialog(QDialog):
         self.runs.clear()
         for row in self.database.list_runs():
             item_text = f"#{row['id']}  {row['created_at']}\nPrompt: {row['prompt'][:160]}\nResponse: {row['response'][:160]}"
-            from PyQt5.QtWidgets import QListWidgetItem
             item = QListWidgetItem(item_text); item.setData(Qt.UserRole, row["id"]); self.runs.addItem(item)
 
     def open_selected(self) -> None:
@@ -1403,6 +1551,20 @@ class TensorScopeMainWindow(QMainWindow):
         wanted = self.model_id.text().strip()
         if not wanted:
             QMessageBox.information(self, "Model required", "Enter a Hugging Face model id."); return
+        try:
+            import torch
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if total_gb < 8.0:
+                    QMessageBox.warning(
+                        self, "VRAM warning",
+                        f"Your GPU has ~{total_gb:.1f} GB VRAM.\n"
+                        "Qwen3-4B needs ~7.6 GB peak (bf16).  "
+                        "Consider using Qwen/Qwen2.5-0.5B-Instruct instead, "
+                        "or set a smaller model id above.",
+                    )
+        except ImportError:
+            pass
         self.capture_model = ModelCapture(wanted)
         self.load_button.setEnabled(False); self.run_button.setEnabled(False)
         self._say("Loading model...", "#1d4ed8")
@@ -1450,6 +1612,71 @@ class TensorScopeMainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self._say("Run failed: an exact capture was not available.", "#b91c1c")
         QMessageBox.critical(self, "Capture failed", message)
+
+
+class DemoMainWindow(QMainWindow):
+    """Browse and open saved TensorScope runs without loading a model.
+
+    Requires only numpy, matplotlib, and PyQt5 — torch and transformers are not
+    imported in this path.  Use --demo or run in an environment without torch.
+    """
+
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        super().__init__()
+        self.database = RunDatabase(db_path)
+        self._open_recaps: list[ComputationRecap] = []  # prevent GC of non-modal windows
+
+        self.setWindowTitle("TensorScope — Browse Runs")
+        self.resize(720, 520)
+        central = QWidget(); self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        title = QLabel("TensorScope"); title.setStyleSheet("font-size:27px;font-weight:bold;")
+        layout.addWidget(title)
+        subtitle = QLabel("Browse saved captures (demo mode — no model required)")
+        subtitle.setStyleSheet("color:#475569;"); layout.addWidget(subtitle)
+
+        self.runs = QListWidget(); layout.addWidget(self.runs)
+
+        buttons = QHBoxLayout()
+        self.open_button = QPushButton("Open Recap")
+        refresh_button = QPushButton("Refresh")
+        buttons.addWidget(self.open_button); buttons.addWidget(refresh_button)
+        buttons.addStretch(1); layout.addLayout(buttons)
+
+        self.status_label = QLabel(); self.status_label.setStyleSheet("color:#475569;")
+        layout.addWidget(self.status_label)
+
+        self.open_button.clicked.connect(self.open_selected)
+        refresh_button.clicked.connect(self.reload)
+        self.runs.itemDoubleClicked.connect(lambda _: self.open_selected())
+        self.reload()
+
+    def reload(self) -> None:
+        self.runs.clear()
+        rows = self.database.list_runs()
+        for row in rows:
+            ts = (row["created_at"] or "")[:16].replace("T", " ")
+            text = f"#{row['id']}  {ts}  |  {row['prompt'][:120]}"
+            item = QListWidgetItem(text); item.setData(Qt.UserRole, row["id"])
+            self.runs.addItem(item)
+        n = len(rows)
+        self.status_label.setText(f"{n} saved run{'s' if n != 1 else ''}  ·  {self.database.path}")
+        self.open_button.setEnabled(n > 0)
+
+    def open_selected(self) -> None:
+        item = self.runs.currentItem()
+        if not item:
+            return
+        try:
+            run_id = item.data(Qt.UserRole)
+            recap = ComputationRecap(self.database.load(run_id), run_id, self)
+            self._open_recaps.append(recap)
+            recap.finished.connect(lambda: self._open_recaps.remove(recap)
+                                   if recap in self._open_recaps else None)
+            recap.show()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot open run", str(exc))
 
 
 def self_test() -> None:
@@ -1546,6 +1773,30 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         self_test()
     else:
+        demo_mode = "--demo" in sys.argv
+        if not demo_mode:
+            try:
+                import torch as _torch_probe  # noqa: F401 — probe only, not used here
+            except ImportError:
+                demo_mode = True
+
+        db_path: Path | None = None
+        if "--db" in sys.argv:
+            idx = sys.argv.index("--db")
+            if idx + 1 < len(sys.argv):
+                db_path = Path(sys.argv[idx + 1])
+
+        import matplotlib
+        matplotlib.rcParams.update(MPLSTYLE)
+
+        from PyQt5.QtGui import QFont
         application = QApplication(sys.argv)
-        window = TensorScopeMainWindow(); window.show()
+        application.setStyleSheet(APP_QSS)
+        application.setFont(QFont("Segoe UI", 10))
+
+        if demo_mode:
+            window: QMainWindow = DemoMainWindow(**({"db_path": db_path} if db_path else {}))
+        else:
+            window = TensorScopeMainWindow()
+        window.show()
         sys.exit(application.exec_())
