@@ -29,6 +29,7 @@ import datetime as dt
 import html
 import io
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -47,7 +48,8 @@ os.environ.setdefault("MPLCONFIGDIR", str(APP_DIR / ".matplotlib"))
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtCore import QLineF, QPointF, QRectF, QSize, QThread, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
@@ -182,7 +184,19 @@ QPushButton#sidebarNav:checked {{
 #rowLabel  {{ font-weight: 600; color: {T['text_primary']}; }}
 #rowValue  {{ color: {T['text_secondary']}; font-size: 12px; }}
 #statusLabel {{ font-size: 12px; color: {T['text_muted']}; padding-top: 2px; }}
-#emptyState  {{ color: {T['text_muted']}; font-size: 13px; padding: 32px; }}
+
+/* Footer status bar: a thin rule separates it from the content it describes, so the
+   database path reads as chrome rather than as floating body text. */
+#statusBar {{
+    background: transparent; border-top: 1px solid {T['border']};
+    color: {T['text_muted']}; font-size: 11px; padding: 8px 32px;
+}}
+
+/* empty state -- deliberately unboxed: no #card wrapper, no background, no border,
+   so it sits directly on the page like the rest of the screen. */
+#emptyTitle {{ font-size: 14px; font-weight: 600; color: {T['text_secondary']}; }}
+#emptyBody  {{ font-size: 12px; color: {T['text_muted']}; }}
+#finePrint  {{ font-size: 11px; color: {T['text_muted']}; }}
 
 /* standard buttons */
 QPushButton {{
@@ -192,6 +206,21 @@ QPushButton {{
 QPushButton:hover  {{ border-color: {T['text_secondary']}; }}
 QPushButton:pressed {{ background: {T['nav_active_bg']}; }}
 QPushButton:disabled {{ color: {T['text_muted']}; border-color: {T['border']}; }}
+
+/* primary button -- the one action a screen wants the reader to take */
+QPushButton#primary {{
+    background: {T['accent']}; border: 1px solid {T['accent']};
+    color: #ffffff; font-weight: 600; padding: 7px 16px;
+}}
+QPushButton#primary:hover  {{ background: #2f6fe0; border-color: #2f6fe0; }}
+QPushButton#primary:pressed {{ background: #2861cc; border-color: #2861cc; }}
+
+/* icon-only button (header actions such as Refresh) */
+QPushButton#iconButton {{
+    background: transparent; border: none; border-radius: 6px; padding: 0px;
+}}
+QPushButton#iconButton:hover   {{ background: {T['nav_active_bg']}; }}
+QPushButton#iconButton:pressed {{ background: {T['border']}; }}
 
 /* ghost button */
 QPushButton#ghost {{
@@ -271,6 +300,103 @@ def _make_mplstyle(T: dict) -> dict:
 
 APP_QSS  = _make_qss(TOKENS)
 MPLSTYLE = _make_mplstyle(TOKENS)
+
+
+# ── Icons ────────────────────────────────────────────────────────────────────────
+#
+# Painted with QPainter rather than shipped as asset files or borrowed from a text
+# font.  The sidebar previously mixed four unrelated characters -- a play triangle,
+# a hamburger, a gear, a middle dot -- so its stroke weight, optical size and
+# vertical alignment were whatever font happened to supply each glyph.  Every icon
+# here is authored on the same 24x24 grid and stroked with the same pen, so the set
+# stays consistent at any pixel size, needs no bundled files, and follows the theme
+# tokens.  Keep new icons single-stroke outlines: no fills, no two-tone shapes.
+_ICON_GRID = 24.0
+_ICON_STROKE = 1.9          # in grid units: ~1.4 px at an 18 px icon
+
+
+def _draw_icon(painter: QPainter, kind: str, colour: QColor) -> None:
+    """Stroke one glyph onto the shared 24x24 grid."""
+    if kind == "play":                      # Live Capture
+        path = QPainterPath(QPointF(9.0, 5.5))
+        path.lineTo(19.0, 12.0); path.lineTo(9.0, 18.5); path.closeSubpath()
+        painter.drawPath(path)
+    elif kind == "layers":                  # Saved Runs
+        top = QPainterPath(QPointF(12.0, 3.0))
+        top.lineTo(21.0, 8.0); top.lineTo(12.0, 13.0); top.lineTo(3.0, 8.0)
+        top.closeSubpath()
+        painter.drawPath(top)
+        painter.drawPolyline(QPolygonF([QPointF(3.0, 12.6), QPointF(12.0, 17.6), QPointF(21.0, 12.6)]))
+    elif kind == "sliders":                 # Settings
+        painter.drawLine(QLineF(3.5, 8.5, 20.5, 8.5))
+        painter.drawLine(QLineF(9.0, 5.5, 9.0, 11.5))
+        painter.drawLine(QLineF(3.5, 15.5, 20.5, 15.5))
+        painter.drawLine(QLineF(15.0, 12.5, 15.0, 18.5))
+    elif kind == "info":                    # About
+        painter.drawEllipse(QRectF(3.6, 3.6, 16.8, 16.8))
+        painter.drawLine(QLineF(12.0, 11.0, 12.0, 16.6))
+        painter.drawLine(QLineF(12.0, 7.7, 12.0, 7.9))   # round cap -> dot
+    elif kind == "tray":                    # empty state anchor
+        painter.drawRoundedRect(QRectF(3.0, 5.0, 18.0, 14.0), 2.6, 2.6)
+        painter.drawPolyline(QPolygonF([
+            QPointF(3.0, 13.0), QPointF(8.0, 13.0), QPointF(9.6, 15.6),
+            QPointF(14.4, 15.6), QPointF(16.0, 13.0), QPointF(21.0, 13.0),
+        ]))
+    elif kind == "refresh":                 # header action
+        centre, radius, start = QPointF(12.0, 12.0), 7.6, 65.0
+        box = QRectF(centre.x() - radius, centre.y() - radius, radius * 2, radius * 2)
+        arc = QPainterPath()
+        arc.arcMoveTo(box, start)
+        arc.arcTo(box, start, -295.0)
+        painter.drawPath(arc)
+        # Arrow head on the open end, aimed along the arc's tangent there.
+        angle = math.radians(start)
+        tip_dir = QPointF(-math.sin(angle), -math.cos(angle))          # increasing angle
+        outward = QPointF(math.cos(angle), -math.sin(angle))
+        at = QPointF(centre.x() + radius * math.cos(angle), centre.y() - radius * math.sin(angle))
+        painter.setBrush(colour)
+        painter.drawPolygon(QPolygonF([
+            at + tip_dir * 2.9,
+            at - tip_dir * 1.1 + outward * 2.0,
+            at - tip_dir * 1.1 - outward * 2.0,
+        ]))
+        painter.setBrush(Qt.NoBrush)
+    else:
+        raise KeyError(f"unknown icon: {kind!r}")
+
+
+def icon_pixmap(kind: str, size: int = 18, colour: str | None = None,
+                stroke: float = _ICON_STROKE) -> QPixmap:
+    """Render one icon at `size` logical pixels, sharp on high-DPI screens."""
+    app = QApplication.instance()
+    ratio = float(app.devicePixelRatio()) if app is not None else 1.0
+    pixels = max(1, int(round(size * ratio)))
+    pixmap = QPixmap(pixels, pixels)
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.scale(pixels / _ICON_GRID, pixels / _ICON_GRID)
+    tint = QColor(colour or TOKENS["text_secondary"])
+    pen = QPen(tint)
+    pen.setWidthF(stroke)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    _draw_icon(painter, kind, tint)
+    painter.end()
+    return pixmap
+
+
+def state_icon(kind: str, size: int = 18) -> QIcon:
+    """Icon whose tint tracks the button states the sidebar QSS already styles."""
+    icon = QIcon()
+    icon.addPixmap(icon_pixmap(kind, size, TOKENS["text_secondary"]), QIcon.Normal, QIcon.Off)
+    icon.addPixmap(icon_pixmap(kind, size, TOKENS["text_primary"]), QIcon.Normal, QIcon.On)
+    icon.addPixmap(icon_pixmap(kind, size, TOKENS["text_primary"]), QIcon.Active, QIcon.Off)
+    icon.addPixmap(icon_pixmap(kind, size, TOKENS["text_primary"]), QIcon.Active, QIcon.On)
+    return icon
 
 
 class CaptureProtocolError(RuntimeError):
@@ -1676,15 +1802,19 @@ class TensorScopeMainWindow(QMainWindow):
         sl.addLayout(logo_row)
         sl.addSpacing(20)
 
+        # One painted icon family for the whole sidebar -- see _draw_icon on why these
+        # are not text glyphs.
         self._nav_btns: list[QPushButton] = []
-        for label, idx in [
-            ("▶  Live Capture", 0),
-            ("≡  Saved Runs",   1),
-            ("⚙  Settings",     2),
-            ("·  About",        3),
+        for label, glyph, idx in [
+            ("Live Capture", "play",    0),
+            ("Saved Runs",   "layers",  1),
+            ("Settings",     "sliders", 2),
+            ("About",        "info",    3),
         ]:
             btn = QPushButton(label)
             btn.setObjectName("sidebarNav")
+            btn.setIcon(state_icon(glyph, 18))
+            btn.setIconSize(QSize(18, 18))
             btn.setCheckable(True)
             btn.clicked.connect(lambda _, i=idx: self._nav_to(i))
             sl.addWidget(btn)
@@ -1706,23 +1836,55 @@ class TensorScopeMainWindow(QMainWindow):
         def _divider() -> QFrame:
             line = QFrame(); line.setObjectName("rowDivider"); return line
 
-        def _screen(title: str, subtitle: str) -> tuple:
+        def _icon_button(glyph: str, tooltip: str) -> QPushButton:
+            btn = QPushButton()
+            btn.setObjectName("iconButton")
+            btn.setIcon(state_icon(glyph, 16))
+            btn.setIconSize(QSize(16, 16))
+            btn.setFixedSize(28, 28)
+            btn.setToolTip(tooltip)
+            btn.setCursor(Qt.PointingHandCursor)
+            return btn
+
+        def _screen(title: str, subtitle: str, action: QWidget | None = None) -> tuple:
+            """Returns (page, body layout, footer label).
+
+            The footer label is a status bar pinned below the scroll area, so it keeps
+            its separating rule at the bottom of the screen instead of scrolling with
+            the content.  It starts hidden; a caller that wants it calls setVisible.
+            """
+            page = QWidget()
+            pl = QVBoxLayout(page)
+            pl.setContentsMargins(0, 0, 0, 0); pl.setSpacing(0)
+
             scroll = QScrollArea(); scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
             inner = QWidget(); scroll.setWidget(inner)
             l = QVBoxLayout(inner)
             l.setContentsMargins(32, 28, 32, 28); l.setSpacing(14)
             l.setAlignment(Qt.AlignTop)
-            hdr = QWidget(); hl = QVBoxLayout(hdr)
-            hl.setContentsMargins(0, 0, 0, 4); hl.setSpacing(2)
-            t = QLabel(title); t.setObjectName("screenTitle"); hl.addWidget(t)
+            hdr = QWidget(); hrow = QHBoxLayout(hdr)
+            hrow.setContentsMargins(0, 0, 0, 4); hrow.setSpacing(8)
+            titles = QVBoxLayout(); titles.setContentsMargins(0, 0, 0, 0); titles.setSpacing(2)
+            t = QLabel(title); t.setObjectName("screenTitle"); titles.addWidget(t)
             if subtitle:
-                s = QLabel(subtitle); s.setObjectName("screenSubtitle"); hl.addWidget(s)
+                s = QLabel(subtitle); s.setObjectName("screenSubtitle"); titles.addWidget(s)
+            hrow.addLayout(titles)
+            hrow.addStretch(1)
+            if action is not None:
+                hrow.addWidget(action, 0, Qt.AlignTop)
             l.addWidget(hdr)
-            return scroll, l
+            pl.addWidget(scroll, 1)
+
+            footer = QLabel(); footer.setObjectName("statusBar")
+            footer.setWordWrap(True)   # a long database path must not widen the window
+            footer.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            footer.setVisible(False)
+            pl.addWidget(footer)
+            return page, l, footer
 
         # Screen 0: Live Capture ──────────────────────────────────────────────
-        live_scr, live_l = _screen(
+        live_scr, live_l, _live_footer = _screen(
             "Live Capture",
             "Load a model in Settings, then run a prompt to capture tensors.",
         )
@@ -1764,7 +1926,10 @@ class TensorScopeMainWindow(QMainWindow):
         self.screens.addWidget(live_scr)  # index 0
 
         # Screen 1: Saved Runs ────────────────────────────────────────────────
-        runs_scr, runs_l = _screen("Saved Runs", "Browse captures without loading a model.")
+        _refresh_btn = _icon_button("refresh", "Reload the run list")
+        runs_scr, runs_l, self.browse_status = _screen(
+            "Saved Runs", "Browse captures without loading a model.", action=_refresh_btn,
+        )
 
         self._browse_inner = QStackedWidget()
 
@@ -1774,30 +1939,56 @@ class TensorScopeMainWindow(QMainWindow):
         self.runs_list = QListWidget(); rll.addWidget(self.runs_list)
         browse_btns_row = QHBoxLayout()
         self.open_recap_btn = QPushButton("Open Recap"); self.open_recap_btn.setEnabled(False)
-        _refresh_btn = QPushButton("Refresh")
-        browse_btns_row.addWidget(self.open_recap_btn); browse_btns_row.addWidget(_refresh_btn)
+        browse_btns_row.addWidget(self.open_recap_btn)
         browse_btns_row.addStretch(1); rll.addLayout(browse_btns_row)
         self._browse_inner.addWidget(runs_list_w)  # index 0
 
+        # Empty state: no card, no border, no background -- it sits directly on the page.
+        # An outline glyph anchors it so the copy is not bare floating text.
+        empty_w = QWidget()
+        ecl = QVBoxLayout(empty_w)
+        ecl.setContentsMargins(32, 24, 32, 24); ecl.setSpacing(0)
+        ecl.addStretch(1)
+        empty_icon = QLabel()
+        empty_icon.setPixmap(icon_pixmap("tray", 44, TOKENS["text_muted"], stroke=1.5))
+        empty_icon.setAlignment(Qt.AlignCenter)
+        ecl.addWidget(empty_icon)
+        ecl.addSpacing(14)
+        empty_title = QLabel("No saved runs yet.")
+        empty_title.setObjectName("emptyTitle"); empty_title.setAlignment(Qt.AlignCenter)
+        ecl.addWidget(empty_title)
+        ecl.addSpacing(6)
         self._empty_label = QLabel(
-            "No saved runs yet.\n\n"
-            "Switch to Live Capture on a machine with a GPU,\n"
-            "run a prompt, then come back here to browse it.\n\n"
-            "Or pass --db /path/to/runs.sqlite3 to point at\n"
-            "an existing database."
+            "Switch to Live Capture on a machine with a GPU, run a prompt,\n"
+            "then come back here to browse it."
         )
+        self._empty_label.setObjectName("emptyBody")
         self._empty_label.setAlignment(Qt.AlignCenter)
         self._empty_label.setWordWrap(True)
-        self._empty_label.setObjectName("emptyState")
-        self._browse_inner.addWidget(self._empty_label)  # index 1
+        ecl.addWidget(self._empty_label)
+        ecl.addSpacing(20)
+        choose_row = QHBoxLayout(); choose_row.setContentsMargins(0, 0, 0, 0)
+        self.choose_db_btn = QPushButton("Choose Database…")
+        self.choose_db_btn.setObjectName("primary")
+        self.choose_db_btn.setCursor(Qt.PointingHandCursor)
+        choose_row.addStretch(1); choose_row.addWidget(self.choose_db_btn); choose_row.addStretch(1)
+        ecl.addLayout(choose_row)
+        ecl.addSpacing(10)
+        # Fine print, not the primary path: TensorScope ships as a community download,
+        # so the file picker above is what most readers will use.
+        cli_hint = QLabel("Already have one? The command-line equivalent is  --db /path/to/runs.sqlite3")
+        cli_hint.setObjectName("finePrint")
+        cli_hint.setAlignment(Qt.AlignCenter); cli_hint.setWordWrap(True)
+        ecl.addWidget(cli_hint)
+        ecl.addStretch(1)
+        self._browse_inner.addWidget(empty_w)  # index 1
 
-        runs_l.addWidget(self._browse_inner)
-        self.browse_status = QLabel(); self.browse_status.setObjectName("statusLabel")
-        runs_l.addWidget(self.browse_status)
+        runs_l.addWidget(self._browse_inner, 1)
+        self.browse_status.setVisible(True)
         self.screens.addWidget(runs_scr)  # index 1
 
         # Screen 2: Settings ──────────────────────────────────────────────────
-        settings_scr, settings_l = _screen("Settings", "")
+        settings_scr, settings_l, _settings_footer = _screen("Settings", "")
 
         mdl_card, mdl_cl = _card()
         mdl_title = QLabel("Model"); mdl_title.setObjectName("cardTitle"); mdl_cl.addWidget(mdl_title)
@@ -1821,15 +2012,19 @@ class TensorScopeMainWindow(QMainWindow):
         db_row = QHBoxLayout()
         db_lbl = QLabel("Path"); db_lbl.setObjectName("rowLabel"); db_row.addWidget(db_lbl)
         db_row.addSpacing(16)
-        db_val = QLabel(str(self.database.path))
-        db_val.setObjectName("rowValue"); db_val.setWordWrap(True)
-        db_val.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        db_row.addWidget(db_val, 1); db_cl.addLayout(db_row)
+        self.db_path_label = QLabel(str(self.database.path))
+        self.db_path_label.setObjectName("rowValue"); self.db_path_label.setWordWrap(True)
+        self.db_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        db_row.addWidget(self.db_path_label, 1)
+        self.settings_choose_db_btn = QPushButton("Change…")
+        self.settings_choose_db_btn.setObjectName("ghost")
+        db_row.addWidget(self.settings_choose_db_btn, 0, Qt.AlignTop)
+        db_cl.addLayout(db_row)
         settings_l.addWidget(db_card)
         self.screens.addWidget(settings_scr)  # index 2
 
         # Screen 3: About ─────────────────────────────────────────────────────
-        about_scr, about_l = _screen("About", "")
+        about_scr, about_l, _about_footer = _screen("About", "")
 
         about_card, about_cl = _card()
         about_name = QLabel("TensorScope"); about_name.setObjectName("cardTitle")
@@ -1850,6 +2045,8 @@ class TensorScopeMainWindow(QMainWindow):
         self.load_button.clicked.connect(self.load_model)
         self.open_recap_btn.clicked.connect(self._open_selected_run)
         _refresh_btn.clicked.connect(self._reload_runs)
+        self.choose_db_btn.clicked.connect(self._choose_database)
+        self.settings_choose_db_btn.clicked.connect(self._choose_database)
         self.runs_list.itemDoubleClicked.connect(lambda _: self._open_selected_run())
         self.runs_list.currentItemChanged.connect(
             lambda item, _: self.open_recap_btn.setEnabled(item is not None)
@@ -1865,113 +2062,40 @@ class TensorScopeMainWindow(QMainWindow):
         for i, btn in enumerate(self._nav_btns):
             btn.setChecked(i == index)
 
-    # (stub to satisfy old code paths — not a separate mode any more)
-    def _set_mode(self, _mode: str) -> None:
-        pass
-
-        self.content_stack = QStackedWidget()
-        layout.addWidget(self.content_stack)
-
-        # ── Live panel (index 0) ──────────────────────────────────────────────
-        live_panel = QWidget()
-        live_layout = QVBoxLayout(live_panel)
-        live_layout.setContentsMargins(0, 4, 0, 0)
-
-        settings = QHBoxLayout()
-        settings.addWidget(QLabel("Model:"))
-        self.model_id = QLineEdit(self.capture_model.model_id)
-        settings.addWidget(self.model_id)
-        self.load_button = QPushButton("Load model")
-        settings.addWidget(self.load_button)
-        live_layout.addLayout(settings)
-
-        live_layout.addWidget(QLabel("Prompt"))
-        self.prompt = QTextEdit()
-        self.prompt.setPlaceholderText("Ask the model something...")
-        self.prompt.setFixedHeight(125)
-        live_layout.addWidget(self.prompt)
-
-        run_row = QHBoxLayout()
-        self.run_button = QPushButton("Run Model")
-        self.run_button.setEnabled(False)
-        run_row.addWidget(self.run_button)
-        run_row.addStretch(1)
-        live_layout.addLayout(run_row)
-
-        live_layout.addWidget(QLabel("Model answer"))
-        self.output = QTextEdit()
-        self.output.setReadOnly(True)
-        live_layout.addWidget(self.output)
-
-        self.status = QLabel("Load a model to begin.")
-        self.status.setStyleSheet(f"color:{C_TEXT2};")
-        live_layout.addWidget(self.status)
-
-        self.content_stack.addWidget(live_panel)
-
-        # ── Browse panel (index 1) ────────────────────────────────────────────
-        browse_panel = QWidget()
-        browse_layout = QVBoxLayout(browse_panel)
-        browse_layout.setContentsMargins(0, 4, 0, 0)
-
-        self._browse_inner = QStackedWidget()
-
-        self.runs_list = QListWidget()
-        self._browse_inner.addWidget(self.runs_list)  # index 0 — populated list
-
-        self._empty_label = QLabel(
-            "No saved runs yet.\n\n"
-            "Switch to Live Mode on a machine with a GPU, run a prompt,\n"
-            "and the capture will appear here.\n\n"
-            "Or point TensorScope at an existing database:\n"
-            "  python TensorScope.py --db /path/to/runs.sqlite3"
-        )
-        self._empty_label.setAlignment(Qt.AlignCenter)
-        self._empty_label.setWordWrap(True)
-        self._empty_label.setStyleSheet(f"color:{C_MUTED};font-size:13px;padding:32px;")
-        self._browse_inner.addWidget(self._empty_label)  # index 1 — empty state
-
-        browse_layout.addWidget(self._browse_inner)
-
-        browse_buttons = QHBoxLayout()
-        self.open_recap_btn = QPushButton("Open Recap")
-        self.open_recap_btn.setEnabled(False)
-        _refresh_btn = QPushButton("Refresh")
-        browse_buttons.addWidget(self.open_recap_btn)
-        browse_buttons.addWidget(_refresh_btn)
-        browse_buttons.addStretch(1)
-        browse_layout.addLayout(browse_buttons)
-
-        self.browse_status = QLabel()
-        self.browse_status.setStyleSheet(f"color:{C_MUTED};font-size:12px;")
-        browse_layout.addWidget(self.browse_status)
-
-        self.content_stack.addWidget(browse_panel)
-
-        # Signals
-        self.run_button.clicked.connect(self.run_model)
-        self.load_button.clicked.connect(self.load_model)
-        self._live_btn.clicked.connect(lambda: self._set_mode("live"))
-        self._browse_btn.clicked.connect(lambda: self._set_mode("browse"))
-        self.open_recap_btn.clicked.connect(self._open_selected_run)
-        _refresh_btn.clicked.connect(self._reload_runs)
-        self.runs_list.itemDoubleClicked.connect(lambda _: self._open_selected_run())
-        self.runs_list.currentItemChanged.connect(
-            lambda item, _: self.open_recap_btn.setEnabled(item is not None)
-        )
-
-        self._reload_runs()
-        self._set_mode("browse" if start_in_browse else "live")
-
-    # ── Mode toggle ───────────────────────────────────────────────────────────
-
-    def _set_mode(self, mode: str) -> None:
-        is_live = mode == "live"
-        self.content_stack.setCurrentIndex(0 if is_live else 1)
-        self._live_btn.setChecked(is_live)
-        self._browse_btn.setChecked(not is_live)
-
     # ── Browse helpers ────────────────────────────────────────────────────────
+
+    def _choose_database(self) -> None:
+        """Point the browser at an existing capture database via a real file picker.
+
+        The GUI path has to work on its own: TensorScope ships as a community download
+        and most readers will never open a terminal, so --db is documented as fine print
+        rather than as the instruction.
+        """
+        start_dir = str(self.database.path.parent if self.database.path.parent.exists() else Path.home())
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose TensorScope database", start_dir,
+            "TensorScope database (*.sqlite3 *.sqlite *.db);;All files (*)",
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            # Probe read-only first.  RunDatabase.__init__ runs CREATE TABLE IF NOT
+            # EXISTS, which would otherwise quietly add empty tables to whatever
+            # unrelated sqlite file was picked.
+            with closing(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)) as probe:
+                tables = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"runs", "tensors"} <= tables:
+                raise ValueError("This file is not a TensorScope database (no runs/tensors tables).")
+            database = RunDatabase(path)
+            database.list_runs()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot open database", f"{path}\n\n{exc}")
+            return
+        self.database = database
+        self.db_path_label.setText(str(self.database.path))
+        self._reload_runs()
+        self._nav_to(1)
 
     def _reload_runs(self) -> None:
         self.runs_list.clear()

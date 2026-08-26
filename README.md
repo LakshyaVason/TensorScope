@@ -83,8 +83,11 @@ Then, in the window:
    it to get back to the main window.
 5. In the recap, click any **Layer *n*** header to expand it. Layers build their contents
    on first expand, which is why a 36-layer model opens instantly.
-6. **View Saved Runs** lists every past capture; select one and click **Open Recap** to
+6. **Saved Runs** lists every past capture; select one and click **Open Recap** to
    reopen it. The stored tensors are the original values, at their original dtype.
+   To browse a database from somewhere else, click **Choose Database…** (also on the
+   **Settings** screen) — no GPU or model load needed. `--db /path/to/runs.sqlite3`
+   does the same thing from a terminal.
 
 Prompts are capped at **256 tokens**, because attention tensors grow with the square of the
 prompt length.
