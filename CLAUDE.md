@@ -10,7 +10,7 @@ single PyQt5 desktop app:
 
 - **`TensorScope.py`** — loads a Hugging Face causal LM **in-process**, runs it with a
   custom eager attention implementation plus forward hooks, persists every captured
-  tensor to SQLite, and renders a read-only "Computation Recap" (tokenization,
+  tensor to SQLite, and renders a read-only, two-mode "Computation Recap" (tokenization,
   embeddings, per-layer Q/K/V before and after RoPE, attention scores/weights, attention
   block output, layer output, plus an attention-weight heatmap).
 - **`verify_capture.py`** — loads a real model and proves the capture is faithful and
@@ -132,8 +132,18 @@ Two labeling distinctions the UI must keep honest, both of which were wrong once
 - `attention_output` is `o_proj`'s output — `W_o · concat(heads)`, the attention block's
   output. It is **not** "attention × V". Calling it that was a real mislabel.
 
-If you change the captured set, update `REQUIRED_LAYER_TENSORS` and `TENSOR_LABELS`
-together; `--self-test` asserts every required tensor has a label.
+If you change the captured set, update `REQUIRED_LAYER_TENSORS`, `TENSOR_LABELS` **and
+`TENSOR_EXPLANATIONS`** together. `--self-test` asserts every required tensor has a label,
+and asserts `TENSOR_EXPLANATIONS` and `TENSOR_LABELS` have *exactly* the same keys in both
+directions — so a new tensor cannot reach the screen unexplained, and copy for a deleted
+tensor cannot linger.
+
+Beyond the per-layer set, `RunCapture.logits` holds the prefill logits row for the final
+prompt position — the vector that chose the first generated token. It is stored, not
+derived, and `validate()` requires `logits.argmax() == token_ids[0]` when present so a real
+score list can never be shown next to the wrong word. It is optional purely for
+back-compatibility: runs saved under schema 2 have none, and the recap degrades to a notice
+rather than refusing them.
 
 `MAX_CAPTURE_TOKENS = 256` bounds the prompt, because attention tensors grow with the
 square of prompt length.
@@ -162,7 +172,10 @@ attention matrices retained). An 8B model in bf16 (~16.4 GB) does not fit 15.9 G
   back via signals.
 - `RunDatabase` (SQLite, `tensorscope_runs.sqlite3`) stores runs + tensors.
   Generated-token tensors are stored under a `first_generated_token:` name prefix and the
-  embedding at `layer_index = -1`; `load()` reverses this convention. Arrays are `np.save`
+  embedding at `layer_index = -1`; `load()` reverses this convention. `final_logits` also
+  rides at `layer_index = -1`, so **its branch in `load()` must precede the by-layer
+  `else`** — falling through invents a `layers[-1]` that `validate()` then rejects for
+  missing every required tensor, breaking every saved run. Arrays are `np.save`
   + zlib blobs (`array_to_blob`/`blob_to_array`) — dtype is preserved exactly, never
   downcast. `verify_capture.py` asserts a bit-exact round-trip.
 - `tensor_to_numpy` widens bf16 to float32 because numpy has no bfloat16 dtype. This is a
@@ -171,7 +184,17 @@ attention matrices retained). An 8B model in bf16 (~16.4 GB) does not fit 15.9 G
 - `numeric_sample` / `display_matrix` sample tensors **for display only** (5×5 text
   preview, ≤96×96 heatmap). They must never mutate or replace persisted data.
 - `LayerSection` is collapsible and builds its body lazily on first expand — a 36-layer
-  model would otherwise construct 70+ matplotlib canvases up front.
+  model would otherwise construct 70+ matplotlib canvases up front. Its `explain` flag adds
+  the plain-language captions and moves the heatmap beside the weights it draws; it defaults
+  off so full-detail mode renders exactly what it always has. `expanded` builds the body
+  during construction, for the one layer story mode narrates.
+- `ComputationRecap` has two modes in a `QStackedWidget`, sharing the banner and provenance
+  table. `StoryView` (default) narrates the **prefill** pass in computation order with a
+  plain-language explanation *above* every number, one layer at a time via a picker;
+  `DetailView` is the previous exhaustive view, built lazily on first switch. Story mode
+  exists because the old default — 72 collapsed layers and no framing — showed a first-time
+  reader math before it showed them meaning. Explanation copy lives in `TENSOR_EXPLANATIONS`
+  and `STORY_STAGES` beside `TENSOR_LABELS`, never inline in a widget.
 
 ### On the softmax cross-check
 

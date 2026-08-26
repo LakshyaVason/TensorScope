@@ -24,6 +24,7 @@ import torch
 
 from TensorScope import (
     REQUIRED_LAYER_TENSORS,
+    TENSOR_EXPLANATIONS,
     TENSOR_LABELS,
     ModelCapture,
     RunDatabase,
@@ -79,11 +80,34 @@ def main() -> int:
           f"(max diff {delta:.3e}, bf16 step ~{2 ** -8:.4f})")
     assert delta < 4e-3, f"scores and weights disagree by {delta}"
 
+    # --- the final scores really are the ones that chose the word ----------------
+    # These logits are the tensor _verify_undisturbed just proved identical to stock eager,
+    # so the recap's score table inherits that proof.  The peak must be the token emitted.
+    assert capture.logits is not None, "capture did not keep the final score vector"
+    assert capture.logits.ndim == 1, f"final logits should be one vector, got {capture.logits.shape}"
+    peak = int(capture.logits.argmax())
+    print(f"\nfinal scores: {capture.logits.shape[0]} entries, peak at token {peak} "
+          f"= generated token {capture.token_ids[0]}")
+    assert peak == capture.token_ids[0], "final logits disagree with the generated token"
+
+    # The recap displays the decoded top-k from metadata; it must describe the stored vector.
+    top = capture.metadata["final_logits_top"]
+    expected_ids = [int(i) for i in np.argsort(capture.logits)[::-1][:len(top)]]
+    assert [entry["id"] for entry in top] == expected_ids, "top-k metadata is not the stored vector's"
+    for entry in top:
+        assert entry["logit"] == float(capture.logits[entry["id"]]), \
+            f"top-k score for token {entry['id']} is not the stored one"
+    print("top-k shown by the recap matches the stored vector: "
+          + ", ".join(f"{entry['token']!r}={entry['logit']:.3f}" for entry in top[:4]))
+
     # --- completeness -----------------------------------------------------------
     print("\ncaptured tensors per layer:")
     for name, _label in TENSOR_LABELS:
         tensor = capture.layers[0].tensors[name]
         print(f"  {name:<20} {str(tensor.shape):<26} {tensor.dtype}")
+        # Every displayed tensor must carry plain-language copy, or story mode would show a
+        # matrix with nothing said about it.
+        assert TENSOR_EXPLANATIONS[name].strip(), f"{name} has no explanation"
 
     for phase, layers in (("prefill", capture.layers),
                           ("first_generated_token", capture.generated_layers)):
@@ -107,8 +131,13 @@ def main() -> int:
                 assert restored.layers[index].tensors[name].dtype == tensor.dtype
         assert np.array_equal(restored.embedding, capture.embedding)
         assert np.array_equal(restored.generated_embedding, capture.generated_embedding)
+        assert np.array_equal(restored.logits, capture.logits), "final scores changed in the database"
+        assert restored.logits.dtype == capture.logits.dtype
+        # Stored at layer_index -1: it must not be read back as a phantom layer.
+        assert set(restored.layers) == set(capture.layers), "load() invented a layer"
         total = sum(len(layer.tensors) for layer in capture.layers.values()) * 2
-        print(f"RunDatabase round-trip bit-exact across ~{total} tensors")
+        print(f"RunDatabase round-trip bit-exact across ~{total} tensors, "
+              f"plus the {restored.logits.shape[0]}-entry score vector")
 
     if torch.cuda.is_available():
         print(f"\npeak VRAM: {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GiB")
