@@ -124,19 +124,29 @@ def main() -> int:
         database = RunDatabase(Path(temporary) / "verify.sqlite3")
         run_id = database.save(capture)
         restored = database.load(run_id)
-        for index, layer in capture.layers.items():
-            for name, tensor in layer.tensors.items():
-                assert np.array_equal(restored.layers[index].tensors[name], tensor), \
-                    f"layer {index} tensor {name} changed in the database"
-                assert restored.layers[index].tensors[name].dtype == tensor.dtype
-        assert np.array_equal(restored.embedding, capture.embedding)
-        assert np.array_equal(restored.generated_embedding, capture.generated_embedding)
+        for phase, original_layers, restored_layers in (
+            ("prefill", capture.layers, restored.layers),
+            ("first_generated_token", capture.generated_layers, restored.generated_layers),
+        ):
+            assert set(restored_layers) == set(original_layers), f"{phase} layer set changed"
+            for index, layer in original_layers.items():
+                assert set(restored_layers[index].tensors) == set(layer.tensors)
+                for name, tensor in layer.tensors.items():
+                    actual = restored_layers[index].tensors[name]
+                    assert np.array_equal(actual, tensor), \
+                        f"{phase} layer {index} tensor {name} changed in the database"
+                    assert actual.dtype == tensor.dtype
+        for name in ("embedding", "generated_embedding"):
+            original, actual = getattr(capture, name), getattr(restored, name)
+            assert np.array_equal(actual, original), f"{name} changed in the database"
+            assert actual.dtype == original.dtype, f"{name} dtype changed in the database"
         assert np.array_equal(restored.logits, capture.logits), "final scores changed in the database"
         assert restored.logits.dtype == capture.logits.dtype
         # Stored at layer_index -1: it must not be read back as a phantom layer.
         assert set(restored.layers) == set(capture.layers), "load() invented a layer"
-        total = sum(len(layer.tensors) for layer in capture.layers.values()) * 2
-        print(f"RunDatabase round-trip bit-exact across ~{total} tensors, "
+        total = sum(len(layer.tensors) for layers in (capture.layers, capture.generated_layers)
+                    for layer in layers.values())
+        print(f"RunDatabase round-trip bit-exact across {total} layer tensors, "
               f"plus the {restored.logits.shape[0]}-entry score vector")
 
     if torch.cuda.is_available():
