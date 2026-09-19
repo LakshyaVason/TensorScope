@@ -9,11 +9,14 @@ import html
 import json
 
 import numpy as np
-from PyQt5.QtCore import Qt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import (
-    QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget, QAbstractItemView, QHeaderView,
+    QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QHeaderView,
+    QLabel, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from tensor_widgets import AttentionExplorer, TensorInspector
@@ -25,20 +28,26 @@ from tensorscope_content import (
 
 STAGES = [('prompt', 'Prompt & journey'), ('tokenization', 'Tokens'),
           ('embedding', 'Embeddings'), ('layers', 'Transformer layers'),
-          ('logits', 'Logits → first token'), ('coda', 'First token’s next pass')]
+          ('logits', 'Logits → first token'), ('coda', "First token's next pass")]
+
 LAYER_STEPS = [('input', '1  Normalize'), ('qkv', '2  Project Q / K / V'),
                ('prepare', '3  Prepare for attention'), ('scores', '4  Scores → weights'),
                ('mix', '5  Mix values & project'), ('output', '6  Finish the layer')]
+
 COLORS = {'q': '#60a5fa', 'k': '#c084fc', 'v': '#34d399',
-          'scores': '#fbbf24', 'weights': '#22d3ee', 'output': '#fb923c'}
+          'scores': '#fbbf24', 'weights': '#22d3ee', 'output': '#fb923c',
+          'norm': '#a78bfa', 'layer': '#94a3b8'}
 
 
-def label(text, *, rich=False, muted=False, title=False):
+# ── Label helpers ────────────────────────────────────────────────────────────
+
+def label(text, *, rich=False, muted=False, title=False, small=False):
     result = QLabel(text)
     result.setTextFormat(Qt.RichText if rich else Qt.PlainText)
     result.setWordWrap(True)
     result.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    result.setObjectName('journeyTitle' if title else 'journeyMuted' if muted else 'journeyText')
+    name = 'journeyTitle' if title else 'journeyMuted' if muted else 'journeySmall' if small else 'journeyText'
+    result.setObjectName(name)
     return result
 
 
@@ -68,13 +77,143 @@ def axes_for(name, tensor):
     return [f'axis {i}' for i in range(tensor.ndim)]
 
 
+# ── Visual component: pipeline flow navigator ────────────────────────────────
+
+class PipelineNavigator(QWidget):
+    """Horizontal clickable pipeline showing the full computation stages.
+
+    Clicking a stage chip navigates there. The current stage is highlighted.
+    """
+
+    CHIP_STAGES = [
+        ('prompt',       'Prompt'),
+        ('tokenization', 'Tokens'),
+        ('embedding',    'Embeddings'),
+        ('layers',       'Layers'),
+        ('logits',       'Logits'),
+        ('coda',         'First token'),
+    ]
+
+    def __init__(self, on_navigate, colors: dict | None = None, parent=None):
+        super().__init__(parent)
+        self._on_navigate = on_navigate
+        self._colors = colors or {}
+        self._buttons: dict[str, QPushButton] = {}
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        for i, (key, name) in enumerate(self.CHIP_STAGES):
+            if i > 0:
+                arrow = QLabel('→')
+                arrow.setObjectName('pipelineArrow')
+                arrow.setAlignment(Qt.AlignCenter)
+                layout.addWidget(arrow)
+            btn = QPushButton(name)
+            btn.setObjectName('pipelineChip')
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _, k=key: on_navigate(k))
+            layout.addWidget(btn)
+            self._buttons[key] = btn
+        layout.addStretch(1)
+
+    def set_current(self, key: str) -> None:
+        for k, btn in self._buttons.items():
+            btn.setChecked(k == key)
+
+
+# ── Visual component: matrix shape diagram ────────────────────────────────────
+
+class ShapeDiagram(QWidget):
+    """Visual representation of a matrix multiply operation showing actual shapes.
+
+    Shows colored labeled boxes: A [rows × cols] @ B [cols × out] → C [rows × out]
+    Dimensions come from captured arrays, not inferred from model config.
+    """
+
+    def __init__(self, operands: list[tuple[str, str, tuple]], operator: str = '@',
+                 colors: dict | None = None, parent=None):
+        """operands: list of (name, color_key, shape_tuple) triples.
+        operator: string shown between boxes (@ for matmul, → for other).
+        """
+        super().__init__(parent)
+        self._colors = colors or {}
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(6)
+        for i, (name, color_key, shp) in enumerate(operands):
+            if i > 0:
+                op_label = QLabel(operator)
+                op_label.setObjectName('shapeOp')
+                op_label.setAlignment(Qt.AlignCenter)
+                layout.addWidget(op_label)
+            box = self._make_box(name, color_key, shp)
+            layout.addWidget(box)
+        layout.addStretch(1)
+
+    def _make_box(self, name, color_key, shp):
+        color = COLORS.get(color_key, '#8888aa')
+        dims = ' × '.join(str(d) for d in shp)
+        box = QFrame()
+        box.setObjectName('shapeDiagramBox')
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(10, 6, 10, 6)
+        box_layout.setSpacing(2)
+        name_label = QLabel(name)
+        name_label.setObjectName('shapeDiagramName')
+        name_label.setStyleSheet(f'color: {color}; font-weight: 700; font-size: 14px;')
+        name_label.setAlignment(Qt.AlignCenter)
+        dim_label = QLabel(f'[{dims}]')
+        dim_label.setObjectName('shapeDiagramDims')
+        dim_label.setStyleSheet('font-size: 11px;')
+        dim_label.setAlignment(Qt.AlignCenter)
+        box_layout.addWidget(name_label)
+        box_layout.addWidget(dim_label)
+        box.setStyleSheet(f'QFrame#shapeDiagramBox {{ border: 2px solid {color}; border-radius: 6px; '
+                          f'background: transparent; min-width: 80px; max-width: 160px; }}')
+        return box
+
+
+# ── Visual component: mini attention heatmap ─────────────────────────────────
+
+class MiniHeatmap(FigureCanvas):
+    """Small matplotlib heatmap of an attention weight slice for display.
+
+    Uses display_matrix to stride-sample to ≤48×48. The source array is never
+    mutated; this is a display-only view.
+    """
+
+    def __init__(self, array: np.ndarray, title: str = '',
+                 mpl_style: dict | None = None, parent=None):
+        from TensorScope import display_matrix
+        fig = Figure(figsize=(3.8, 2.8), tight_layout=True)
+        super().__init__(fig)
+        ax = fig.add_subplot(111)
+        sampled = display_matrix(array, maximum=48)
+        # Use a perceptually uniform colormap; viridis is standard and colorblind-safe.
+        im = ax.imshow(sampled, aspect='auto', cmap='viridis', interpolation='nearest')
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if title:
+            ax.set_title(title, fontsize=9)
+        ax.set_xlabel('Key token index', fontsize=8)
+        ax.set_ylabel('Query token index', fontsize=8)
+        ax.tick_params(labelsize=7)
+        if mpl_style:
+            fig.set_facecolor(mpl_style.get('figure.facecolor', '#111114'))
+            ax.set_facecolor(mpl_style.get('axes.facecolor', '#1c1c20'))
+        self.setMinimumSize(QSize(280, 200))
+        self.setMaximumSize(QSize(500, 360))
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+
+
+# ── Card ─────────────────────────────────────────────────────────────────────
+
 class Card(QFrame):
     def __init__(self, title, plain='', parent=None):
         super().__init__(parent)
         self.setObjectName('journeyCard')
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(20, 18, 20, 18)
-        self.body.setSpacing(12)
+        self.body.setSpacing(10)
         self.add(label(title, title=True))
         if plain:
             self.add(label(plain, rich=True))
@@ -82,6 +221,9 @@ class Card(QFrame):
     def add(self, widget):
         self.body.addWidget(widget)
         return widget
+
+    def add_layout(self, layout):
+        self.body.addLayout(layout)
 
     def field(self, heading, text, rich=False):
         self.add(label(heading.upper(), muted=True))
@@ -92,6 +234,19 @@ class Card(QFrame):
         widget.setObjectName('journeyEquation')
         return self.add(widget)
 
+    def shape_diagram(self, operands, operator='@'):
+        """Add a visual matrix shape diagram."""
+        diag = ShapeDiagram(operands, operator)
+        return self.add(diag)
+
+    def section_rule(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setObjectName('sectionRule')
+        return self.add(line)
+
+
+# ── Disclosure ────────────────────────────────────────────────────────────────
 
 class Disclosure(QWidget):
     """Construct expensive numerical widgets only when the reader requests them."""
@@ -117,6 +272,32 @@ class Disclosure(QWidget):
         self.button.setText(('− ' if checked else '＋ ') + self.title)
 
 
+# ── Phase badge ───────────────────────────────────────────────────────────────
+
+class PhaseBadge(QLabel):
+    """Colored badge showing which captured phase is being viewed."""
+
+    def __init__(self, generated: bool = False, parent=None):
+        super().__init__(parent)
+        self.setObjectName('phaseBadge')
+        self._set(generated)
+
+    def _set(self, generated: bool) -> None:
+        if generated:
+            self.setText('Phase 2  ·  First generated-token pass')
+            self.setStyleSheet('background: #1e3a2a; color: #34d399; border: 1px solid #34d399; '
+                               'border-radius: 4px; padding: 4px 10px; font-size: 12px; font-weight: 600;')
+        else:
+            self.setText('Phase 1  ·  Prompt prefill')
+            self.setStyleSheet('background: #1e2d40; color: #60a5fa; border: 1px solid #60a5fa; '
+                               'border-radius: 4px; padding: 4px 10px; font-size: 12px; font-weight: 600;')
+
+    def update_phase(self, generated: bool) -> None:
+        self._set(generated)
+
+
+# ── Token table ───────────────────────────────────────────────────────────────
+
 def token_table(capture):
     table = QTableWidget(len(capture.prompt_tokens), 3)
     table.setHorizontalHeaderLabels(['Position', 'Token ID', 'Stored tokenizer spelling'])
@@ -131,9 +312,44 @@ def token_table(capture):
     return table
 
 
+# ── Layer step sidebar ────────────────────────────────────────────────────────
+
+class LayerStepSidebar(QWidget):
+    """Vertical step navigator for within-layer operations.
+
+    Clicking a step item navigates there. Current step is highlighted.
+    """
+
+    def __init__(self, on_step, parent=None):
+        super().__init__(parent)
+        self._on_step = on_step
+        self._buttons: dict[str, QPushButton] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        header = label('LAYER OPERATIONS', muted=True, small=True)
+        header.setObjectName('stepSidebarHeader')
+        layout.addWidget(header)
+        for key, title in LAYER_STEPS:
+            btn = QPushButton(title)
+            btn.setObjectName('layerStepBtn')
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _, k=key: on_step(k))
+            layout.addWidget(btn)
+            self._buttons[key] = btn
+        layout.addStretch(1)
+
+    def set_current(self, key: str) -> None:
+        for k, btn in self._buttons.items():
+            btn.setChecked(k == key)
+
+
+# ── StoryView ─────────────────────────────────────────────────────────────────
+
 class StoryView(QWidget):
     """One stage and one layer operation at a time, with persistent selection."""
-    def __init__(self, capture, parent=None):
+
+    def __init__(self, capture, parent=None, tokens: dict | None = None):
         super().__init__(parent)
         self.capture = capture
         self.facts = story_facts(capture)
@@ -144,6 +360,8 @@ class StoryView(QWidget):
         self._stage_widget = None
         self._on_stage_change = None
         self._on_context_change = None
+        self._tokens = tokens or {}
+        self._mpl_style = {}
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(0, 0, 0, 0)
         self.body.setSpacing(14)
@@ -157,9 +375,14 @@ class StoryView(QWidget):
             self._stage_widget.hide()
             self._stage_widget.deleteLater()
         self._stage_key = key
-        builders = {'prompt': self._opening, 'tokenization': self._tokenization,
-                    'embedding': self._embedding, 'layers': self._layers_stage,
-                    'logits': self._word_choice, 'coda': self._coda}
+        builders = {
+            'prompt': self._opening,
+            'tokenization': self._tokenization,
+            'embedding': self._embedding,
+            'layers': self._layers_stage,
+            'logits': self._word_choice,
+            'coda': self._coda,
+        }
         self._stage_widget = builders[key]()
         self.body.addWidget(self._stage_widget)
         if self._on_stage_change:
@@ -169,51 +392,188 @@ class StoryView(QWidget):
         stage = STORY_STAGE_INDEX[key]
         return Card(stage.heading.format(**self.facts), stage.plain.format(**self.facts))
 
+    # ── Stage: Prompt ─────────────────────────────────────────────────────────
+
     def _opening(self):
         card = self._stage_card('prompt')
+
+        # Prompt and first token displayed prominently
         card.field('Your prompt', self.capture.prompt)
-        card.field('The first selected token', f'{self.capture.tokens[0]!r}  ·  ID {self.capture.token_ids[0]}')
-        card.field('Follow the computation',
-                   'Each stage explains its purpose, then its operation and dimensions. Open the captured data when you want to inspect values.')
-        for key, title in STAGES[1:-1]:
-            button = QPushButton('↓  ' + title)
-            button.setObjectName('journeyFlow')
-            button.clicked.connect(lambda _, k=key: self.go_to(k))
-            card.add(button)
+        card.field('First generated token',
+                   f'{self.capture.tokens[0]!r}  ·  vocabulary ID {self.capture.token_ids[0]}')
+
+        # Visual pipeline overview
+        card.section_rule()
+        card.add(label('COMPUTATION OVERVIEW', muted=True))
+        overview = self._make_pipeline_overview()
+        card.add(overview)
+
+        card.section_rule()
         card.field('Two captured phases',
-                   '<b>1 · Prompt prefill.</b> All prompt tokens pass through the layers. The final prompt position’s logits choose the first output token.<br><br>'
-                   '<b>2 · First generated-token pass.</b> The chosen token is processed with the cached prompt keys and values. '
-                   'Its embeddings and layer tensors are saved; its output logits are not saved. Later tokens’ forward-pass tensors are not captured.', rich=True)
-        answer = Disclosure('Read the complete generated response', lambda: label(self.capture.response))
+                   '<b>Phase 1 · Prompt prefill.</b>  All prompt tokens pass through all '
+                   'transformer layers simultaneously. The final prompt position\'s logits vector '
+                   'chooses the first output token.<br><br>'
+                   '<b>Phase 2 · First generated-token pass.</b>  That chosen token is then processed '
+                   'through all layers again, reusing the prompt\'s cached keys and values. '
+                   'Its embeddings and all layer tensors are captured. Its output logits are not saved.<br><br>'
+                   '<b>Later tokens</b> are generated uncaptured — their text is retained as context '
+                   'so you see the full answer.', rich=True)
+
+        answer = Disclosure('Read the complete generated response',
+                            lambda: label(self.capture.response))
         card.add(answer)
         return card
 
+    def _make_pipeline_overview(self):
+        """A visual flow diagram widget showing the computation path."""
+        host = QWidget()
+        layout = QHBoxLayout(host)
+        layout.setContentsMargins(0, 6, 0, 6)
+        layout.setSpacing(0)
+
+        steps = [
+            ('Prompt\ntext', '#636370'),
+            ('Token\nIDs', '#9f9fa8'),
+            ('Embeddings\nX₀', '#60a5fa'),
+            (f'Layer 0\n→ Layer {len(self.capture.layers)-1}', '#a78bfa'),
+            ('Final\nLogits', '#fbbf24'),
+            ('First\nToken', '#34d399'),
+        ]
+        keys = ['tokenization', 'tokenization', 'embedding', 'layers', 'logits', 'coda']
+
+        for i, ((name, color), key) in enumerate(zip(steps, keys)):
+            if i > 0:
+                arrow = QLabel('→')
+                arrow.setAlignment(Qt.AlignCenter)
+                arrow.setStyleSheet('color: #636370; font-size: 14px; padding: 0 4px;')
+                layout.addWidget(arrow)
+            btn = QPushButton(name)
+            btn.setObjectName('overviewChip')
+            btn.setStyleSheet(
+                f'QPushButton#overviewChip {{ background: transparent; border: 2px solid {color}; '
+                f'border-radius: 6px; color: {color}; font-size: 11px; font-weight: 600; '
+                f'padding: 6px 8px; min-width: 60px; }}'
+                f'QPushButton#overviewChip:hover {{ background: {color}22; }}'
+            )
+            btn.clicked.connect(lambda _, k=key: self.go_to(k))
+            layout.addWidget(btn)
+
+        layout.addStretch(1)
+        return host
+
+    # ── Stage: Tokenization ───────────────────────────────────────────────────
+
     def _tokenization(self):
         card = self._stage_card('tokenization')
-        card.field('Why it exists', 'Token IDs address a fixed vocabulary. A token can be a word, part of a word, punctuation, or a control marker.')
-        card.equation('Prompt + chat formatting → tokenizer → ordered token IDs')
-        card.field('Shape', f'T = {len(self.capture.prompt_tokens)} input tokens; batch B = {self.capture.embedding.shape[0]}.')
-        card.field('How to read it',
-                   'Position is the sequence index. The strings below are the saved tokenizer spellings, not a new decode. '
-                   'Markers such as Ġ and Ċ commonly encode whitespace in these tokenizers. Chat control tokens can appear even though you did not type them. '
-                   'The formatted prompt text and full tokenizer vocabulary are not persisted.')
+
+        card.add(label('WHY IT EXISTS', muted=True))
+        card.add(label('Neural networks operate on vectors of numbers, not characters. A tokenizer maps '
+                       'text to integer IDs that index a fixed vocabulary. These IDs are the only '
+                       'input the model receives.'))
+
+        card.equation('Prompt text + chat formatting  →  tokenizer  →  ordered token IDs  →  embedding lookup')
+
+        card.add(label('SHAPE', muted=True))
+        T = len(self.capture.prompt_tokens)
+        B = self.capture.embedding.shape[0]
+        card.add(label(
+            f'T = {T} input tokens  ·  batch B = {B}  ·  '
+            f'each token ID is a single integer in [0, vocabulary_size)'))
+
+        card.add(label('HOW TO READ IT', muted=True))
+        card.add(label(
+            'Position is the sequence index (0-based). The Token ID column shows the vocabulary '
+            'lookup key. The spelling column shows the tokenizer\'s internal piece, not a re-decode — '
+            'markers like Ġ and Ċ often encode whitespace. Chat control tokens (role markers, generation '
+            'prefix) may appear here even though you did not type them; the chat template added them '
+            'before tokenization.'))
+
         card.add(token_table(self.capture))
-        card.field('Next', 'Each token ID selects one learned embedding vector.')
+        card.field('What happens next',
+                   'Each token ID selects one row from the learned embedding table, producing a '
+                   f'{self.facts["hidden_size"]}-dimensional feature vector.')
         return card
+
+    # ── Stage: Embedding ──────────────────────────────────────────────────────
+
+    def _embedding(self):
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        # Phase selector + badge
+        phase_row = QHBoxLayout()
+        self.phase_picker = QComboBox()
+        self.phase_picker.addItems(['Phase 1 · Prompt prefill',
+                                    'Phase 2 · First generated-token pass'])
+        self.phase_picker.setCurrentIndex(int(self.generated))
+        self.phase_picker.currentIndexChanged.connect(self._phase_changed)
+        self._phase_badge = PhaseBadge(self.generated)
+        phase_row.addWidget(self.phase_picker, 1)
+        phase_row.addWidget(self._phase_badge)
+        layout.addLayout(phase_row)
+
+        array = self.capture.generated_embedding if self.generated else self.capture.embedding
+        H = array.shape[-1]
+
+        card = self._stage_card('embedding')
+        card.add(label('WHY IT EXISTS', muted=True))
+        card.add(label('The model has no notion of meaning for integer IDs. The embedding table '
+                       'maps each ID to a dense vector of learned real-valued features. These vectors '
+                       'are the starting point that all subsequent computation refines.'))
+
+        card.equation('token ID  →  row of learned embedding table  →  X  =  initial feature vector')
+
+        card.add(label('SHAPE', muted=True))
+        card.shape_diagram([
+            ('X', 'q', (array.shape[0], array.shape[-2] if array.ndim >= 3 else 1, H)),
+        ], operator='=')
+        card.add(label(
+            f'[batch × tokens × hidden]  =  [{array.shape[0]} × '
+            f'{array.shape[-2] if array.ndim >= 3 else 1} × {H}]\n'
+            f'Each token gets a {H}-dimensional feature vector. Stored dtype: {array.dtype}.'))
+
+        card.add(label('HOW TO READ IT', muted=True))
+        card.add(label(
+            'Each row is one token\'s initial feature vector. Column indices are just coordinates in '
+            'the learned embedding space — they are not named properties like "subject" or "verb". '
+            'The embedding table itself is not saved; only the rows used for this specific input.'))
+
+        if self.generated:
+            card.add(label(
+                f'In this phase, only the first generated token {self.capture.tokens[0]!r} '
+                'is embedded. The prompt\'s information is available through the key/value cache '
+                'inside each attention layer — it does not pass through embedding again.',
+                muted=True))
+
+        self._tensor_disclosure(card, 'embedding', array)
+        card.field('What happens next',
+                   f'Layer 0 receives this tensor and normalizes each token\'s {H}-dimensional '
+                   'feature vector before the attention projections.')
+        layout.addWidget(card)
+        return host
+
+    # ── Phase controls ────────────────────────────────────────────────────────
 
     def _phase_controls(self, layout):
         row = QHBoxLayout()
         row.addWidget(label('Captured phase'))
         self.phase_picker = QComboBox()
-        self.phase_picker.addItems(['1 · Prompt prefill', '2 · First generated-token pass'])
+        self.phase_picker.addItems(['Phase 1 · Prompt prefill',
+                                    'Phase 2 · First generated-token pass'])
         self.phase_picker.setCurrentIndex(int(self.generated))
         self.phase_picker.currentIndexChanged.connect(self._phase_changed)
         row.addWidget(self.phase_picker, 1)
+        self._phase_badge = PhaseBadge(self.generated)
+        row.addWidget(self._phase_badge)
         layout.addLayout(row)
 
     def _phase_changed(self, index):
         self.generated = bool(index)
         self.go_to(self._stage_key)
+
+    # ── Tensor disclosure ─────────────────────────────────────────────────────
 
     def _inspect(self, name, tensor):
         generated = self.generated
@@ -225,77 +585,89 @@ class StoryView(QWidget):
                                row_labels=rows if name != 'final_logits' else None,
                                column_labels=columns)
 
-    def _tensor(self, card, name, tensor):
-        """Shape and meaning precede any request to instantiate a numerical view."""
+    def _tensor_disclosure(self, card, name, tensor):
+        """Shape summary + a disclosure button for the full inspector."""
         meanings = axes_for(name, tensor)
         card.add(label(f'{name}   {shape(tensor)}   ·   stored {tensor.dtype}'))
         card.add(label('Axes: ' + ' × '.join(meanings), muted=True))
-        card.add(Disclosure(f'Inspect captured {name}', lambda: self._inspect(name, tensor)))
+        card.add(Disclosure(f'Inspect captured {name}',
+                             lambda n=name, t=tensor: self._inspect(n, t)))
 
-    def _embedding(self):
-        host = QWidget()
-        layout = QVBoxLayout(host)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self._phase_controls(layout)
-        card = self._stage_card('embedding')
-        array = self.capture.generated_embedding if self.generated else self.capture.embedding
-        card.field('Why it exists', 'Attention operates on feature vectors, not vocabulary IDs. The embedding lookup supplies the initial vector for each token.')
-        card.equation('token ID → row of learned embedding table → X')
-        card.field('How to read it', f'Each token has {array.shape[-1]} learned features. Columns are numerical coordinates, not named meanings. '
-                   'This is the captured lookup output; the learned embedding table itself is not saved.')
-        if self.generated:
-            card.add(label(f'Input for this pass: {self.capture.tokens[0]!r}. Only this new token is embedded; prompt K/V are reused in attention.', muted=True))
-        self._tensor(card, 'embedding', array)
-        card.field('Next', 'Layer 0 receives this tensor and normalizes each token’s feature vector before its attention projections.')
-        layout.addWidget(card)
-        return host
+    # Keep old API name used by external tests / other places
+    def _tensor(self, card, name, tensor):
+        return self._tensor_disclosure(card, name, tensor)
+
+    # ── Stage: Transformer Layers ─────────────────────────────────────────────
 
     def _layers_stage(self):
         host = QWidget()
-        layout = QVBoxLayout(host)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-        self._phase_controls(layout)
-        row = QHBoxLayout()
-        self.previous_layer = QPushButton('← Previous layer')
-        self.next_layer = QPushButton('Next layer →')
+        host_layout = QHBoxLayout(host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(0)
+
+        # Left: layer + step navigation sidebar
+        nav_panel = QWidget()
+        nav_panel.setObjectName('layerNavPanel')
+        nav_panel.setFixedWidth(180)
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(0, 0, 10, 0)
+        nav_layout.setSpacing(12)
+
+        # Phase selector
+        self._phase_controls(nav_layout)
+
+        # Layer picker
+        nav_layout.addWidget(label('LAYER', muted=True))
+        layer_row = QHBoxLayout()
+        self.previous_layer = QPushButton('◀')
+        self.previous_layer.setFixedWidth(30)
+        self.next_layer = QPushButton('▶')
+        self.next_layer.setFixedWidth(30)
         self.picker = QComboBox()
         indices = sorted(self.capture.layers)
         for index in indices:
             self.picker.addItem(f'Layer {index}', index)
         self.picker.setCurrentIndex(indices.index(self.layer_index))
         self.picker.currentIndexChanged.connect(self._layer_changed)
-        self.previous_layer.clicked.connect(lambda: self.picker.setCurrentIndex(self.picker.currentIndex() - 1))
-        self.next_layer.clicked.connect(lambda: self.picker.setCurrentIndex(self.picker.currentIndex() + 1))
+        self.previous_layer.clicked.connect(
+            lambda: self.picker.setCurrentIndex(self.picker.currentIndex() - 1))
+        self.next_layer.clicked.connect(
+            lambda: self.picker.setCurrentIndex(self.picker.currentIndex() + 1))
         self.previous_layer.setEnabled(self.layer_index != indices[0])
         self.next_layer.setEnabled(self.layer_index != indices[-1])
-        row.addWidget(self.previous_layer)
-        row.addWidget(self.picker, 1)
-        row.addWidget(self.next_layer)
-        layout.addLayout(row)
-        layout.addWidget(label(f'All {len(indices)} layers repeat this general computation with different learned parameters and activations. '
-                               'A layer preserves the hidden width so its output can feed the next layer.', muted=True))
-        self.step_picker = QComboBox()
-        for key, title in LAYER_STEPS:
-            self.step_picker.addItem(title, key)
-        self.step_picker.setCurrentIndex([k for k, _ in LAYER_STEPS].index(self.step_key))
-        self.step_picker.currentIndexChanged.connect(self._step_changed)
-        layout.addWidget(self.step_picker)
+        layer_row.addWidget(self.previous_layer)
+        layer_row.addWidget(self.picker, 1)
+        layer_row.addWidget(self.next_layer)
+        nav_layout.addLayout(layer_row)
+
+        context = label(
+            f'All {len(indices)} layers repeat this same structure with different learned '
+            'weights and activations. Each layer preserves the hidden width so its output '
+            'feeds directly into the next.', muted=True)
+        nav_layout.addWidget(context)
+
+        # Step sidebar
+        self.step_sidebar = LayerStepSidebar(self._step_navigate)
+        self.step_sidebar.set_current(self.step_key)
+        nav_layout.addWidget(self.step_sidebar)
+        nav_layout.addStretch(1)
+        host_layout.addWidget(nav_panel)
+
+        # Right: layer step card
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
         self.layer_section = self._layer_card()
-        layout.addWidget(self.layer_section)
-        controls = QHBoxLayout()
-        prev = QPushButton('← Previous operation')
-        nxt = QPushButton('Next operation →')
-        pos = [k for k, _ in LAYER_STEPS].index(self.step_key)
-        prev.setEnabled(pos > 0)
-        nxt.setEnabled(pos < len(LAYER_STEPS) - 1)
-        prev.clicked.connect(lambda: self.step_picker.setCurrentIndex(pos - 1))
-        nxt.clicked.connect(lambda: self.step_picker.setCurrentIndex(pos + 1))
-        controls.addWidget(prev)
-        controls.addStretch(1)
-        controls.addWidget(nxt)
-        layout.addLayout(controls)
+        right_layout.addWidget(self.layer_section)
+        right_layout.addStretch(1)
+        host_layout.addWidget(right, 1)
+
         return host
+
+    def _step_navigate(self, key: str) -> None:
+        self.step_key = key
+        self.go_to('layers')
 
     def _layer_changed(self, position):
         index = self.picker.itemData(position)
@@ -313,116 +685,340 @@ class StoryView(QWidget):
         layers = self.capture.generated_layers if self.generated else self.capture.layers
         tensors = layers[self.layer_index].tensors
         norm = tensors['normalized_input']
-        q, k, v = (tensors[n] for n in ('q_attended', 'k_attended', 'v_attended'))
-        # Dimensions are taken from the captured operands, never hidden_size / heads.
-        tq, tk, d = q.shape[-2], k.shape[-2], q.shape[-1]
+        q_att, k_att, v_att = (tensors[n] for n in ('q_attended', 'k_attended', 'v_attended'))
+        tq = q_att.shape[-2]
+        tk = k_att.shape[-2]
+        d = q_att.shape[-1]
+        dv = v_att.shape[-1]
         hidden = norm.shape[-1]
-        heads = q.shape[-3]
+        heads = q_att.shape[-3]
         step = self.step_key
+
         if step == 'input':
-            card = Card('Normalize the incoming representation', TENSOR_EXPLANATIONS['normalized_input'])
-            previous = sorted(layers).index(self.layer_index) - 1
-            source = 'embedding' if previous < 0 else f'layer_output from layer {sorted(layers)[previous]}'
-            card.field('Where it came from', f'The {source} is this layer’s input X.')
-            card.field('Why the model needs it', 'Normalization controls the scale of each token’s features before the learned projections, helping keep a deep stack numerically well behaved.')
-            card.equation('X → input_layernorm(X) → X_norm<br>For Qwen RMSNorm: x / √(mean(x²) + ε) ⊙ g')
-            card.add(label('Equation only: normalization parameters g and ε and its internal arithmetic are not stored in the run.', muted=True))
-            self._tensor(card, 'normalized_input', norm)
-            card.field('Next', 'The same normalized vector feeds three different learned linear projections: Q, K, and V.')
+            return self._card_normalize(tensors, norm, hidden)
         elif step == 'qkv':
-            card = Card('Three projections, three roles', 'Q and K define which tokens interact. V supplies the feature content that attention will combine. '
-                        'These are learned linear transformations of the same normalized input.')
-            card.field('Operation', 'For PyTorch Linear: X_norm @ Wᵀ + bias (where present). The saved run contains each projection output; it does not contain W or bias.')
-            for name, role in [('q', 'Query · what features this position seeks'),
-                               ('k', 'Key · features against which queries are compared'),
-                               ('v', 'Value · content available for weighted mixing')]:
-                width = tensors[name].shape[-1]
-                color = COLORS[name]
-                card.equation(f'<span style="color:{color}"><b>{name.upper()} · {role}</b></span><br>'
-                              f'[{tq} × <b>{hidden}</b>] @ [<b>{hidden}</b> × {width}] → [{tq} × {width}]')
-                card.add(label(f'Inner dimensions {hidden} match. Weight dimensions are inferred from input/output shapes for the equation; weight values are unavailable. Batch axis is retained below.', muted=True))
-                card.add(label(TENSOR_EXPLANATIONS[name], rich=True))
-                self._tensor(card, name, tensors[name])
-            card.field('Next', 'Split projection features into heads, apply architecture-specific preparation, and align Q/K/V for attention.')
+            return self._card_qkv(tensors, tq, hidden, heads, d)
         elif step == 'prepare':
-            card = Card('Before preparation → tensors used by attention',
-                        'A head is one parallel attention computation with its own query/key feature subspace. '
-                        'Several query heads can share key/value heads (grouped-query attention, GQA).')
-            is_qwen3 = 'qwen3' in str(self.capture.metadata.get('model', '')).lower()
-            prep = ('For this Qwen3 model, preparation includes per-head Q/K normalization and rotary position encoding (RoPE) on Q/K. '
-                    if is_qwen3 else 'Preparation can include model-specific Q/K normalization and positional transformations such as RoPE. ')
-            card.field('What happens', prep + 'RoPE rotates pairs of Q/K coordinates according to token position, so dot products can depend on relative position. '
-                       'K/V heads are expanded by repeat_kv for the attention computation. These internal steps are not separately persisted.')
-            if self.generated:
-                card.field('KV cache', 'The new token supplies one new query and new K/V. Cached prompt K/V are included before attention. '
-                           f'That is why query length is {tq} but key length is {tk}. Prompt tokens are not run through the entire layer again.')
-            for name in ('q', 'k', 'v'):
-                attended = name + '_attended'
-                card.equation(f'<span style="color:{COLORS[name]}"><b>{name.upper()}</b></span> '
-                              f'{shape(tensors[name])} → {shape(tensors[attended])}')
-                card.add(label(TENSOR_EXPLANATIONS[attended], rich=True))
-                self._tensor(card, attended, tensors[attended])
-            card.field('Dimensions in this run', f'B = {q.shape[0]} batch · H = {heads} query heads · d_head = {d} features per Q/K head. '
-                       f'd_model = {hidden}. These are independent dimensions read from this run; H × d_head need not equal d_model.')
-            card.field('Next', 'Use the prepared Q and K, not the raw projections, to calculate attention scores.')
+            return self._card_prepare(tensors, tq, tk, d, hidden, heads)
         elif step == 'scores':
-            card = Card('From comparisons to a distribution',
-                        'Each query vector is compared with every available key vector. A dot product measures their learned compatibility. '
-                        'Softmax then determines how much of each value vector the query will receive.')
-            card.equation(f'<span style="color:{COLORS["q"]}">Q [{tq} × <b>{d}</b>]</span> @ '
-                          f'<span style="color:{COLORS["k"]}">Kᵀ [<b>{d}</b> × {tk}]</span> → QKᵀ [{tq} × {tk}]<br>'
-                          'QKᵀ → scaling + causal mask → <b>captured scores</b> → softmax over keys → <b>captured weights</b>')
-            card.field('Why the dimensions work', f'For one head and batch, the two inner dimensions both equal {d}. '
-                       f'Each of the {tq} queries yields {tk} dot products. Full score/weight axes are [batch, head, query token, key token].')
-            card.field('Captured versus conceptual',
-                       'The saved scores are already scaled and masked: the exact input handed to softmax. '
-                       'The unscaled QKᵀ product, scale parameter and mask alone are not saved. The conventional scale is 1/√d_head; no scale value is reconstructed here.')
-            card.field('How to read the grids',
-                       'Row = query token; column = key token. Softmax exponentiates and normalizes across each row. '
-                       'Captured weights sum approximately to one because of dtype rounding. They are mixing weights, not vocabulary probabilities or a causal explanation of the answer. '
-                       'Future positions have suppressed scores (possibly very negative finite values or −∞) and zero weights under causal masking.')
-            if self.generated:
-                card.add(label('This is a one-query pass over cached prompt keys plus the new token. All displayed keys are available; do not expect a triangular future-token region.', muted=True))
-            card.add(label(f'Captured scores {shape(tensors["attention_scores"])} → weights {shape(tensors["attention_weights"])}'))
-            self.attention = AttentionExplorer(tensors, token_labels(self.capture, self.generated),
-                                              token_labels(self.capture, self.generated, keys=True),
-                                              layer_index=self.layer_index,
-                                              phase='first_generated_token' if self.generated else 'prefill')
-            card.add(self.attention)
-            card.field('Next', 'Use each captured weight row to combine V vectors, then join head results and apply the output projection.')
+            return self._card_scores(tensors, tq, tk, d, hidden, heads)
         elif step == 'mix':
-            dv = v.shape[-1]
-            card = Card('Mix value vectors, then project the head results', TENSOR_EXPLANATIONS['attention_output'])
-            card.field('Why the model needs it', 'The weights determine which positions contribute. Multiplication by V transports their feature content into each query position. '
-                       'The output projection mixes head features back into the residual stream’s hidden width.')
-            card.equation(f'<span style="color:{COLORS["weights"]}">weights [{tq} × <b>{tk}</b>]</span> @ '
-                          f'<span style="color:{COLORS["v"]}">V [<b>{tk}</b> × {dv}]</span> → head result [{tq} × {dv}]<br>'
-                          f'concat({heads} heads) [{tq} × {heads * dv}] → Linear_o → [{tq} × {hidden}]')
-            card.field('Capture boundary', 'The per-head weights @ V result and the concatenated tensor before o_proj are NOT persisted. '
-                       'The diagram gives their conceptual shapes from the captured operands, not numerical tensors. '
-                       'attention_output is the captured output of o_proj, after that learned output projection.')
-            self._tensor(card, 'v_attended', v)
-            self._tensor(card, 'attention_output', tensors['attention_output'])
-            card.field('Next', 'The decoder layer combines the attention branch with its residual stream and runs its remaining computation.')
+            return self._card_mix(tensors, tq, tk, dv, heads, hidden, v_att)
         else:
-            card = Card('Finish this decoder layer', TENSOR_EXPLANATIONS['layer_output'])
-            card.equation('Captured attention_output<br>↓<br>'
-                          'Residual addition → post-attention normalization → feed-forward / MLP → residual addition<br>'
-                          '<i>Conceptual decoder computation · these intermediates are not separately captured</i><br>↓<br>'
-                          'Captured layer_output')
-            card.field('Why there is more computation', 'Attention exchanges information between positions. The feed-forward network transforms features at each position. '
-                       'Residual paths add branch results back to the running representation. The shown order describes the supported Qwen dense decoder blocks.')
-            self._tensor(card, 'layer_output', tensors['layer_output'])
-            last = self.layer_index == sorted(layers)[-1]
-            card.field('Next', ('After the last layer, final normalization and the vocabulary projection produce logits. '
-                               'Their internal tensors and learned weights are not saved; only the prefill final-position logits vector is persisted.') if last else
-                       f'This [{tq} × {hidden}] representation (plus batch axis) becomes the next layer’s input. The token count and hidden width are compatible without reshaping.')
-            button = QPushButton('Go to final token decision →' if last else 'Follow into the next layer →')
-            if last:
-                button.clicked.connect(lambda: self.go_to('logits'))
-            else:
-                button.clicked.connect(self._follow_layer)
+            return self._card_output(tensors, tq, hidden, layers)
+
+    # ── Layer step cards ──────────────────────────────────────────────────────
+
+    def _card_normalize(self, tensors, norm, hidden):
+        layers = self.capture.generated_layers if self.generated else self.capture.layers
+        previous = sorted(layers).index(self.layer_index) - 1
+        source = ('embedding' if previous < 0
+                  else f'layer_output from layer {sorted(layers)[previous]}')
+
+        card = Card('Step 1 · Normalize the incoming representation',
+                    TENSOR_EXPLANATIONS['normalized_input'])
+        card.add(label('WHY IT EXISTS', muted=True))
+        card.add(label(
+            'Deep networks can accumulate extreme activation magnitudes layer by layer. '
+            'RMSNorm rescales each token\'s feature vector so the Q/K/V projections '
+            'operate on a controlled scale, regardless of how large the features became '
+            'in the previous layer.'))
+
+        card.add(label('OPERATION', muted=True))
+        card.equation(
+            f'Input X  ({source})<br>'
+            '↓<br>'
+            '<b>RMSNorm(X)</b>  =  X / √(mean(x²) + ε) ⊙ g<br>'
+            '↓<br>'
+            '<b>X_norm</b>  (captured — feeds Q, K, V projections)')
+        card.add(label(
+            'Normalization scale g and ε are learned parameters not saved in the capture. '
+            'The division and element-wise scale are conceptual — only the final output is captured.',
+            muted=True))
+
+        card.add(label('SHAPE', muted=True))
+        card.shape_diagram([
+            ('X_norm', 'norm', norm.shape),
+        ], operator='=')
+        card.add(label(f'[batch × tokens × hidden]  =  {shape(norm)}  ·  stored {norm.dtype}'))
+
+        self._tensor_disclosure(card, 'normalized_input', tensors['normalized_input'])
+        card.field('What happens next',
+                   'The same X_norm tensor feeds three separate learned linear projections: '
+                   'Q, K, and V — all from this one normalized representation.')
+        return card
+
+    def _card_qkv(self, tensors, tq, hidden, heads, d):
+        card = Card('Step 2 · Three projections, three roles',
+                    'Q and K define which tokens interact. V supplies the feature content '
+                    'attention will combine. All three are computed from the same normalized input.')
+
+        card.add(label('WHY THREE PROJECTIONS?', muted=True))
+        card.add(label(
+            'A single vector cannot simultaneously express "what I\'m looking for" (query), '
+            '"what I offer for others to find" (key), and "what content I contribute" (value). '
+            'Three separate learned projections specialize for each role. Each has its own '
+            'weight matrix, learned from data.'))
+
+        card.add(label('OPERATION', muted=True))
+        card.equation(
+            'X_norm  W_Qᵀ  →  Q_raw    (what this position searches for)<br>'
+            'X_norm  W_Kᵀ  →  K_raw    (what this position presents to be found)<br>'
+            'X_norm  W_Vᵀ  →  V_raw    (what content this position contributes)<br><br>'
+            'PyTorch Linear: output = input @ Wᵀ + bias (bias where architecture uses it). '
+            'Weight matrices are not saved in the capture.')
+
+        card.add(label('DIMENSION COMPATIBILITY', muted=True))
+        for name, role, color_key in [
+            ('Q_raw', 'what each token looks for', 'q'),
+            ('K_raw', 'what each token presents', 'k'),
+            ('V_raw', 'what content each token offers', 'v'),
+        ]:
+            raw_key = name[0].lower()  # 'q', 'k', or 'v'
+            width = tensors[raw_key].shape[-1]
+            card.shape_diagram([
+                ('X_norm', 'norm', (tq, hidden)),
+                (f'W_{name[0]}ᵀ', color_key, (hidden, width)),
+                (name, color_key, (tq, width)),
+            ])
+            card.add(label(
+                f'Inner dimension {hidden} matches. Output: {tq} tokens × {width} projection features. '
+                f'Batch axis omitted in diagram; present in stored tensor.',
+                muted=True))
+            card.add(label(TENSOR_EXPLANATIONS[raw_key]))
+            self._tensor_disclosure(card, raw_key, tensors[raw_key])
+            card.section_rule()
+
+        card.field('What happens next',
+                   'The raw projections are split into attention heads, rotated by positional '
+                   'encodings (RoPE), and optionally normalized (Qwen3). Only then do they '
+                   'enter the attention computation.')
+        return card
+
+    def _card_prepare(self, tensors, tq, tk, d, hidden, heads):
+        is_qwen3 = 'qwen3' in str(self.capture.metadata.get('model', '')).lower()
+
+        card = Card('Step 3 · Prepare Q / K / V for attention',
+                    'A head is one parallel attention channel operating on a subspace of the '
+                    'full projection. Several heads run simultaneously, each finding different '
+                    'relationship patterns.')
+
+        card.add(label('WHAT HAPPENS DURING PREPARATION', muted=True))
+        if is_qwen3:
+            prep_text = (
+                'For this Qwen3 model, preparation applies three operations in order: '
+                '(1) reshape each projection into per-head slices, '
+                '(2) per-head Q and K normalization (QK-norm, a Qwen3 addition), '
+                '(3) RoPE — a rotary position encoding that rotates pairs of Q/K features '
+                'according to token position, so dot products reflect relative position.')
+        else:
+            prep_text = (
+                'Preparation reshapes each projection into per-head slices, then applies '
+                'RoPE — a rotary position encoding that rotates pairs of Q/K features '
+                'according to token position, so their dot products reflect relative position. '
+                'V is not rotated by RoPE, though it inherits positional information from '
+                'previous layers.')
+        card.add(label(prep_text))
+        card.add(label(
+            'GQA (grouped-query attention): Qwen uses fewer K/V heads than Q heads. '
+            'The attention implementation repeats K/V heads via repeat_kv to match '
+            'the query-head count. These internal steps are not individually captured.',
+            muted=True))
+
+        if self.generated:
+            card.add(label(
+                f'KV cache: the new token contributes one new query (Q length = {tq}) '
+                f'but the K/V tensors include cached prompt keys/values '
+                f'(K/V length = {tk}). Prompt tokens are not re-run through this layer.',
+                muted=True))
+
+        card.add(label('BEFORE vs. AFTER PREPARATION', muted=True))
+        for raw_key in ('q', 'k', 'v'):
+            attended_key = raw_key + '_attended'
+            raw = tensors[raw_key]
+            attended = tensors[attended_key]
+            card.equation(
+                f'<span style="color:{COLORS[raw_key]}"><b>{raw_key.upper()}_raw</b></span>  '
+                f'{shape(raw)}  →  '
+                f'<b>reshape + RoPE{"+ QK-norm" if is_qwen3 and raw_key in ("q","k") else ""}'
+                f'{"+ repeat_kv" if raw_key in ("k","v") else ""}</b>  →  '
+                f'<span style="color:{COLORS[raw_key]}"><b>{raw_key.upper()}_attended</b></span>  '
+                f'{shape(attended)}')
+            card.add(label(TENSOR_EXPLANATIONS[attended_key]))
+            self._tensor_disclosure(card, attended_key, attended)
+            card.section_rule()
+
+        card.field('Dimensions in this run',
+                   f'B = {tensors["q_attended"].shape[0]} batch  ·  '
+                   f'H = {heads} query heads  ·  '
+                   f'd_head = {d} features per Q/K head  ·  '
+                   f'd_model = {hidden}  ·  '
+                   f'T_query = {tq}  ·  T_key = {tk}')
+        card.field('What happens next',
+                   'Q_attended and K_attended enter the dot-product attention calculation.')
+        return card
+
+    def _card_scores(self, tensors, tq, tk, d, hidden, heads):
+        card = Card('Step 4 · Compute attention scores and weights',
+                    'Each query vector is compared with every available key vector. '
+                    'A dot product measures their learned compatibility. Softmax converts '
+                    'the row of comparison scores into a normalized distribution.')
+
+        card.add(label('OPERATION', muted=True))
+        card.equation(
+            f'<span style="color:{COLORS["q"]}">Q  [{tq} × {d}]</span>  @  '
+            f'<span style="color:{COLORS["k"]}">Kᵀ  [{d} × {tk}]</span>  →  '
+            f'QKᵀ  [{tq} × {tk}]<br>'
+            '↓  scale by 1/√d_head  +  add causal mask<br>'
+            f'<span style="color:{COLORS["scores"]}">Scores  (captured)  [{tq} × {tk}]</span><br>'
+            '↓  softmax across key dimension (each row independently)<br>'
+            f'<span style="color:{COLORS["weights"]}">Weights  (captured)  [{tq} × {tk}]</span>')
+
+        card.add(label('WHY THE DIMENSIONS WORK', muted=True))
+        card.shape_diagram([
+            ('Q_attended', 'q', (tq, d)),
+            ('K_attendedᵀ', 'k', (d, tk)),
+            ('QKᵀ → Scores', 'scores', (tq, tk)),
+        ])
+        card.add(label(
+            f'Inner dimension d_head = {d} cancels. Each of the {tq} query tokens yields '
+            f'{tk} dot products — one per available key. Full axes: [batch, head, query, key].'))
+
+        card.add(label('WHAT EACH CAPTURED TENSOR CONTAINS', muted=True))
+        card.add(label(
+            f'<b style="color:{COLORS["scores"]}">Captured scores:</b>  already scaled '
+            f'(×1/√{d}) and masked — exactly what is handed to softmax. '
+            'Causal masking adds very large negative values to future positions, making '
+            'them near-zero after softmax. The unscaled QKᵀ and the mask alone are not separately stored.<br><br>'
+            f'<b style="color:{COLORS["weights"]}">Captured weights:</b>  softmax output — '
+            'each score row is exponentiated and normalized to sum ≈ 1. These are mixing '
+            'coefficients for V vectors, not vocabulary probabilities.',
+            rich=True))
+
+        if self.generated:
+            card.add(label(
+                'In this one-query pass: the query length is 1, key length covers all '
+                'cached prompt tokens plus the new token. There is no future to mask.',
+                muted=True))
+
+        # AttentionExplorer — placed inline here because this is the primary display for scores/weights
+        card.add(label('CAPTURED ATTENTION DATA', muted=True))
+        card.add(label(
+            'Select head and query token. Rows = query tokens; columns = key tokens. '
+            'Values are displayed with 4 significant figures; hover or click for exact captured value. '
+            'Colors are display aids only.',
+            muted=True))
+        try:
+            self.attention = AttentionExplorer(
+                tensors,
+                token_labels(self.capture, self.generated),
+                token_labels(self.capture, self.generated, keys=True),
+                layer_index=self.layer_index,
+                phase='first_generated_token' if self.generated else 'prefill')
+            card.add(self.attention)
+        except Exception:
+            card.add(label('Attention explorer could not be constructed for this capture.', muted=True))
+
+        card.field('What happens next',
+                   'The weight matrix multiplies V_attended to mix value vectors weighted '
+                   'by attention. Head results are concatenated and projected by o_proj.')
+        return card
+
+    def _card_mix(self, tensors, tq, tk, dv, heads, hidden, v_att):
+        card = Card('Step 5 · Mix values and apply the output projection',
+                    TENSOR_EXPLANATIONS['attention_output'])
+
+        card.add(label('WHY THIS STEP EXISTS', muted=True))
+        card.add(label(
+            'The attention weights determined how much each key position contributes. '
+            'Multiplying by V transports that content into each query position. '
+            'The output projection (o_proj) then maps the multi-head result back '
+            'into the residual stream\'s hidden width.'))
+
+        card.add(label('OPERATION (with conceptual intermediates)', muted=True))
+        card.equation(
+            f'<span style="color:{COLORS["weights"]}">Weights  [{tq} × {tk}]</span>  @  '
+            f'<span style="color:{COLORS["v"]}">V_attended  [{tk} × {dv}]</span>  →  '
+            f'head result  [{tq} × {dv}]<br>'
+            f'concat({heads} heads)  [{tq} × {heads * dv}]  →  '
+            f'<span style="color:{COLORS["output"]}">Linear_o  →  attention_output  [{tq} × {hidden}]</span>')
+
+        card.add(label('CAPTURE BOUNDARY', muted=True))
+        card.add(label(
+            'The per-head (weights @ V) result and the concatenated multi-head tensor '
+            '<b>are not individually persisted.</b>  The diagram shows their conceptual '
+            'shapes from the captured operands — not numerical values from capture. '
+            '<b>attention_output</b> is the captured output of o_proj, after that projection.',
+            rich=True))
+
+        card.shape_diagram([
+            ('concat(heads)', 'output', (tq, heads * dv)),
+            ('W_oᵀ', 'output', (heads * dv, hidden)),
+            ('attention_output', 'output', (tq, hidden)),
+        ])
+
+        card.section_rule()
+        self._tensor_disclosure(card, 'v_attended', v_att)
+        card.section_rule()
+        self._tensor_disclosure(card, 'attention_output', tensors['attention_output'])
+
+        card.field('What happens next',
+                   'The decoder layer combines the attention branch with its residual stream '
+                   'and then runs the feed-forward network.')
+        return card
+
+    def _card_output(self, tensors, tq, hidden, layers):
+        card = Card('Step 6 · Finish this decoder layer',
+                    TENSOR_EXPLANATIONS['layer_output'])
+
+        card.add(label('OPERATIONS NOT INDIVIDUALLY CAPTURED', muted=True))
+        card.equation(
+            '<b>Captured:</b>  attention_output  (from o_proj)<br>'
+            '↓<br>'
+            'Residual addition:  X_residual = X_input + attention_output<br>'
+            'Post-attention normalization:  X_post_norm = RMSNorm(X_residual)<br>'
+            'Feed-forward network (MLP):  X_mlp = MLP(X_post_norm)<br>'
+            '  — gate activation, two weight matrices, element-wise multiplication<br>'
+            'Residual addition:  X_out = X_residual + X_mlp<br>'
+            '↓<br>'
+            '<b>Captured:</b>  layer_output')
+
+        card.add(label(
+            'Attention mixes information across token positions. '
+            'The MLP transforms features at each position independently. '
+            'Residual connections let the layer add to the existing representation rather '
+            'than replace it. These intermediate tensors are not individually saved.',
+            muted=True))
+
+        card.shape_diagram([
+            ('layer_output', 'layer', tensors['layer_output'].shape),
+        ], operator='=')
+        card.add(label(
+            f'{shape(tensors["layer_output"])}  =  [batch × tokens × hidden]  ·  '
+            f'stored {tensors["layer_output"].dtype}'))
+
+        self._tensor_disclosure(card, 'layer_output', tensors['layer_output'])
+
+        last = self.layer_index == sorted(layers)[-1]
+        if last:
+            card.field('What happens next',
+                       'This is the last decoder layer. Its output passes through a final '
+                       'RMSNorm and a vocabulary projection to produce logits. '
+                       'Those intermediate tensors and learned weights are not saved — '
+                       'only the prefill final-position logits vector is captured.')
+            button = QPushButton('Continue to final token decision →')
+            button.setObjectName('primary')
+            button.clicked.connect(lambda: self.go_to('logits'))
             card.add(button)
+        else:
+            card.field('What happens next',
+                       f'This [{tq} × {hidden}] tensor (with batch axis) becomes '
+                       f'the input to layer {self.layer_index + 1}. '
+                       'Token count and hidden width are unchanged.')
+            button = QPushButton(f'Follow into layer {self.layer_index + 1} →')
+            button.clicked.connect(self._follow_layer)
+            card.add(button)
+
         return card
 
     def _follow_layer(self):
@@ -431,60 +1027,141 @@ class StoryView(QWidget):
         self.step_key = 'input'
         self.go_to('layers')
 
+    # ── Stage: Logits / Word Choice ───────────────────────────────────────────
+
     def _word_choice(self):
         card = self._stage_card('logits')
+
         position = len(self.capture.prompt_tokens) - 1
-        card.field('Which position makes this decision?', f'Prompt prefill · final position {position} · stored token spelling {self.capture.prompt_tokens[-1]!r}. '
-                   'Its contextual representation includes the preceding prompt. This stage always describes prefill, regardless of the phase selected in the layer explorer.')
-        card.equation('last layer → final normalization → vocabulary projection → logits at final prompt position → argmax → first token')
-        card.field('What is a logit?', 'An unnormalized score for one vocabulary entry. It is not a probability. TensorScope uses greedy selection: argmax returns the index of the largest captured score. '
-                   'No vocabulary probabilities are calculated or displayed.')
+        card.add(label('WHY THIS POSITION?', muted=True))
+        card.add(label(
+            f'In a causal (left-to-right) language model, only the last prompt position\'s '
+            f'representation has attended to all preceding tokens. Its logits vector is the '
+            f'model\'s vocabulary score after reading the entire prompt. Position {position} '
+            f'corresponds to stored token {self.capture.prompt_tokens[-1]!r}.'))
+
+        card.add(label('OPERATION', muted=True))
+        card.equation(
+            'last layer output  →  final RMSNorm  →  vocabulary projection<br>'
+            '↓<br>'
+            '<b>logits vector</b> at final prompt position  (one score per vocabulary entry)<br>'
+            '↓<br>'
+            'argmax  →  vocabulary ID with highest score  =  first generated token<br><br>'
+            '<i>Final RMSNorm output and projection weight matrix are not saved.</i>')
+
+        card.add(label('WHAT IS A LOGIT?', muted=True))
+        card.add(label(
+            'An unnormalized score for one vocabulary entry — not a probability. '
+            'TensorScope uses greedy decoding: argmax selects the ID with the highest '
+            'raw score. No softmax is applied and no vocabulary probability vector is saved.'))
+
         logits = self.capture.logits
         if logits is None:
-            card.field('Logits not available in this saved run', LOGITS_UNAVAILABLE)
+            card.add(label('LOGITS NOT AVAILABLE IN THIS RUN', muted=True))
+            card.add(label(LOGITS_UNAVAILABLE))
         else:
-            card.field('Shape', f'{shape(logits)} · {len(logits):,} vocabulary entries · stored {logits.dtype}. '
-                       'Only this one prompt position’s logits row is saved, not the full [batch, tokens, vocabulary] tensor.')
-            # Rank is derived presentation metadata; every score is read from the array,
-            # even if persisted top-k metadata is missing or stale.
+            vocab_size = len(logits)
+            card.add(label('SHAPE & TOP SCORES', muted=True))
+            card.add(label(
+                f'{shape(logits)}  =  [{vocab_size:,} vocabulary entries]  ·  '
+                f'stored {logits.dtype}\n'
+                f'Only this one row (final prompt position) is saved — not the full '
+                f'[batch, tokens, vocabulary] logits tensor.'))
+
             order = np.argsort(logits)[::-1][:8]
-            names = {int(e['id']): str(e.get('token', '')) for e in self.capture.metadata.get('final_logits_top', []) if 'id' in e}
+            names = {int(e['id']): str(e.get('token', ''))
+                     for e in self.capture.metadata.get('final_logits_top', [])
+                     if 'id' in e}
             names[self.capture.token_ids[0]] = self.capture.tokens[0]
-            table = QTableWidget(len(order), 3)
-            table.setHorizontalHeaderLabels(['Token ID', 'Saved token text', 'Captured logit'])
+
+            table = QTableWidget(len(order), 4)
+            table.setHorizontalHeaderLabels(['Rank', 'Token ID', 'Token text', 'Captured logit'])
             table.verticalHeader().hide()
             table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-            for row, token_id in enumerate(order):
-                for col, text in enumerate((str(token_id), repr(names[int(token_id)]) if int(token_id) in names else 'Text not saved', str(logits[token_id].item()))):
-                    table.setItem(row, col, QTableWidgetItem(text))
+            for row_idx, token_id in enumerate(order):
+                rank = str(row_idx + 1)
+                tid = str(int(token_id))
+                tok_text = (repr(names[int(token_id)]) if int(token_id) in names
+                            else '(text not saved)')
+                logit_val = str(logits[token_id].item())
+                for col, text in enumerate((rank, tid, tok_text, logit_val)):
+                    item = QTableWidgetItem(text)
+                    if row_idx == 0:
+                        item.setForeground(QColor('#34d399'))
+                    table.setItem(row_idx, col, item)
             table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             table.setFixedHeight(275)
             card.add(table)
-            card.add(label('Display subset: the eight highest captured logits, sorted for reading. The full vector remains available below. Ties are resolved by argmax’s first index.', muted=True))
-            card.add(Disclosure('Inspect all captured logits', lambda: TensorInspector(logits, name='final_logits', axes=['vocabulary token ID'])))
-        card.field('First generated token', f'{self.capture.tokens[0]!r}  ·  ID {self.capture.token_ids[0]}')
+            card.add(label(
+                'Top 8 by captured logit. Row 1 (green) is the selected token. '
+                'The full vector is accessible below.',
+                muted=True))
+            card.add(Disclosure('Inspect full captured logits vector',
+                                 lambda: TensorInspector(logits, name='final_logits',
+                                                         axes=['vocabulary token ID'])))
+
+        card.add(label('FIRST GENERATED TOKEN', muted=True))
+        card.add(label(
+            f'Selected token: {self.capture.tokens[0]!r}  ·  vocabulary ID {self.capture.token_ids[0]}'))
+
         if logits is not None:
-            card.field('Selection check', f'argmax(captured logits) = {int(logits.argmax())} = saved first token ID. '
-                       'This index comparison is a display check on the saved vector. The stored capture metadata also attests bitwise equality with stock eager logits.')
-        card.field('Next', 'The selected token is fed into the next captured pass. Its own forward pass did not choose itself; the prefill logits above chose it.')
+            card.add(label(
+                f'Verification: argmax(captured logits) = {int(logits.argmax())} '
+                f'= saved first token ID {self.capture.token_ids[0]}. '
+                'Saved metadata also attests bitwise equality with stock eager attention logits.',
+                muted=True))
+
+        card.field('What happens next',
+                   'The selected token enters a second complete forward pass through all '
+                   f'{len(self.capture.layers)} decoder layers. '
+                   'That first-token pass is also captured in full.')
         return card
+
+    # ── Stage: Coda ───────────────────────────────────────────────────────────
 
     def _coda(self):
         card = self._stage_card('coda')
-        card.field('New input', f'{self.capture.tokens[0]!r}  ·  token ID {self.capture.token_ids[0]}')
-        tensor = self.capture.generated_layers[sorted(self.capture.generated_layers)[0]].tensors['attention_scores']
-        card.equation(f'1 new token + cached prompt K/V → {len(self.capture.layers)} layers<br>'
-                      f'Captured attention shape: {shape(tensor)} = [batch, head, new query, available keys]')
-        card.field('What caching means', 'Previous tokens’ keys and values are retained and reused. Each layer processes the new token’s query against those cached keys plus its own key. '
-                   'This avoids computing every prompt token’s layer activations again.')
+
+        card.add(label('WHY A SECOND FORWARD PASS?', muted=True))
+        card.add(label(
+            'Autoregressive generation processes one token at a time. After choosing the '
+            'first output token from the prefill logits, that token must itself pass through '
+            'the model to produce the second token\'s logits. TensorScope captures this '
+            'first-token pass completely.'))
+
+        card.add(label('WHAT KV CACHING MEANS HERE', muted=True))
+        tok_text = f'{self.capture.tokens[0]!r}  (ID {self.capture.token_ids[0]})'
+        card.add(label(
+            f'The new token {tok_text} contributes one new query position. '
+            'Each attention layer reuses the cached Q/K/V from the prompt prefill — '
+            'the prompt tokens are NOT run through the layer again. '
+            'The cached K/V are included in the captured k_attended and v_attended '
+            'tensors for this phase.'))
+
+        try:
+            tensor = self.capture.generated_layers[sorted(self.capture.generated_layers)[0]].tensors['attention_scores']
+            card.add(label('ATTENTION SHAPE IN THIS PASS', muted=True))
+            card.equation(
+                f'1 new query token  +  {tensor.shape[-1] - 1} cached prompt keys<br>'
+                f'attention_scores shape:  {shape(tensor)}  '
+                f'=  [batch, head, new query, available keys]')
+        except Exception:
+            pass
+
         button = QPushButton('Explore the first generated-token pass →')
         button.setObjectName('primary')
         button.clicked.connect(self._enter_generated)
         card.add(button)
-        card.field('Where the capture ends', 'The new token’s embedding and all required layer tensors are saved. Logits from this second pass are not persisted. '
-                   'Later output tokens are retained as text/IDs only; their forward-pass tensors are not captured. '
-                   'The full answer is context, not evidence of additional tensor capture.')
-        card.add(Disclosure('Read the complete generated response', lambda: label(self.capture.response)))
+
+        card.field('Where the capture ends',
+                   'Embedding and all required layer tensors are saved for this pass. '
+                   'The output logits (which would choose the second generated token) are not saved. '
+                   'Later output tokens are retained as text/IDs only — their forward-pass '
+                   'tensors are not captured. The full answer is context, not evidence of '
+                   'additional tensor capture.')
+
+        card.add(Disclosure('Read the complete generated response',
+                             lambda: label(self.capture.response)))
         return card
 
     def _enter_generated(self):
@@ -492,6 +1169,8 @@ class StoryView(QWidget):
         self.step_key = 'input'
         self.go_to('layers')
 
+
+# ── DetailView ────────────────────────────────────────────────────────────────
 
 class DetailView(QWidget):
     """Virtual full-array browser for every captured tensor in either phase."""
@@ -502,8 +1181,10 @@ class DetailView(QWidget):
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(0, 0, 0, 0)
         self.body.addWidget(label('Raw / Detail · complete captured arrays', title=True))
-        self.body.addWidget(label('Select phase, layer, and tensor. All values are accessible through virtual rows/columns and explicit batch/head slices. '
-                                  'Reading a tensor does not change its stored values or dtype.', muted=True))
+        self.body.addWidget(label(
+            'Select phase, layer, and tensor. All values are accessible through virtual '
+            'rows/columns and explicit batch/head slices. '
+            'Reading a tensor does not change its stored values or dtype.', muted=True))
         row = QHBoxLayout()
         self.phase_picker = QComboBox()
         self.phase_picker.addItems(['Prompt prefill', 'First generated-token pass'])
@@ -512,7 +1193,9 @@ class DetailView(QWidget):
         for index in sorted(capture.layers):
             self.layer_picker.addItem(f'Layer {index}', index)
         self.tensor_picker = QComboBox()
-        for title, picker in [('Phase', self.phase_picker), ('Layer', self.layer_picker), ('Tensor', self.tensor_picker)]:
+        for title, picker in [('Phase', self.phase_picker),
+                               ('Layer', self.layer_picker),
+                               ('Tensor', self.tensor_picker)]:
             picker.setAccessibleName(title)
             row.addWidget(picker, 1)
         self.body.addLayout(row)
@@ -534,7 +1217,8 @@ class DetailView(QWidget):
             if not self.phase_picker.currentIndex() and self.capture.logits is not None:
                 self.tensor_picker.addItem('final_logits', 'final_logits')
         else:
-            layers = self.capture.generated_layers if self.phase_picker.currentIndex() else self.capture.layers
+            layers = (self.capture.generated_layers if self.phase_picker.currentIndex()
+                      else self.capture.layers)
             for name in layers[self.layer_picker.currentData()].tensors:
                 self.tensor_picker.addItem(name, name)
         found = self.tensor_picker.findData(old)
@@ -555,7 +1239,7 @@ class DetailView(QWidget):
             array = self.capture.logits
             text = 'Captured vocabulary logits at the final prompt position; scores, not probabilities.'
         else:
-            layers = self.capture.generated_layers if generated else self.capture.layers
+            layers = (self.capture.generated_layers if generated else self.capture.layers)
             array = layers[self.layer_picker.currentData()].tensors[name]
             text = TENSOR_EXPLANATIONS.get(name, 'Additional captured tensor.')
         self.meaning.setTextFormat(Qt.RichText)
@@ -564,55 +1248,246 @@ class DetailView(QWidget):
             self.host.removeWidget(self.inspector)
             self.inspector.hide()
             self.inspector.deleteLater()
-        rows = token_labels(self.capture, generated, keys=name in ('k_attended', 'v_attended'))
-        self.inspector = TensorInspector(array, name=name, axes=axes_for(name, array),
-                                         row_labels=rows if name != 'final_logits' else None,
-                                         column_labels=token_labels(self.capture, generated, keys=True) if name in ('attention_scores', 'attention_weights') else None)
+        rows = token_labels(self.capture, generated,
+                            keys=name in ('k_attended', 'v_attended'))
+        self.inspector = TensorInspector(
+            array, name=name, axes=axes_for(name, array),
+            row_labels=rows if name != 'final_logits' else None,
+            column_labels=(token_labels(self.capture, generated, keys=True)
+                           if name in ('attention_scores', 'attention_weights') else None))
         self.host.addWidget(self.inspector)
 
+
+# ── ComputationRecap ──────────────────────────────────────────────────────────
 
 class ComputationRecap(QDialog):
     def __init__(self, capture, run_id=None, parent=None, tokens=None):
         super().__init__(parent)
         capture.validate()
         self.capture = capture
-        self.setWindowTitle('TensorScope — Computation journey')
-        self.resize(1240, 880)
-        self.setMinimumSize(850, 620)
-        colors = tokens or {'card_bg': '#1c1c20', 'border': '#3b3b44', 'text_secondary': '#b5b5c1',
-                            'text_primary': '#f0f0f2', 'accent': '#60a5fa', 'bg': '#111114'}
+        self.setWindowTitle('TensorScope — Computation Journey')
+        self.resize(1300, 900)
+        self.setMinimumSize(900, 640)
+
+        colors = tokens or {
+            'card_bg': '#1c1c20', 'border': '#3b3b44',
+            'text_secondary': '#b5b5c1', 'text_primary': '#f0f0f2',
+            'accent': '#60a5fa', 'bg': '#111114',
+            'text_muted': '#636370', 'nav_active_bg': '#202028',
+        }
         self.setStyleSheet(f'''
-            #journeyCard {{ background:{colors['card_bg']}; border:1px solid {colors['border']}; border-radius:10px; }}
-            #journeyTitle {{ font-size:21px; font-weight:600; }}
-            #journeyText {{ font-size:14px; }}
-            #journeyMuted {{ color:{colors['text_secondary']}; font-size:12px; }}
-            #journeyEquation {{ font-size:16px; padding:12px; background:{colors['bg']}; border-radius:6px; }}
-            #journeyFlow {{ text-align:left; padding:10px; font-size:14px; }}
-            QTableView {{ background:{colors['card_bg']}; color:{colors['text_primary']}; gridline-color:{colors['border']}; selection-background-color:{colors['accent']}; }}
-            QHeaderView::section {{ background:{colors['bg']}; color:{colors['text_secondary']}; padding:6px; border:1px solid {colors['border']}; }}
+            /* Cards */
+            #journeyCard {{
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']};
+                border-radius: 10px;
+            }}
+
+            /* Typography */
+            #journeyTitle {{ font-size: 20px; font-weight: 700; }}
+            #journeyText  {{ font-size: 13px; line-height: 1.55; }}
+            #journeyMuted {{ color: {colors['text_secondary']}; font-size: 11px; letter-spacing: 0.04em; }}
+            #journeySmall {{ color: {colors['text_secondary']}; font-size: 11px; }}
+            #journeyEquation {{
+                font-size: 13px; padding: 12px 14px;
+                background: {colors['bg']};
+                border-left: 3px solid {colors['accent']};
+                border-radius: 4px;
+            }}
+
+            /* Pipeline navigator chips */
+            QPushButton#pipelineChip {{
+                border: 1px solid {colors['border']};
+                border-radius: 16px;
+                padding: 4px 12px;
+                background: {colors['card_bg']};
+                color: {colors['text_secondary']};
+                font-size: 12px;
+            }}
+            QPushButton#pipelineChip:hover {{
+                border-color: {colors['accent']};
+                color: {colors['text_primary']};
+            }}
+            QPushButton#pipelineChip:checked {{
+                background: {colors['accent']};
+                border-color: {colors['accent']};
+                color: #ffffff;
+                font-weight: 700;
+            }}
+            #pipelineArrow {{ color: {colors['text_muted']}; font-size: 14px; padding: 0 4px; }}
+
+            /* Layer step sidebar buttons */
+            QPushButton#layerStepBtn {{
+                text-align: left;
+                border: none;
+                border-radius: 5px;
+                padding: 6px 8px;
+                background: transparent;
+                color: {colors['text_secondary']};
+                font-size: 12px;
+            }}
+            QPushButton#layerStepBtn:hover {{
+                background: {colors['nav_active_bg']};
+                color: {colors['text_primary']};
+            }}
+            QPushButton#layerStepBtn:checked {{
+                background: {colors['nav_active_bg']};
+                color: {colors['text_primary']};
+                font-weight: 600;
+                border-left: 3px solid {colors['accent']};
+            }}
+            #stepSidebarHeader {{ font-size: 10px; letter-spacing: 0.06em; padding-bottom: 4px; }}
+
+            /* Section rule */
+            QFrame#sectionRule {{
+                background: {colors['border']};
+                max-height: 1px; min-height: 1px;
+                border: none; margin: 6px 0;
+            }}
+
+            /* Nav left panel */
+            #navItem {{
+                text-align: left; border: none; border-radius: 6px;
+                padding: 6px 10px; background: transparent;
+                color: {colors['text_secondary']};
+            }}
+            #navItem:hover {{ background: {colors['nav_active_bg']}; color: {colors['text_primary']}; }}
+            #navItem:checked {{
+                background: {colors['nav_active_bg']};
+                color: {colors['text_primary']}; font-weight: 600;
+            }}
+
+            /* Table styling */
+            QTableView, QTableWidget {{
+                background: {colors['card_bg']};
+                color: {colors['text_primary']};
+                gridline-color: {colors['border']};
+                selection-background-color: {colors['accent']};
+                border: 1px solid {colors['border']};
+                border-radius: 4px;
+            }}
+            QHeaderView::section {{
+                background: {colors['bg']};
+                color: {colors['text_secondary']};
+                padding: 6px;
+                border: 1px solid {colors['border']};
+            }}
+
+            /* primary button */
+            QPushButton#primary {{
+                background: {colors['accent']};
+                border: 1px solid {colors['accent']};
+                color: #ffffff; font-weight: 600; padding: 7px 16px;
+                border-radius: 6px;
+            }}
+            QPushButton#primary:hover {{ background: #2f6fe0; }}
+
+            /* Disclosure button */
+            QPushButton[checkable="true"] {{
+                text-align: left;
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+                padding: 6px 12px;
+                background: transparent;
+                color: {colors['text_secondary']};
+                font-size: 12px;
+            }}
+            QPushButton[checkable="true"]:hover {{
+                border-color: {colors['accent']};
+                color: {colors['text_primary']};
+            }}
+            QPushButton[checkable="true"]:checked {{
+                background: {colors['nav_active_bg']};
+                color: {colors['text_primary']};
+            }}
+
+            /* Journey flow buttons */
+            #journeyFlow {{
+                text-align: left; padding: 10px;
+                font-size: 13px; border: 1px solid {colors['border']};
+                border-radius: 6px; background: transparent;
+                color: {colors['text_secondary']};
+            }}
+            #journeyFlow:hover {{
+                border-color: {colors['accent']};
+                color: {colors['text_primary']};
+            }}
+
+            /* Banner */
+            #recapBanner {{
+                padding: 10px 24px;
+                border-bottom: 1px solid {colors['border']};
+                font-weight: 600;
+                font-size: 13px;
+            }}
+            #recapBannerSub {{ color: {colors['text_secondary']}; font-size: 11px; }}
+
+            /* Pipeline container */
+            #pipelineBar {{
+                background: {colors['card_bg']};
+                border-bottom: 1px solid {colors['border']};
+                padding: 8px 20px;
+            }}
         ''')
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        banner = label(f'{"Saved run #" + str(run_id) if run_id is not None else "Current capture"}  ·  '
-                       f'{capture.metadata.get("model", "Model ID unavailable")}  ·  real PyTorch capture')
-        banner.setStyleSheet(f'padding:12px; font-weight:600; border-bottom:1px solid {colors["border"]};')
-        root.addWidget(banner)
+        root.setSpacing(0)
+
+        # ── Banner ────────────────────────────────────────────────────────────
+        banner_widget = QWidget()
+        banner_widget.setObjectName('recapBanner')
+        banner_layout = QHBoxLayout(banner_widget)
+        banner_layout.setContentsMargins(24, 10, 24, 10)
+        run_label = QLabel(
+            f'{"Saved run #" + str(run_id) if run_id is not None else "Current capture"}  ·  '
+            f'{capture.metadata.get("model", "Model ID unavailable")}  ·  '
+            f'Real PyTorch capture')
+        run_label.setObjectName('recapBanner')
+        banner_layout.addWidget(run_label)
+        banner_layout.addStretch(1)
+        verified_label = QLabel('✓ Validated  ·  Stock-eager match attested')
+        verified_label.setStyleSheet(f'color: #16a34a; font-size: 11px;')
+        banner_layout.addWidget(verified_label)
+        root.addWidget(banner_widget)
+
+        # ── Pipeline navigator bar ────────────────────────────────────────────
+        pipeline_bar = QWidget()
+        pipeline_bar.setObjectName('pipelineBar')
+        pipeline_layout = QHBoxLayout(pipeline_bar)
+        pipeline_layout.setContentsMargins(20, 8, 20, 8)
+        self.pipeline_nav = PipelineNavigator(self._pipeline_navigate, colors)
+        pipeline_layout.addWidget(self.pipeline_nav)
+        root.addWidget(pipeline_bar)
+
+        # ── Main split ────────────────────────────────────────────────────────
         split = QSplitter(Qt.Horizontal)
         root.addWidget(split, 1)
+
+        # Left nav panel
         left = QWidget()
         left.setObjectName('sidebar')
         left.setMinimumWidth(190)
-        left.setMaximumWidth(250)
+        left.setMaximumWidth(240)
         nav = QVBoxLayout(left)
         nav.setContentsMargins(12, 18, 12, 18)
-        nav.addWidget(label('COMPUTATION JOURNEY', muted=True))
+        nav.setSpacing(4)
+
+        mode_label = QLabel('MODE')
+        mode_label.setObjectName('journeyMuted')
+        nav.addWidget(mode_label)
+
         self.story_button = QPushButton('Learn / Story')
         self.detail_button = QPushButton('Raw / Detail')
         for button in (self.story_button, self.detail_button):
             button.setCheckable(True)
             button.setObjectName('navItem')
             nav.addWidget(button)
-        nav.addSpacing(18)
+
+        nav.addSpacing(14)
+        stages_label = QLabel('JOURNEY STAGES')
+        stages_label.setObjectName('journeyMuted')
+        nav.addWidget(stages_label)
         self._nav_buttons = {}
         for n, (key, title) in enumerate(STAGES):
             button = QPushButton(f'{n + 1:02}  {title}')
@@ -621,33 +1496,49 @@ class ComputationRecap(QDialog):
             button.clicked.connect(lambda _, k=key: self._nav_to(k))
             nav.addWidget(button)
             self._nav_buttons[key] = button
+
         nav.addStretch(1)
-        nav.addWidget(label(f'{len(capture.layers)} layers · {len(capture.prompt_tokens)} prompt tokens\n'
-                            f'Model dtype: {capture.metadata.get("weight_dtype", "not recorded")}\n'
-                            f'Stored embedding: {capture.embedding.dtype}', muted=True))
-        nav.addWidget(label('Validated saved capture\nStock-eager match attested in metadata', muted=True))
+        # Provenance summary
+        nav.addWidget(label(
+            f'{len(capture.layers)} layers · '
+            f'{len(capture.prompt_tokens)} prompt tokens\n'
+            f'Weight dtype: {capture.metadata.get("weight_dtype", "not recorded")}\n'
+            f'Stored dtype: {capture.embedding.dtype}',
+            muted=True))
         split.addWidget(left)
+
+        # Right content
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(20, 12, 20, 12)
+        right_layout.setSpacing(8)
+
         self.breadcrumb = label('')
+        self.breadcrumb.setStyleSheet(f'color: {colors["text_secondary"]}; font-size: 12px;')
         right_layout.addWidget(self.breadcrumb)
+
         self.provenance = Disclosure('Capture provenance & verification', self._provenance)
         right_layout.addWidget(self.provenance)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(0, 0, 6, 0)
+        inner_layout.setSpacing(0)
         self.stack = QStackedWidget()
-        self.story_view = StoryView(capture)
+
+        self.story_view = StoryView(capture, tokens=tokens)
         self.story_view._on_stage_change = self._on_story_stage_change
         self.stack.addWidget(self.story_view)
         self.detail = None
+
         inner_layout.addWidget(self.stack)
         inner_layout.addStretch(1)
         self.scroll.setWidget(inner)
         right_layout.addWidget(self.scroll, 1)
+
         footer = QHBoxLayout()
         self.previous_stage = QPushButton('← Previous stage')
         self.next_stage = QPushButton('Next stage →')
@@ -658,27 +1549,47 @@ class ComputationRecap(QDialog):
         footer.addWidget(self.next_stage)
         right_layout.addLayout(footer)
         split.addWidget(right)
-        split.setSizes([225, 1015])
+        split.setSizes([225, 1075])
+
         self.story_button.clicked.connect(self._show_story)
         self.detail_button.clicked.connect(self._show_detail)
         self._show_story()
 
     def _provenance(self):
         c = self.capture
-        card = Card('Evidence for this run')
+        card = Card('Evidence for this run — what TensorScope verified')
         m = c.metadata
-        card.field('Source', str(m.get('capture_source', 'not recorded')))
-        card.field('Validation', 'RunCapture.validate() passed on opening. Saved metadata attests the following checks at capture time:')
-        card.field('Stock eager logits', f'Match: {m.get("logits_match_stock_eager", "not recorded")} · '
-                   f'max absolute difference: {m.get("logits_max_abs_diff_vs_stock_eager", "not recorded")}')
-        card.field('Attention reference', f'Faithful to upstream eager: {m.get("faithful_to_upstream_eager", "not recorded")} · '
-                   f'verified calls: {m.get("attention_calls_verified", "not recorded")} · {len(c.layers) * 2} layer calls across the two captured phases')
-        card.field('Runtime', f'{m.get("backend", "not recorded")} · torch {m.get("torch", "not recorded")} · {c.started_at}')
-        card.field('Dtype', f'Model weights: {m.get("weight_dtype", "not recorded")} · stored embedding: {c.embedding.dtype}. '
-                   'bfloat16 activations are widened losslessly to float32 for NumPy storage; values are preserved.')
+        card.field('Capture source', str(m.get('capture_source', 'not recorded')))
+        card.field('Validation on open',
+                   'RunCapture.validate() passed. Saved metadata attests the checks below '
+                   'were performed at capture time, before saving.')
+        card.field('Stock-eager logit comparison',
+                   f'Match: {m.get("logits_match_stock_eager", "not recorded")}  ·  '
+                   f'Max absolute difference: {m.get("logits_max_abs_diff_vs_stock_eager", "not recorded")}\n'
+                   'TensorScope re-ran the prefill with stock eager attention and required '
+                   'bit-exact identical logits. A non-zero difference would have discarded the run.')
+        card.field('Attention implementation faithfulness',
+                   f'Faithful to upstream eager: {m.get("faithful_to_upstream_eager", "not recorded")}  ·  '
+                   f'Verified calls: {m.get("attention_calls_verified", "not recorded")} / '
+                   f'{len(c.layers) * 2} expected (both phases × all layers)\n'
+                   'CaptureAttention re-ran upstream\'s own eager_attention_forward on every '
+                   'captured call and required bit-exact matching outputs.')
+        card.field('Runtime',
+                   f'{m.get("backend", "not recorded")}  ·  '
+                   f'torch {m.get("torch", "not recorded")}  ·  '
+                   f'captured at {c.started_at}')
+        card.field('Dtype handling',
+                   f'Model weights: {m.get("weight_dtype", "not recorded")}  ·  '
+                   f'Stored embedding: {c.embedding.dtype}\n'
+                   'bfloat16 activations are widened losslessly to float32 for NumPy storage. '
+                   'No values are narrowed or lost.')
         card.field('Prompt', c.prompt)
-        card.add(Disclosure('Read all saved metadata', lambda: label(json.dumps(m, indent=2, ensure_ascii=False))))
+        card.add(Disclosure('Show all saved metadata',
+                             lambda: label(json.dumps(m, indent=2, ensure_ascii=False))))
         return card
+
+    def _pipeline_navigate(self, key: str) -> None:
+        self._nav_to(key)
 
     def _nav_to(self, key):
         self._show_story()
@@ -687,14 +1598,17 @@ class ComputationRecap(QDialog):
     def _on_story_stage_change(self, key):
         for k, button in self._nav_buttons.items():
             button.setChecked(k == key)
+        self.pipeline_nav.set_current(key)
         idx = [k for k, _ in STAGES].index(key)
         self.previous_stage.setEnabled(idx > 0)
         self.next_stage.setEnabled(idx < len(STAGES) - 1)
         context = ''
         if key in ('layers', 'embedding'):
-            context = ' / ' + ('First generated-token pass' if self.story_view.generated else 'Prompt prefill')
+            context = (' / First generated-token pass' if self.story_view.generated
+                       else ' / Prompt prefill')
         if key == 'layers':
-            context += f' / Layer {self.story_view.layer_index} / {dict(LAYER_STEPS)[self.story_view.step_key]}'
+            context += (f' / Layer {self.story_view.layer_index} / '
+                        f'{dict(LAYER_STEPS)[self.story_view.step_key]}')
         self.breadcrumb.setText('Learn / ' + dict(STAGES)[key] + context)
         self.scroll.verticalScrollBar().setValue(0)
 
