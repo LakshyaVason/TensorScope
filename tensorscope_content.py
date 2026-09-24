@@ -1,13 +1,102 @@
-"""Educational copy for the saved-capture UI; no model or GUI imports.
+"""Educational copy and evidence taxonomy for the saved-capture UI.
 
-Equations describe the architecture. Numerical displays must use the saved arrays,
-including when a mathematically intermediate result was not retained by capture.
+No model, numpy or GUI imports: this module is pure data, so it can be read by the
+capture engine, the views and the tests alike.
+
+Two rules govern everything here:
+
+* Equations describe the architecture.  Numerical displays must use the saved arrays,
+  including when a mathematically intermediate result was not retained by capture.
+* Every number shown to a reader carries an evidence tier (see EVIDENCE_KINDS).  A
+  value the model produced and a value TensorScope calculated for presentation must
+  never look alike.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+
+# ── Per-token decision telemetry ─────────────────────────────────────────────────
+# Defined here rather than in TensorScope.py because the view modules need it and
+# TensorScope.py imports them: a view importing it from TensorScope would run while
+# TensorScope is still mid-import.  This module imports nothing, so it is always safe.
+
+@dataclass
+class GenerationDecision:
+    """The real scores that chose one generated token.
+
+    Recorded inside the generation loop from the logits tensor the forward pass had
+    already produced.  Nothing here is recomputed, re-run or reconstructed afterwards.
+
+    `attested` marks whether the vector behind this decision is covered by the
+    stock-eager comparison in ModelCapture._verify_undisturbed.  Only the prefill
+    logits are, so only step 0 is True; later steps are real model output that no
+    verification gate independently re-derived.  The UI must not present the two at
+    the same confidence.
+    """
+
+    step: int                                          # 0 == first generated token
+    selected_token_id: int
+    selected_logit: float
+    # Descending by score, ties broken by ascending token id so entry 0 always agrees
+    # with argmax.  Shape: [{"id": int, "token": str, "logit": float}, ...]
+    top_candidates: list[dict[str, Any]] = field(default_factory=list)
+    attested: bool = False
+
+    @property
+    def runner_up(self) -> dict[str, Any] | None:
+        """The highest-scoring candidate that was not selected, if one was recorded."""
+        for entry in self.top_candidates:
+            if int(entry["id"]) != self.selected_token_id:
+                return entry
+        return None
+
+    @property
+    def margin(self) -> float | None:
+        """How far ahead the winner scored.  Derived, not captured."""
+        other = self.runner_up
+        return None if other is None else self.selected_logit - float(other["logit"])
+
+
+# ── Evidence taxonomy ────────────────────────────────────────────────────────────
+# Four tiers, not three.  The spec asks for observed / derived / conceptual, but
+# per-token telemetry introduced a fourth case that would otherwise be mislabelled
+# as plain "observed": real forward-pass output that no verification gate covers.
+
+EVIDENCE_OBSERVED = "observed"
+EVIDENCE_UNATTESTED = "unattested"
+EVIDENCE_DERIVED = "derived"
+EVIDENCE_CONCEPTUAL = "conceptual"
+
+EVIDENCE_KINDS = {
+    EVIDENCE_OBSERVED: (
+        "Observed",
+        "A tensor this run captured from the model and stored exactly, covered by the "
+        "stock-eager comparison: embeddings, Q/K/V, attention scores and weights, layer "
+        "outputs, the prefill logits vector, and the selected token.",
+    ),
+    EVIDENCE_UNATTESTED: (
+        "Observed · unattested",
+        "Real output of the real forward pass, recorded as it happened, but not "
+        "independently re-derived. Only the prompt prefill is re-run under stock eager "
+        "attention, so candidate scores for generated tokens after the first carry no "
+        "such comparison.",
+    ),
+    EVIDENCE_DERIVED: (
+        "Derived",
+        "Calculated by TensorScope from stored values for presentation: candidate "
+        "rankings, score differences, optional softmax percentages, summary statistics. "
+        "The model did not compute these.",
+    ),
+    EVIDENCE_CONCEPTUAL: (
+        "Conceptual",
+        "An operation the architecture performs whose intermediate value this capture "
+        "did not retain: the residual sum, the MLP interior, A @ V before the output "
+        "projection, and every learned weight matrix. Described, never shown as data.",
+    ),
+}
 
 
 # These keys deliberately match REQUIRED_LAYER_TENSORS in TensorScope.py exactly.
@@ -111,9 +200,10 @@ TENSOR_EXPLANATIONS = {
         "over available keys; stored values can sum only approximately to one after "
         "rounding to the model dtype. Capture runs in evaluation mode, so dropout is "
         "inactive. Each cell weights that key's V vector when computing a query's output. "
-        "These are attention mixing weights, not probabilities of next output tokens. "
-        "They describe this head's computation and are not a complete explanation of "
-        "why the model answered as it did."
+        "These are attention mixing weights over input positions, not probabilities over "
+        "next output tokens — the two are different sizes and different things. They "
+        "describe one head's computation and are not an explanation of why the model "
+        "answered as it did."
     ),
     "attention_output": (
         "The captured o_proj output is the attention block's contribution in model-feature "
@@ -139,81 +229,243 @@ TENSOR_EXPLANATIONS = {
 }
 
 
+# ── The default learning journey ─────────────────────────────────────────────────
+# Each stage answers a question a human actually asks, and says so.  The old journey
+# was organised around operations (normalize, project, rotate, softmax); a reader who
+# has never studied transformers met the math before the meaning.
+
 @dataclass(frozen=True)
-class StoryStage:
-    """One journey stage; format fields come from story_facts()."""
+class LearnStage:
+    """One stage of the Understand journey; format fields come from learn_facts()."""
 
     key: str
+    nav: str        # short label for the sidebar and pipeline chips
+    question: str   # the question this screen answers, shown as its heading
+    plain: str      # two or three sentences, no more -- the screens carry the weight
+
+
+LEARN_STAGES = [
+    LearnStage(
+        "overview", "Prompt & response",
+        "What did I ask, and what did the model answer?",
+        "This is one real run of {model}. The response was not written all at once: the "
+        "model produced {generated_count} tokens one at a time, each one chosen by a "
+        "fresh pass over everything written so far. TensorScope recorded that run as it "
+        "happened rather than reproducing it afterwards."
+    ),
+    LearnStage(
+        "tokens", "What it received",
+        "What did the model actually receive?",
+        "Not your sentence. A tokenizer splits text into vocabulary entries — whole words, "
+        "word fragments, punctuation, spaces — and the model only ever sees their ID "
+        "numbers. This prompt became {prompt_token_count} tokens. Select any one to see "
+        "what the model was handed in its place."
+    ),
+    LearnStage(
+        "context", "Building context",
+        "How does the model build context between tokens?",
+        "Each token starts as a vector that depends only on which token it is. Across "
+        "{layer_count} layers that vector is repeatedly updated by pulling in information "
+        "from other positions in the text, so by the end it reflects its context and not "
+        "just its own identity. The mechanism that does the pulling is attention."
+    ),
+    LearnStage(
+        "generation", "Choosing each token",
+        "How does it generate one token at a time, and why this token?",
+        "At every step the model scores the entire {vocab_size}-entry vocabulary and the "
+        "highest score wins. Click any token of the response to see the real scores that "
+        "chose it and what came second."
+    ),
+    LearnStage(
+        "limits", "What we can and cannot say",
+        "What can we observe inside the model, and what can we not conclude?",
+        "TensorScope shows exactly what this run computed. That is a strong claim about "
+        "values and a weak one about meaning: knowing every number a model produced is "
+        "not the same as knowing why it learned to produce them."
+    ),
+]
+
+LEARN_STAGE_INDEX = {stage.key: stage for stage in LEARN_STAGES}
+
+
+# ── The optional technical journey ───────────────────────────────────────────────
+# Everything the old default view showed, kept in full and reachable in two clicks --
+# but ordered purpose -> diagram -> equation -> dimensions -> tensor, so the tensor is
+# the last level of detail rather than the first.
+
+@dataclass(frozen=True)
+class InternalsStage:
+    key: str
+    nav: str
     heading: str
     plain: str
 
 
-STORY_STAGES = [
-    StoryStage(
-        "prompt", "A real prompt becomes a next-token decision",
-        "Follow this model's actual captured activations from input text to its first "
-        "output token. TensorScope retains selected tensors at named capture points, "
-        "not every intermediate operation. The journey distinguishes captured data "
-        "from conceptual steps whose intermediate values were not saved. There are two "
-        "captured phases: prompt prefill, then a forward pass for the first selected token. "
-        "Later forward passes are not captured; the remaining generated text is included "
-        "to put that first token in context."
+INTERNALS_STAGES = [
+    InternalsStage(
+        "embedding", "Embedding",
+        "Token IDs become feature vectors",
+        "The embedding module looks up a learned vector for each token ID. Each vector has "
+        "{hidden_size} model features, with axes [batch, token position, model feature]. "
+        "Individual features are learned coordinates, not named concepts. The complete "
+        "lookup table is not saved, only the rows this pass produced."
     ),
-    StoryStage(
-        "tokenization", "1 · Text becomes token IDs",
-        "A tokenizer maps text into vocabulary entries: words, fragments, punctuation, "
-        "whitespace, or special markers. This run supplied {token_count} token IDs to "
-        "the model. The saved token strings are the tokenizer's pieces, so they can "
-        "include visible spellings for whitespace rather than ordinary prose. When a "
-        "chat template is available, TensorScope applies it before tokenization; this "
-        "can add role markers and an assistant prefix that you did not type. Token IDs "
-        "are lookup indices, not numerical measurements of meaning."
+    InternalsStage(
+        "layers", "Decoder layer",
+        "Inside one of {layer_count} decoder layers",
+        "Every layer repeats the same structure with its own learned parameters: normalize, "
+        "project into queries/keys/values, mix information across positions with attention, "
+        "then a residual addition and a feed-forward network. Pick a layer and walk its six "
+        "steps; its output is the next layer's input."
     ),
-    StoryStage(
-        "embedding", "2 · IDs become feature vectors",
-        "The embedding module looks up a learned vector for each token ID. In this run, "
-        "each vector has {hidden_size} model features. The captured embedding output "
-        "has axes [batch, token position, model feature]; it supplies the first decoder "
-        "layer. Individual features are learned coordinates, not named concepts. The "
-        "complete embedding lookup table is not saved, only the rows produced for "
-        "this pass. In the generated-token phase, just the new token receives a new "
-        "embedding; prompt information is available through cached keys and values."
+    InternalsStage(
+        "head", "Vocabulary scores",
+        "The last position becomes one score per vocabulary entry",
+        "Only the final position has attended to the whole prompt, so its representation is "
+        "the one that chooses the next token. A final RMSNorm and a learned vocabulary "
+        "projection turn it into {vocab_size} scores. The normalization output and the "
+        "projection matrix are not saved; the resulting score vector is."
     ),
-    StoryStage(
-        "layers", "3 · Follow one of {layer_count} decoder layers",
-        "Each decoder layer repeats the same general structure with different learned "
-        "parameters and activations. Normalization prepares the input, Q/K/V projections "
-        "create attention features, and attention mixes information across token positions. "
-        "Residual connections and a feed-forward network complete the layer. Select one "
-        "layer and follow its steps; its output feeds the next layer. Shapes are taken "
-        "from the captured arrays. A preview or selected head is only a display view; "
-        "the complete saved tensors remain available in Raw / Detail mode."
-    ),
-    StoryStage(
-        "logits", "4 · The final prompt position chooses a token",
-        "After the last decoder layer, Qwen applies a final normalization and a learned "
-        "vocabulary projection. The final normalization output and projection weights "
-        "are not saved. The retained logits, when available, are the vocabulary score "
-        "vector at the final prompt position. A logit is a score, not a probability. "
-        "TensorScope uses greedy decoding: argmax chooses the vocabulary ID with the "
-        "highest score as the first output token. No vocabulary-softmax probability "
-        "tensor is persisted. Older runs can lack the logits vector while retaining "
-        "the selected token and the rest of the capture."
-    ),
-    StoryStage(
-        "coda", "5 · The first selected token starts the next pass",
-        "The first token was chosen by the prompt-prefill logits. That token then enters "
-        "a second forward pass through all {layer_count} decoder layers. It contributes "
-        "one new query position while each layer reuses the prompt's cached keys and "
-        "values and adds the new token's K/V. TensorScope captures this first-token "
-        "pass too. It computes scores for choosing the second output token, but those "
-        "logits are not persisted. Further forward passes are uncaptured. The answer "
-        "is generated one token at a time, which may be a word fragment rather than "
-        "a whole word."
+    InternalsStage(
+        "decode", "The next pass",
+        "The selected token starts another forward pass",
+        "Generation is autoregressive: the chosen token must itself go through the model to "
+        "score the token after it. TensorScope captures this second pass in full, which is "
+        "why two phases exist. Passes after it are not captured at tensor level."
     ),
 ]
 
-STORY_STAGE_INDEX = {stage.key: stage for stage in STORY_STAGES}
+INTERNALS_STAGE_INDEX = {stage.key: stage for stage in INTERNALS_STAGES}
+
+# Per-step copy for the layer walk.  `purpose` is level 1 (plain language), `equation`
+# is level 3; the diagram, dimensions and tensor inspector are built from the captured
+# shapes by the view.  `concept` is the one-line caption under the diagram.
+INTERNALS_STEPS = {
+    "input": {
+        "purpose": (
+            "Before a layer does anything else it puts its input on a predictable scale. "
+            "Without this, values can grow or shrink as they pass through dozens of layers "
+            "until the arithmetic stops being useful."
+        ),
+        "concept": "every token's vector is rescaled independently; no mixing happens here",
+        "equation": (
+            "X_norm  =  X / RMS(X)  ·  g<br>"
+            "RMS(X)  =  √(mean(X²) + ε)<br><br>"
+            "<i>The learned scales g and the intermediate statistics are not saved.</i>"
+        ),
+    },
+    "qkv": {
+        "purpose": (
+            "Each token is turned into three different learned views of itself: what it is "
+            "looking for (query), what it can be found by (key), and what it will contribute "
+            "if found (value). Attention is built entirely out of these three."
+        ),
+        "concept": "three independent linear maps read the same normalized vector",
+        "equation": (
+            "Q_raw = X_norm W_Qᵀ<br>K_raw = X_norm W_Kᵀ<br>V_raw = X_norm W_Vᵀ<br><br>"
+            "<i>PyTorch stores these transposed, hence Wᵀ. The weight matrices "
+            "themselves are not saved — only their outputs.</i>"
+        ),
+    },
+    "prepare": {
+        "purpose": (
+            "The projections are split into heads so several comparisons can run in parallel, "
+            "and position information is rotated into the queries and keys. Until this "
+            "happens the model has no notion of word order."
+        ),
+        "concept": "split into heads, then rotate by position (RoPE); Q and K only, never V",
+        "equation": (
+            "reshape to [batch, head, token, head feature]<br>"
+            "Q = RoPE(norm(Q_raw))   K = RoPE(norm(K_raw))<br>"
+            "V = repeat_kv(V_raw)<br><br>"
+            "<i>Per-head QK normalization is a Qwen3 addition; Qwen2.5 has no such step. "
+            "repeat_kv expands shared KV heads for grouped-query attention.</i>"
+        ),
+    },
+    "scores": {
+        "purpose": (
+            "Every query is compared against every key it is allowed to see. A large score "
+            "means that position is relevant to this one. Softmax then turns each row of "
+            "scores into mixing weights that sum to one."
+        ),
+        "concept": "one number per (query, key) pair, per head; the future is masked out",
+        "equation": (
+            "S  =  (Q @ Kᵀ) / √d_head  +  mask<br>"
+            "A  =  softmax(S)   along the key axis<br><br>"
+            "<i>Both S and A are captured. The mask sets future positions to a very "
+            "negative value so softmax gives them almost zero weight.</i>"
+        ),
+    },
+    "mix": {
+        "purpose": (
+            "Each head builds its output as a weighted blend of the values it attended to. "
+            "The heads are then joined back together and projected once, which is how the "
+            "attention block returns to the model's own feature width."
+        ),
+        "concept": "weights select which values to blend; one projection rejoins the heads",
+        "equation": (
+            "head_i  =  A_i @ V_i          <b>not captured</b><br>"
+            "output  =  concat(head_i) W_oᵀ  <b>captured</b><br><br>"
+            "<i>The captured attention_output is after the projection. It is not A @ V.</i>"
+        ),
+    },
+    "output": {
+        "purpose": (
+            "The attention result is added back onto the running representation rather than "
+            "replacing it, then a feed-forward network refines each position on its own. The "
+            "layer hands on a vector of the same width it received."
+        ),
+        "concept": "two residual additions around attention and the MLP",
+        "equation": (
+            "H  =  X + attention_output<br>"
+            "X_next  =  H + MLP(RMSNorm(H))<br><br>"
+            "<i>Only X_next is captured. H, the post-attention normalization and the "
+            "MLP interior are conceptual here.</i>"
+        ),
+    },
+}
+
+
+# Execution order of the six steps above, asserted against the UI's own list so the
+# copy and the navigator can never drift apart silently.
+LAYER_STEP_ORDER = ["input", "qkv", "prepare", "scores", "mix", "output"]
+
+assert set(LAYER_STEP_ORDER) == set(INTERNALS_STEPS), "INTERNALS_STEPS is missing a step"
+
+
+# ── What can and cannot be concluded ─────────────────────────────────────────────
+
+WHAT_WE_KNOW = [
+    "The exact token IDs the model was given, after any chat template was applied.",
+    "The exact embedding vectors those IDs produced in this run.",
+    "The exact queries, keys, values, attention scores and attention weights for every "
+    "head of every layer, in both captured passes.",
+    "The exact output of every decoder layer.",
+    "The full vocabulary score vector that chose the first generated token.",
+    "The leading candidate scores at every later generation step, and which token won.",
+    "The decoding rule: greedy, so the highest score is selected with no sampling.",
+    "That capture did not change the computation — the prompt pass was re-run under "
+    "stock eager attention and the logits matched bit for bit.",
+]
+
+WHAT_WE_CANNOT_CONCLUDE = [
+    "Why the model learned this association. Training data and training dynamics are "
+    "outside anything a forward pass can show.",
+    "That any single attention head caused the answer. Removing it is the experiment "
+    "that would test that, and TensorScope does not run it.",
+    "That an individual neuron or feature corresponds to a human concept. Features are "
+    "learned coordinates, and meaning is generally spread across many of them.",
+    "That an attention heatmap is the model's reasoning. It shows where one head's "
+    "weights went, which is a mechanism, not an intention.",
+    "What the model would have answered to a different prompt. That needs another run.",
+]
+
+TELEMETRY_UNAVAILABLE = (
+    "Detailed candidate scores were not recorded for this generation step. This run was "
+    "saved before TensorScope recorded per-token decisions; the token it selected is "
+    "stored, but the scores that competed with it are not recoverable from this capture. "
+    "A new run records them for every token."
+)
 
 LOGITS_UNAVAILABLE = (
     "This saved run has no retained logits vector. Earlier capture versions did not "
@@ -221,11 +473,28 @@ LOGITS_UNAVAILABLE = (
     "cannot be recovered from this capture. A new run can capture those scores."
 )
 
+STOP_REASONS = {
+    "eos": "The model emitted an end-of-sequence token, so generation stopped there.",
+    "max_new_tokens": "Generation hit TensorScope's token limit for this run, so the "
+                      "response may be cut off mid-sentence.",
+    "unknown": "This run does not record why generation stopped.",
+}
 
-def story_facts(capture: Any) -> dict[str, Any]:
-    """Read structural facts from a saved capture without loading a model."""
+
+def learn_facts(capture: Any) -> dict[str, Any]:
+    """Read structural facts from a saved capture without loading a model.
+
+    Every field any stage's copy interpolates must appear here, or a reader would meet
+    a KeyError instead of a sentence.  self_test() formats every stage against this.
+    """
+    embedding = getattr(capture, "embedding", None)
+    logits = getattr(capture, "logits", None)
+    vocabulary = int(logits.shape[-1]) if logits is not None else 0
     return {
+        "model": capture.metadata.get("model", "an open-weight model"),
         "layer_count": len(capture.layers),
-        "token_count": len(capture.prompt_token_ids),
-        "hidden_size": int(capture.embedding.shape[-1]) if capture.embedding is not None else 0,
+        "prompt_token_count": len(capture.prompt_token_ids),
+        "generated_count": len(capture.token_ids),
+        "hidden_size": int(embedding.shape[-1]) if embedding is not None else 0,
+        "vocab_size": f"{vocabulary:,}" if vocabulary else "full",
     }
