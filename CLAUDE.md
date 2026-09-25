@@ -183,18 +183,62 @@ attention matrices retained). An 8B model in bf16 (~16.4 GB) does not fit 15.9 G
   through untouched.
 - `numeric_sample` / `display_matrix` sample tensors **for display only** (5×5 text
   preview, ≤96×96 heatmap). They must never mutate or replace persisted data.
-- `LayerSection` is collapsible and builds its body lazily on first expand — a 36-layer
-  model would otherwise construct 70+ matplotlib canvases up front. Its `explain` flag adds
-  the plain-language captions and moves the heatmap beside the weights it draws; it defaults
-  off so full-detail mode renders exactly what it always has. `expanded` builds the body
-  during construction, for the one layer story mode narrates.
-- `ComputationRecap` has two modes in a `QStackedWidget`, sharing the banner and provenance
-  table. `StoryView` (default) narrates the **prefill** pass in computation order with a
-  plain-language explanation *above* every number, one layer at a time via a picker;
-  `DetailView` is the previous exhaustive view, built lazily on first switch. Story mode
-  exists because the old default — 72 collapsed layers and no framing — showed a first-time
-  reader math before it showed them meaning. Explanation copy lives in `TENSOR_EXPLANATIONS`
-  and `STORY_STAGES` beside `TENSOR_LABELS`, never inline in a widget.
+
+### The recap is four modules, and the layering is the point
+
+```
+tensorscope_content.py   pure copy + data; imports nothing of ours
+tensorscope_common.py    presentation primitives (no journey logic)
+tensorscope_views.py     the three journeys
+tensorscope_ui.py        ComputationRecap, the shell
+TensorScope.py           capture, persistence, app; imports the shell
+```
+
+`tensorscope_common` exists to break an import cycle: `MiniHeatmap` needs
+`display_matrix` from `TensorScope`, so it imports it *inside* `__init__` — a module-level
+import would run while `TensorScope` is still half-initialised. Don't move that import out.
+
+- `ComputationRecap` (`tensorscope_ui`) owns the window, the palette, the banner, the
+  provenance evidence card and the navigation. It knows nothing about tensors. Each view
+  exposes the same small contract — a `NAV` list of `(stage key, label)`, `go_to(key)`,
+  `current_stage()`, and the `stage_changed` / `context_changed` signals — and the shell
+  drives its navigator, sidebar, breadcrumb and footer from those alone, so adding a mode
+  is a row in `MODES`, not a layout change. Views other than the default are built on
+  first visit.
+- Three modes, in the order a reader should meet them. **Understand** (`LearnView`, the
+  default) asks five questions a person actually asks — prompt & response, tokens,
+  building context, choosing each token, limits — and puts the explanation *above* the
+  numbers. **Internals** (`InternalsView`) walks the same capture by architecture:
+  embedding, one decoder layer's six steps, vocabulary scores, the next pass. **Raw
+  tensors** (`RawView`) is phase/layer/tensor pickers over a full `TensorInspector`, so
+  retiring the old exhaustive view lost nothing — every array stays reachable in two
+  clicks, unframed.
+- `InternalsView` follows one fixed disclosure ladder per layer step: purpose → diagram →
+  equation → dimensions → tensor. The array is the *last* rung, never the first thing on
+  screen. Level 2 (`STEP_FLOW`) is deliberately numberless; level 4 reads its dimensions
+  off the captured arrays rather than the config, so a shape on screen is always this
+  run's.
+- Copy never lives inline in a widget. `TENSOR_LABELS`, `TENSOR_EXPLANATIONS`,
+  `LEARN_STAGES`, `INTERNALS_STAGES`, `INTERNALS_STEPS`, `WHAT_WE_KNOW`,
+  `WHAT_WE_CANNOT_CONCLUDE` and `STOP_REASONS` are all in `tensorscope_content`.
+  `--self-test` formats every stage's copy against `learn_facts()`, so a stage naming a
+  field that function does not supply fails the test instead of raising `KeyError` in front
+  of a reader.
+- Every number on screen carries an evidence tier (`EVIDENCE_OBSERVED`,
+  `EVIDENCE_UNATTESTED`, `EVIDENCE_DERIVED`, `EVIDENCE_CONCEPTUAL`). Four tiers, not
+  three: candidate scores for generated tokens after the first are real forward-pass
+  output that no verification gate re-derived, and they must not look identical to a tensor
+  that survives all three gates. Anything TensorScope itself computed for the screen —
+  a ranking, a margin, an argmax — is `EVIDENCE_DERIVED`, and anything the architecture has
+  but this capture did not keep (A@V, the residual sum, the MLP interior, the learned weight
+  matrices) is described and badged `EVIDENCE_CONCEPTUAL` rather than reconstructed.
+- `Disclosure` builds its body only when toggled, which is what keeps a 36-layer model from
+  constructing 70+ matplotlib canvases up front — and is why `test_recap.py` clicks every
+  one of them open. `test_every_view_stage_builds_from_real_captures_without_mutating_them`
+  walks all three views over every saved run (both phases, every layer, all six layer
+  steps, every generated token) and re-hashes the capture afterwards; a lazily-built stage
+  nobody visits would otherwise carry a stale attribute name indefinitely, which is exactly
+  how the previous rework broke.
 
 ### On the softmax cross-check
 

@@ -383,6 +383,19 @@ class MiniHeatmap(FigureCanvas):
         if mpl_style:
             figure.set_facecolor(mpl_style.get('figure.facecolor', '#111114'))
             axes.set_facecolor(mpl_style.get('axes.facecolor', '#1c1c20'))
+            # Without this the default near-black text is invisible on a dark figure.
+            colour = mpl_style.get('text.color')
+            if colour:
+                axes.title.set_color(colour)
+                axes.xaxis.label.set_color(colour)
+                axes.yaxis.label.set_color(colour)
+                axes.tick_params(colors=colour)
+                for spine in axes.spines.values():
+                    spine.set_color(colour)
+                bar = image.colorbar
+                if bar is not None:
+                    bar.ax.tick_params(colors=colour)
+                    bar.outline.set_edgecolor(colour)
         self.setMinimumSize(QSize(280, 200))
         self.setMaximumSize(QSize(500, 360))
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)

@@ -1279,9 +1279,11 @@ class GenerationWorker(QThread):
 # Re-export copy/helpers for the existing verification entry points.
 from tensorscope_content import (
     TENSOR_LABELS, TENSOR_LABEL_BY_KEY, TENSOR_EXPLANATIONS,
-    StoryStage, STORY_STAGES, STORY_STAGE_INDEX, story_facts, LOGITS_UNAVAILABLE,
+    InternalsStage, INTERNALS_STAGES, INTERNALS_STAGE_INDEX, INTERNALS_STEPS,
+    LearnStage, LEARN_STAGES, LEARN_STAGE_INDEX, learn_facts, LOGITS_UNAVAILABLE,
 )
-from tensorscope_ui import StoryView, DetailView, ComputationRecap as _ComputationRecap
+from tensorscope_views import InternalsView, LearnView, RawView
+from tensorscope_ui import ComputationRecap as _ComputationRecap
 
 
 class ComputationRecap(_ComputationRecap):
@@ -1860,14 +1862,24 @@ def self_test() -> None:
     # tensor that no longer exists cannot linger.
     assert set(TENSOR_EXPLANATIONS) == labelled, set(TENSOR_EXPLANATIONS) ^ labelled
     assert all(text.strip() for text in TENSOR_EXPLANATIONS.values())
-    assert len(STORY_STAGE_INDEX) == len(STORY_STAGES), "duplicate story stage key"
+    assert len(LEARN_STAGE_INDEX) == len(LEARN_STAGES), "duplicate learn stage key"
+    assert len(INTERNALS_STAGE_INDEX) == len(INTERNALS_STAGES), "duplicate internals stage key"
 
-    # Narration interpolates real run quantities; a stage naming a field story_facts() does
-    # not supply would otherwise raise KeyError in front of a reader.
-    facts = story_facts(capture)
-    for stage in STORY_STAGES:
+    # Both journeys interpolate real run quantities into their copy; a stage naming a field
+    # learn_facts() does not supply would otherwise raise KeyError in front of a reader.
+    facts = learn_facts(capture)
+    for stage in LEARN_STAGES:
+        stage.question.format(**facts)
+        stage.plain.format(**facts)
+    for stage in INTERNALS_STAGES:
         stage.heading.format(**facts)
         stage.plain.format(**facts)
+
+    # Every layer step needs all three rungs of its disclosure ladder, or the technical
+    # journey would show an equation with no purpose above it.
+    for key, copy in INTERNALS_STEPS.items():
+        assert {"purpose", "concept", "equation"} <= set(copy), key
+        assert all(str(copy[field]).strip() for field in ("purpose", "concept", "equation")), key
 
     print("TensorScope self-test passed.")
 
