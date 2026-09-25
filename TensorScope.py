@@ -41,6 +41,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
 
+from tensorscope_content import GenerationDecision
+
 # Keep matplotlib's cache beside the application when a user profile is locked down.
 APP_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("MPLCONFIGDIR", str(APP_DIR / ".matplotlib"))
@@ -70,7 +72,10 @@ if getattr(sys, "frozen", False):
 else:
     DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
 
-SCHEMA_VERSION = 3
+# Bumped to 4 for per-token decision telemetry (the generation_steps table).  Nothing
+# reads this number to decide behaviour: the real discriminator for a pre-telemetry run
+# is simply that it has no generation_steps rows, which load() handles directly.
+SCHEMA_VERSION = 4
 CAPTURE_SOURCE = "pytorch-forward-hooks"
 
 # A dense instruct model.  Dense matters: a Mixture-of-Experts model routes through
@@ -94,8 +99,10 @@ REQUIRED_LAYER_TENSORS = {
 # quietly produce a multi-gigabyte run.
 MAX_CAPTURE_TOKENS = 256
 
-# How many of the final scores the recap names.  The scores themselves are all kept.
-FINAL_LOGITS_TOP_K = 8
+# How many of the competing next-token scores each generation step records.  One K for
+# every candidate list, so the first token -- whose whole vocabulary vector is also kept --
+# is not stored twice at two different lengths.  Internally configurable.
+CANDIDATE_TOP_K = 10
 
 # ── Design token tables ──────────────────────────────────────────────────────────
 #
@@ -459,6 +466,29 @@ def sample_text(array: np.ndarray) -> str:
     return np.array2string(numeric_sample(array), precision=5, suppress_small=False, max_line_width=95)
 
 
+def top_logit_indices(array: np.ndarray, count: int) -> list[int]:
+    """Indices of the `count` largest scores, descending, ties broken by ascending index.
+
+    The tie rule is not cosmetic.  Greedy decoding selects with argmax, which returns the
+    *first* maximum, so any ranking shown beside "the model selected this" must break ties
+    the same way or entry 0 can disagree with the token the model actually emitted.
+    `np.argsort(x)[::-1]` reverses ties and gets this wrong.
+
+    argpartition keeps this O(V) rather than sorting a 151k-entry vocabulary, which the
+    previous per-render full argsort did.
+    """
+    flat = np.asarray(array).reshape(-1)
+    count = max(0, min(int(count), flat.size))
+    if count == 0:
+        return []
+    if count < flat.size:
+        window = np.argpartition(-flat, count - 1)[:count]
+    else:
+        window = np.arange(flat.size)
+    # Stable sort of the small window: equal scores keep their ascending-index order.
+    return [int(index) for index in window[np.argsort(-flat[window], kind="stable")]]
+
+
 @dataclass
 class LayerCapture:
     """Exact tensors received for one model transformer layer."""
@@ -483,6 +513,10 @@ class RunCapture:
     # the prefill logits belonging to the final prompt position.  Optional because runs
     # saved before schema 3 do not have one; the recap degrades rather than refusing them.
     logits: np.ndarray | None = None
+    # One record per generated token: the real scores that chose it, read out of the
+    # forward pass that produced them.  Empty for runs saved before schema 4, which is
+    # why every invariant below is guarded on the list being non-empty.
+    generation_trace: list[GenerationDecision] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     started_at: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
     completed_at: str | None = None
@@ -538,6 +572,57 @@ class RunCapture:
                     f"Final logits peak at token {chosen} but the capture reports the model "
                     f"generated token {self.token_ids[0]}; the two cannot both be real."
                 )
+        # Per-token decisions arrived in schema 4.  An empty trace means a run saved before
+        # that and must still validate, so every check here is inside this guard.  A trace
+        # that *is* present has to describe the tokens the capture reports, or the Next
+        # Token Explorer would attribute real scores to the wrong step.
+        if self.generation_trace:
+            if len(self.generation_trace) != len(self.token_ids):
+                raise CaptureProtocolError(
+                    f"Capture recorded {len(self.generation_trace)} generation decisions for "
+                    f"{len(self.token_ids)} generated tokens; the trace does not cover the run."
+                )
+            for position, decision in enumerate(self.generation_trace):
+                if decision.step != position:
+                    raise CaptureProtocolError(
+                        f"Generation decision {position} reports step {decision.step}; the "
+                        f"trace is out of order."
+                    )
+                if decision.selected_token_id != self.token_ids[position]:
+                    raise CaptureProtocolError(
+                        f"Step {position} recorded token {decision.selected_token_id} but the "
+                        f"capture emitted {self.token_ids[position]}."
+                    )
+                scores = {int(entry["id"]): float(entry["logit"])
+                          for entry in decision.top_candidates}
+                if decision.selected_token_id not in scores:
+                    raise CaptureProtocolError(
+                        f"Step {position} does not list the token it selected "
+                        f"({decision.selected_token_id}) among its candidates."
+                    )
+                # Stated as "nothing scored higher" rather than "the winner is first" so an
+                # exact tie -- which argmax resolves by index -- is not a spurious rejection.
+                better = [identifier for identifier, score in scores.items()
+                          if score > decision.selected_logit]
+                if better:
+                    raise CaptureProtocolError(
+                        f"Step {position} selected token {decision.selected_token_id} while "
+                        f"token {better[0]} scored higher; greedy decoding cannot do that."
+                    )
+            first = self.generation_trace[0]
+            if self.logits is not None:
+                stored = float(np.asarray(self.logits)[self.token_ids[0]])
+                # isfinite first: a NaN-producing model should get a NaN diagnosis rather
+                # than an equality failure that reads like a bookkeeping bug.
+                if not (math.isfinite(stored) and math.isfinite(first.selected_logit)):
+                    raise CaptureProtocolError(
+                        "The first generated token's score is not a finite number."
+                    )
+                if first.selected_logit != stored:
+                    raise CaptureProtocolError(
+                        f"Step 0 recorded score {first.selected_logit} for the selected token "
+                        f"but the stored logits vector says {stored}."
+                    )
 
 
 class CaptureAttention:
@@ -805,17 +890,20 @@ class ModelCapture:
         return delta
 
     def _top_logits(self, logits: np.ndarray,
-                    count: int = FINAL_LOGITS_TOP_K) -> list[dict[str, Any]]:
+                    count: int = CANDIDATE_TOP_K) -> list[dict[str, Any]]:
         """Name the highest-scoring next tokens, for display.
 
-        Derived from the array that gets persisted -- not from the torch tensor -- so the
-        table the recap draws provably describes the stored vector.  Turning an id back
-        into text needs the tokenizer, which the recap has no access to, so this runs at
-        capture time and travels in metadata beside prompt_tokens.
+        Reads the numpy array rather than the torch tensor, so the scores shown are the
+        ones that get persisted.  For the first generated token that array is the whole
+        vocabulary vector the run also stores, so the table there describes a value the
+        reader can check; for later tokens only this Top-K survives.
+
+        Turning an id back into text needs the tokenizer, which a saved-run viewer has no
+        access to, so decoding happens here at capture time and travels with the record.
         """
-        order = np.argsort(logits)[::-1][:count]
-        return [{"id": int(index), "token": self.tokenizer.decode([int(index)]),
-                 "logit": float(logits[index])} for index in order]
+        return [{"id": index, "token": self.tokenizer.decode([index]),
+                 "logit": float(logits[index])}
+                for index in top_logit_indices(logits, count)]
 
     def _templated(self, prompt: str) -> str:
         """Format the prompt the way the model expects, when it defines a template."""
@@ -871,7 +959,28 @@ class ModelCapture:
             if on_text and text:
                 on_text(text)
 
+        def record(row: Any, token_id: int, *, attested: bool) -> None:
+            """Store the scores that chose the token just emitted.
+
+            `attested` says whether a verification gate covers this vector.  Only the
+            prefill is re-run under stock eager attention, so only step 0 is True; later
+            steps are genuine forward-pass output that nothing independently re-derived,
+            and the UI must not present the two at equal confidence.
+            """
+            scores = row if isinstance(row, np.ndarray) else tensor_to_numpy(row)
+            capture.generation_trace.append(GenerationDecision(
+                step=len(capture.token_ids) - 1,
+                selected_token_id=token_id,
+                selected_logit=float(scores[token_id]),
+                top_candidates=self._top_logits(scores, CANDIDATE_TOP_K),
+                attested=attested))
+            # Not retained: tensor_to_numpy returns a view that shares memory with the
+            # torch tensor when the device is already CPU.
+
         eos_ids = self._eos_ids()
+        stop_reason = "max_new_tokens"
+        stop_token_id: int | None = None
+        stop_token_logit: float | None = None
         with torch.no_grad():
             # --- captured: prompt prefill ---
             self._capturing = True
@@ -890,7 +999,6 @@ class ModelCapture:
             # prefill logits would be tens of megabytes per run, and this is the row that
             # actually decided the word.
             capture.logits = tensor_to_numpy(prefill.logits[0, -1, :])
-            final_logits_top = self._top_logits(capture.logits)
 
             # --- captured: first generated token ---
             step = self.model(
@@ -901,15 +1009,34 @@ class ModelCapture:
             self.attention.sink = None
 
             emit(first_id)
+            # The real scores behind this choice, read from the tensor the prefill already
+            # produced.  No extra forward pass, no recomputation: `capture.logits` is the
+            # array _verify_undisturbed just proved bit-identical to stock eager, so step 0
+            # is the one decision covered by that gate.
+            record(capture.logits, first_id, attested=True)
 
-            # --- uncaptured: finish the answer so the reader sees a whole response ---
+            # --- tensors no longer captured, decisions still recorded ---------------
+            # Layer tensors stop here: retaining full attention matrices for every token
+            # would make runs enormous.  The decision telemetry below costs one already
+            # materialised logits row per token and no additional model work.
             past = step.past_key_values
             logits = step.logits[:, -1, :]
             for _ in range(max(0, max_new_tokens - 1)):
                 token_id = int(logits.argmax(dim=-1)[0])
                 if token_id in eos_ids:
+                    # This decision ends the answer without emitting a token, so it would
+                    # otherwise be discarded -- and "why did it stop there?" is the first
+                    # question the response chip strip provokes.
+                    stop_reason = "eos"
+                    stop_token_id = token_id
+                    stop_token_logit = float(tensor_to_numpy(logits[0])[token_id])
                     break
                 emit(token_id)
+                # `logits` here belongs to the pass that ran *before* this token was fed in,
+                # i.e. the pass whose final position chose it.  Recording after emit means
+                # step == len(token_ids) - 1, which cannot drift out of step with the token
+                # list the way a separately maintained counter could.
+                record(logits[0], token_id, attested=False)
                 step = self.model(
                     input_ids=torch.tensor([[token_id]], device=self.device),
                     past_key_values=past, use_cache=True)
@@ -921,7 +1048,13 @@ class ModelCapture:
             "faithful_to_upstream_eager": self.attention.faithful,
             "logits_match_stock_eager": True,  # _verify_undisturbed raises otherwise
             "logits_max_abs_diff_vs_stock_eager": logits_delta,
-            "final_logits_top": final_logits_top,
+            # One computation behind step 0's candidate list, not two that could diverge.
+            "final_logits_top": capture.generation_trace[0].top_candidates,
+            "decoding": "greedy",
+            "candidate_top_k": CANDIDATE_TOP_K,
+            "stop_reason": stop_reason,
+            "stop_token_id": stop_token_id,
+            "stop_token_logit": stop_token_logit,
             "schema_version": SCHEMA_VERSION,
             "model": self.model_id,
             "backend": (torch.cuda.get_device_name(0) if self.device == "cuda"
@@ -973,6 +1106,24 @@ class RunDatabase:
                     data_blob BLOB NOT NULL,
                     PRIMARY KEY (run_id, layer_index, name)
                 );
+                -- Schema 4.  CREATE TABLE IF NOT EXISTS means opening a database written
+                -- by an earlier version simply adds this table; its existing rows are
+                -- untouched and its runs load with an empty trace.
+                -- No ON DELETE CASCADE here, unlike the tensors table above: PRAGMA
+                -- foreign_keys is per-connection and only this one sets it, so a cascade
+                -- declared here would never actually fire.
+                CREATE TABLE IF NOT EXISTS generation_steps (
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    step INTEGER NOT NULL,
+                    selected_token_id INTEGER NOT NULL,
+                    selected_logit REAL NOT NULL,
+                    attested INTEGER NOT NULL,
+                    -- The decoded candidate text lives in here rather than in its own TEXT
+                    -- column: byte-level BPE can emit lone surrogates, which sqlite3
+                    -- rejects on a TEXT bind but json.dumps encodes without complaint.
+                    candidates_json TEXT NOT NULL,
+                    PRIMARY KEY (run_id, step)
+                );
             """)
             db.commit()
 
@@ -1015,6 +1166,15 @@ class RunDatabase:
                     (run_id, -1, "final_logits", json.dumps(list(capture.logits.shape)),
                      str(capture.logits.dtype), array_to_blob(capture.logits)),
                 )
+            # Inside the same transaction as the tensors, so a run can never be committed
+            # with a trace that only half describes it.
+            for decision in capture.generation_trace:
+                db.execute(
+                    "INSERT INTO generation_steps VALUES (?, ?, ?, ?, ?, ?)",
+                    (run_id, decision.step, decision.selected_token_id,
+                     decision.selected_logit, int(decision.attested),
+                     json.dumps(decision.top_candidates)),
+                )
             db.commit()
         return run_id
 
@@ -1051,6 +1211,29 @@ class RunDatabase:
                 else:
                     layer = capture.layers.setdefault(tensor_row["layer_index"], LayerCapture(tensor_row["layer_index"]))
                     layer.tensors[name] = tensor
+            # Read inside this block and before validate(), which sits outside it: after
+            # validate() every reopened run would be checked with an empty trace and the
+            # schema-4 invariants would never run on the path that matters most.
+            #
+            # An explicit existence check rather than try/except, because the table is
+            # genuinely absent in two supported cases: a database written before schema 4,
+            # and a read-only connection whose _setup() never ran (see test_recap.py).
+            has_trace = db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='generation_steps'"
+            ).fetchone()
+            if has_trace:
+                capture.generation_trace = [
+                    GenerationDecision(
+                        step=int(step_row["step"]),
+                        selected_token_id=int(step_row["selected_token_id"]),
+                        selected_logit=float(step_row["selected_logit"]),
+                        top_candidates=json.loads(step_row["candidates_json"]),
+                        attested=bool(step_row["attested"]),
+                    )
+                    for step_row in db.execute(
+                        "SELECT * FROM generation_steps WHERE run_id = ? ORDER BY step",
+                        (run_id,))
+                ]
         capture.validate()
         return capture
 
@@ -1096,9 +1279,11 @@ class GenerationWorker(QThread):
 # Re-export copy/helpers for the existing verification entry points.
 from tensorscope_content import (
     TENSOR_LABELS, TENSOR_LABEL_BY_KEY, TENSOR_EXPLANATIONS,
-    StoryStage, STORY_STAGES, STORY_STAGE_INDEX, story_facts, LOGITS_UNAVAILABLE,
+    InternalsStage, INTERNALS_STAGES, INTERNALS_STAGE_INDEX, INTERNALS_STEPS,
+    LearnStage, LEARN_STAGES, LEARN_STAGE_INDEX, learn_facts, LOGITS_UNAVAILABLE,
 )
-from tensorscope_ui import StoryView, DetailView, ComputationRecap as _ComputationRecap
+from tensorscope_views import InternalsView, LearnView, RawView
+from tensorscope_ui import ComputationRecap as _ComputationRecap
 
 
 class ComputationRecap(_ComputationRecap):
@@ -1677,14 +1862,24 @@ def self_test() -> None:
     # tensor that no longer exists cannot linger.
     assert set(TENSOR_EXPLANATIONS) == labelled, set(TENSOR_EXPLANATIONS) ^ labelled
     assert all(text.strip() for text in TENSOR_EXPLANATIONS.values())
-    assert len(STORY_STAGE_INDEX) == len(STORY_STAGES), "duplicate story stage key"
+    assert len(LEARN_STAGE_INDEX) == len(LEARN_STAGES), "duplicate learn stage key"
+    assert len(INTERNALS_STAGE_INDEX) == len(INTERNALS_STAGES), "duplicate internals stage key"
 
-    # Narration interpolates real run quantities; a stage naming a field story_facts() does
-    # not supply would otherwise raise KeyError in front of a reader.
-    facts = story_facts(capture)
-    for stage in STORY_STAGES:
+    # Both journeys interpolate real run quantities into their copy; a stage naming a field
+    # learn_facts() does not supply would otherwise raise KeyError in front of a reader.
+    facts = learn_facts(capture)
+    for stage in LEARN_STAGES:
+        stage.question.format(**facts)
+        stage.plain.format(**facts)
+    for stage in INTERNALS_STAGES:
         stage.heading.format(**facts)
         stage.plain.format(**facts)
+
+    # Every layer step needs all three rungs of its disclosure ladder, or the technical
+    # journey would show an equation with no purpose above it.
+    for key, copy in INTERNALS_STEPS.items():
+        assert {"purpose", "concept", "equation"} <= set(copy), key
+        assert all(str(copy[field]).strip() for field in ("purpose", "concept", "equation")), key
 
     print("TensorScope self-test passed.")
 

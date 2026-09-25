@@ -31,10 +31,13 @@ sys.meta_path.insert(0, ForbidModelImports())
 
 import numpy as np
 from PyQt5.QtCore import QCoreApplication, QEvent, Qt
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QPushButton
 
 import TensorScope as app
 from tensor_widgets import AttentionExplorer, TensorInspector, TensorTableModel, exact_scalar
+from tensorscope_common import LAYER_STEPS, Disclosure
+from tensorscope_ui import MODES, ComputationRecap
+from tensorscope_views import InternalsView, LearnView, RawView
 
 
 DATABASE = Path(sys.argv.pop(1)) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else app.DB_PATH
@@ -67,6 +70,17 @@ def capture_digest(capture):
         result.update(str((array.dtype.str, array.shape)).encode())
         result.update(array.tobytes())
     return result.hexdigest()
+
+
+def open_every_disclosure(widget):
+    """Click open every collapsed Disclosure under `widget`, building its body.
+
+    A Disclosure builds nothing until it is toggled, so an unopened one proves nothing.
+    """
+    for disclosure in widget.findChildren(Disclosure):
+        button = disclosure.findChild(QPushButton)
+        if button is not None and button.isCheckable() and not button.isChecked():
+            button.click()
 
 
 class ReadOnlyDatabase(app.RunDatabase):
@@ -129,9 +143,13 @@ class SavedCaptureTests(unittest.TestCase):
         self.assertEqual(app.REQUIRED_LAYER_TENSORS, set(app.TENSOR_EXPLANATIONS))
         self.assertTrue(all(text.strip() for text in app.TENSOR_EXPLANATIONS.values()))
         for capture in self.captures.values():
-            for stage in app.STORY_STAGES:
-                stage.heading.format(**app.story_facts(capture))
-                stage.plain.format(**app.story_facts(capture))
+            facts = app.learn_facts(capture)
+            for stage in app.LEARN_STAGES:
+                stage.question.format(**facts)
+                stage.plain.format(**facts)
+            for stage in app.INTERNALS_STAGES:
+                stage.heading.format(**facts)
+                stage.plain.format(**facts)
 
     def test_virtual_tables_reach_every_saved_axis_without_mutation(self):
         """All heads/slices and boundary cells remain accessible at exact precision."""
@@ -224,6 +242,78 @@ class SavedCaptureTests(unittest.TestCase):
                         explorer.deleteLater()
             QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
             self.assertEqual(before, capture_digest(capture))
+
+    def test_every_view_stage_builds_from_real_captures_without_mutating_them(self):
+        """Walk all three views over every saved run, opening every disclosure.
+
+        The recap builds its expensive widgets lazily, so a stage nobody visited during
+        development can carry a stale attribute name for a long time.  This visits all of
+        them -- both phases, every layer, every layer step, every generated token -- and
+        clicks open each Disclosure, then re-hashes the capture: reading a tensor must
+        never rewrite it.
+        """
+        for run_id, capture in self.captures.items():
+            before = capture_digest(capture)
+            for factory in (LearnView, InternalsView):
+                view = factory(capture, tokens=app.TOKENS)
+                for key in view.stage_keys():
+                    with self.subTest(run_id=run_id, view=factory.__name__, stage=key):
+                        view.go_to(key)
+                        self.assertEqual(view.current_stage(), key)
+                        open_every_disclosure(view)
+                        for generated in (False, True):
+                            view.generated = generated
+                            for layer_index in {min(view.layer_indices), max(view.layer_indices)}:
+                                view.layer_index = layer_index
+                                for step, _ in (LAYER_STEPS if key == "layers" else [("input", "")]):
+                                    view.step_key = step
+                                    view.go_to(key)
+                                    open_every_disclosure(view)
+                        view.generated = False
+                        if key == "tokens":
+                            for position in {0, len(capture.prompt_tokens) - 1}:
+                                view._show_token(position)
+                                open_every_disclosure(view)
+                        if key == "generation":
+                            for position in range(len(capture.tokens)):
+                                view._show_decision(position)
+                                open_every_disclosure(view)
+                view.deleteLater()
+
+            raw = RawView(capture, tokens=app.TOKENS)
+            for phase in range(raw.phase_picker.count()):
+                raw.phase_picker.setCurrentIndex(phase)
+                for layer in range(raw.layer_picker.count()):
+                    raw.layer_picker.setCurrentIndex(layer)
+                    self.assertGreater(raw.tensor_picker.count(), 0)
+                    for tensor in range(raw.tensor_picker.count()):
+                        raw.tensor_picker.setCurrentIndex(tensor)
+                        inspector = raw.findChild(TensorInspector)
+                        self.assertIsNotNone(inspector)
+            raw.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.assertEqual(before, capture_digest(capture))
+
+    def test_recap_shell_reaches_every_mode_and_stage(self):
+        """The shell's navigation must stay in step with whatever stages a view declares."""
+        run_id, capture = next(iter(self.captures.items()))
+        before = capture_digest(capture)
+        recap = ComputationRecap(capture, run_id=run_id, tokens=app.TOKENS)
+        for key, name, _, _ in MODES:
+            recap._show_mode(key)
+            self.assertTrue(recap._mode_buttons[key].isChecked())
+            self.assertEqual(set(recap._stage_buttons), {k for k, _ in recap.view.NAV})
+            self.assertIn(name, recap.breadcrumb.text())
+            for stage_key, stage_name in recap.view.NAV:
+                recap._nav_to(stage_key)
+                self.assertEqual(recap.view.current_stage(), stage_key)
+                self.assertTrue(recap._stage_buttons[stage_key].isChecked())
+                self.assertIn(stage_name, recap.breadcrumb.text())
+            recap._advance(1)
+            recap._advance(-1)
+        recap.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(before, capture_digest(capture))
 
 
 if __name__ == "__main__":
