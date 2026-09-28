@@ -1280,9 +1280,12 @@ class GenerationWorker(QThread):
 from tensorscope_content import (
     TENSOR_LABELS, TENSOR_LABEL_BY_KEY, TENSOR_EXPLANATIONS,
     InternalsStage, INTERNALS_STAGES, INTERNALS_STAGE_INDEX, INTERNALS_STEPS,
-    LearnStage, LEARN_STAGES, LEARN_STAGE_INDEX, learn_facts, LOGITS_UNAVAILABLE,
+    LessonScene, LESSON_SCENES, LESSON_SCENE_INDEX, LESSON_SCENE_KEYS,
+    Reveal, REVEALS, REVEAL_INDEX, Term, TERMS, TERM_CAVEAT,
+    Checkpoint, CHECKPOINTS, CHECKPOINT_INDEX, CHECKPOINTS_BY_SCENE,
+    learn_facts, visible_text, LOGITS_UNAVAILABLE,
 )
-from tensorscope_views import InternalsView, LearnView, RawView
+from tensorscope_views import InternalsView, LessonView, RawView
 from tensorscope_ui import ComputationRecap as _ComputationRecap
 
 

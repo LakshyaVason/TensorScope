@@ -17,8 +17,9 @@ from matplotlib.figure import Figure
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QAction, QButtonGroup, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QMenu, QPushButton, QRadioButton, QSizePolicy, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from tensorscope_content import (
@@ -448,10 +449,14 @@ class Disclosure(QWidget):
     Nothing inside is built until `toggle` fires, which is why the self-test has to
     open every one of these: merely constructing a view creates no tensor widgets.
     """
-    def __init__(self, title, build, parent=None):
+    def __init__(self, title, build, parent=None, *, key: str | None = None,
+                 start_open: bool = False, on_toggle=None):
         super().__init__(parent)
         self.build = build
         self.content = None
+        self.title = title
+        self.key = key
+        self._on_toggle = on_toggle
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(0, 0, 0, 0)
         self.button = QPushButton('＋ ' + title)
@@ -459,7 +464,11 @@ class Disclosure(QWidget):
         self.button.setAccessibleName(title)
         self.button.toggled.connect(self.toggle)
         self.body.addWidget(self.button, 0, Qt.AlignLeft)
-        self.title = title
+        if start_open:
+            # Restoring a reveal the reader had already opened before Back/Next rebuilt
+            # the scene.  Builders are pure functions of lesson state, so re-running one
+            # reproduces the same widget rather than a stale copy.
+            self.button.setChecked(True)
 
     def toggle(self, checked):
         if checked and self.content is None:
@@ -468,6 +477,8 @@ class Disclosure(QWidget):
         if self.content is not None:
             self.content.setVisible(checked)
         self.button.setText(('− ' if checked else '＋ ') + self.title)
+        if self._on_toggle is not None and self.key is not None:
+            self._on_toggle(self.key, bool(checked))
 
 
 # ── Phase badge ───────────────────────────────────────────────────────────────
@@ -561,3 +572,417 @@ class LayerStepSidebar(QWidget):
     def set_current(self, key: str) -> None:
         for existing, button in self._buttons.items():
             button.setChecked(existing == key)
+
+
+# ── Lesson primitives ─────────────────────────────────────────────────────────
+#
+# Everything below serves the guided lesson in `tensorscope_views`, and all of it is
+# presentation only: no widget here computes a tensor, caches one, or writes through
+# a view returned by `display_matrix`.
+#
+# `ValueStrip` is the one that carries a rule rather than a look.  Every numeric
+# preview the lesson shows goes through it, and it refuses to render without a
+# `source` string naming which captured array and which subset the numbers came from.
+# That makes the spec's provenance requirement structural instead of editorial.
+
+# Recorded answers to an optional understanding check.  Non-negative values are the
+# index of the option the reader chose; these two are the other outcomes.
+CHECK_REVEALED = -1
+CHECK_SKIPPED = -2
+
+
+def preview_number(value, digits: int = 5) -> str:
+    """A short, honest rendering of one stored scalar.
+
+    Shortest-round-trip formatting at the array's own precision, so nothing gains
+    digits it does not have.  Very large or very small magnitudes switch to
+    scientific notation -- the masked cells in a captured score tensor hold a number
+    near -3.4e38, and rendering that positionally would fill the screen.  Exact
+    values always remain available through the tensor inspector.
+    """
+    number = float(value)
+    if number != number or number in (float('inf'), float('-inf')):
+        return str(number)
+    magnitude = abs(number)
+    if magnitude and (magnitude >= 1e5 or magnitude < 1e-4):
+        return np.format_float_scientific(number, precision=3, unique=True, trim='-')
+    return np.format_float_positional(number, precision=digits, unique=True,
+                                      fractional=True, trim='-')
+
+
+class ValueStrip(QWidget):
+    """A row of real captured numbers that always states where it came from.
+
+    `source` is mandatory and appears under the numbers: which array, which phase,
+    which position, and how much of it is shown.  A preview of eight numbers out of
+    2560 that does not say so is the failure mode this class exists to prevent.
+    """
+
+    def __init__(self, values, *, source: str, title: str = '', color_key: str = 'layer',
+                 highlight: int | None = None, labels=None, tokens: dict | None = None,
+                 parent=None):
+        super().__init__(parent)
+        if not source:
+            raise ValueError('ValueStrip needs a source: which array and which subset')
+        palette = tokens or {}
+        colour = COLORS.get(color_key, palette.get('accent', '#8888aa'))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        if title:
+            heading = label(title, small=True)
+            heading.setStyleSheet(f'color: {colour}; font-weight: 700;')
+            outer.addWidget(heading)
+
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self.cells: list[QLabel] = []
+        flat = list(np.asarray(values).reshape(-1))
+        for index, value in enumerate(flat):
+            cell = QLabel(preview_number(value))
+            cell.setObjectName('valueCell')
+            cell.setAlignment(Qt.AlignCenter)
+            cell.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            emphasised = index == highlight
+            cell.setStyleSheet(
+                f'border: 1px solid {colour}; border-radius: 4px; padding: 5px 7px; '
+                f'font-family: Consolas, monospace; font-size: 12px; '
+                + (f'background: {colour}33; font-weight: 700;' if emphasised else ''))
+            if labels is not None and index < len(labels):
+                cell.setToolTip(str(labels[index]))
+            row.addWidget(cell)
+            self.cells.append(cell)
+        row.addStretch(1)
+        outer.addWidget(holder)
+        outer.addWidget(label(source, muted=True, small=True))
+
+
+class MultiplyVisual(QWidget):
+    """The row-times-weights lesson, with captured endpoints and a schematic middle.
+
+    The input row and the result row are real stored numbers.  The weight set between
+    them is drawn as a labelled box carrying a *conceptual* badge, because a capture
+    stores activations and not parameters.  No product is ever displayed: with the
+    weights absent, any individual product would have to be invented.
+    """
+
+    def __init__(self, row_values, result_values, *, row_source: str, result_source: str,
+                 row_title: str, result_title: str, matrix_label: str,
+                 matrix_shape: tuple, row_color: str = 'norm', result_color: str = 'q',
+                 pair: tuple[int, int] = (0, 0), note: str = '',
+                 tokens: dict | None = None, parent=None):
+        super().__init__(parent)
+        from tensorscope_content import EVIDENCE_CONCEPTUAL as _conceptual
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        outer.addWidget(ValueStrip(row_values, source=row_source, title=row_title,
+                                   color_key=row_color, highlight=pair[0], tokens=tokens))
+
+        middle = QWidget()
+        middle_row = QHBoxLayout(middle)
+        middle_row.setContentsMargins(0, 0, 0, 0)
+        middle_row.setSpacing(10)
+        times = QLabel('×')
+        times.setObjectName('shapeOp')
+        middle_row.addWidget(times)
+        box = QFrame()
+        box.setObjectName('schematicBox')
+        box.setStyleSheet(
+            'QFrame#schematicBox { border: 1px dashed %s; border-radius: 6px; }'
+            % COLORS.get('layer', '#94a3b8'))
+        inner = QVBoxLayout(box)
+        inner.setContentsMargins(12, 8, 12, 8)
+        inner.setSpacing(3)
+        inner.addWidget(label(matrix_label, small=True))
+        inner.addWidget(label('[' + ' × '.join(str(d) for d in matrix_shape) + ']', muted=True,
+                              small=True))
+        inner.addWidget(EvidenceBadge(_conceptual, 'parameters not saved'))
+        middle_row.addWidget(box)
+        arrow = QLabel('=')
+        arrow.setObjectName('shapeOp')
+        middle_row.addWidget(arrow)
+        middle_row.addStretch(1)
+        outer.addWidget(middle)
+
+        outer.addWidget(ValueStrip(result_values, source=result_source, title=result_title,
+                                   color_key=result_color, highlight=pair[1], tokens=tokens))
+        if note:
+            outer.addWidget(label(note, muted=True, small=True))
+
+
+class ValueBars(QWidget):
+    """Aligned bars for one row of stored numbers, next to their exact values.
+
+    Plain frames rather than matplotlib: this appears on the lesson's default path,
+    where building a canvas per scene is the cost the disclosure ladder exists to
+    avoid.  Masked entries are shown as masked instead of as an enormous bar; the
+    test for "is this cell masked" is the same `finfo.min / 2` rule the attention
+    table uses, so there is only one such rule in the codebase.
+    """
+
+    def __init__(self, values, labels, *, source: str, color_key: str = 'weights',
+                 highlight: int | None = None, signed: bool = False,
+                 tokens: dict | None = None, parent=None):
+        super().__init__(parent)
+        palette = tokens or {}
+        colour = COLORS.get(color_key, palette.get('accent', '#8888aa'))
+        muted = palette.get('text_muted', '#636370')
+        flat = np.asarray(values).reshape(-1)
+        floor = np.finfo(flat.dtype).min / 2 if flat.dtype.kind == 'f' else None
+        eligible = flat if floor is None else flat[flat > floor]
+        span = float(np.max(np.abs(eligible))) if eligible.size else 0.0
+        low = float(np.min(eligible)) if eligible.size and signed else 0.0
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(3)
+        for index, value in enumerate(flat):
+            number = float(value)
+            masked = floor is not None and number <= floor
+            line = QWidget()
+            row = QHBoxLayout(line)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            name = QLabel(str(labels[index]) if index < len(labels) else str(index))
+            name.setMinimumWidth(130)
+            name.setMaximumWidth(130)
+            name.setObjectName('journeySmall')
+            name.setToolTip(str(labels[index]) if index < len(labels) else str(index))
+            row.addWidget(name)
+
+            track = QWidget()
+            track.setMinimumHeight(14)
+            track.setMaximumHeight(14)
+            fill_row = QHBoxLayout(track)
+            fill_row.setContentsMargins(0, 0, 0, 0)
+            fill_row.setSpacing(0)
+            if masked or span == 0.0:
+                fraction = 0.0
+            elif signed:
+                fraction = (number - low) / (span - low) if span > low else 0.0
+            else:
+                fraction = abs(number) / span
+            filled = max(0, min(1000, int(round(fraction * 1000))))
+            bar = QFrame()
+            emphasised = index == highlight
+            bar.setStyleSheet(
+                f'background: {colour}; border-radius: 3px;'
+                if emphasised else f'background: {colour}88; border-radius: 3px;')
+            fill_row.addWidget(bar, filled)
+            rest = QFrame()
+            rest.setStyleSheet('background: transparent;')
+            fill_row.addWidget(rest, 1000 - filled)
+            row.addWidget(track, 1)
+
+            readout = QLabel('masked' if masked else preview_number(number))
+            readout.setMinimumWidth(110)
+            readout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            readout.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            readout.setStyleSheet(
+                'font-family: Consolas, monospace; font-size: 12px; '
+                + (f'color: {muted};' if masked else
+                   f'color: {colour}; font-weight: 700;' if emphasised else ''))
+            if masked:
+                readout.setToolTip(f'stored value {preview_number(number)} — a masked position')
+            row.addWidget(readout)
+            outer.addWidget(line)
+        outer.addWidget(label(source, muted=True, small=True))
+
+
+class CheckpointCard(QFrame):
+    """One optional understanding check.
+
+    Answering, revealing and skipping are all offered, and none of them touches
+    navigation -- Back and Next live outside this widget entirely, so a wrong answer
+    cannot block the lesson.  Every option carries its own explanation, so choosing
+    the wrong one teaches instead of scoring.  A previously recorded answer is
+    reflected when the scene is rebuilt.
+    """
+
+    def __init__(self, spec, facts: dict, answer=None, on_answer=None,
+                 tokens: dict | None = None, parent=None):
+        super().__init__(parent)
+        from tensorscope_content import EVIDENCE_CONCEPTUAL as _conceptual
+        self.spec = spec
+        self._on_answer = on_answer
+        palette = tokens or {}
+        accent = palette.get('accent', '#3b82f6')
+        self.setObjectName('checkpointCard')
+        self.setStyleSheet(
+            'QFrame#checkpointCard { border: 1px solid %s; border-radius: 8px; }' % accent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(8)
+        heading = label('CHECK YOUR UNDERSTANDING  ·  OPTIONAL', small=True)
+        heading.setStyleSheet(f'color: {accent}; font-weight: 700; letter-spacing: 0.6px;')
+        outer.addWidget(heading)
+        outer.addWidget(label(spec.question.format(**facts)))
+
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.options: list[QRadioButton] = []
+        for index, text in enumerate(spec.options):
+            button = QRadioButton(text.format(**facts))
+            button.setObjectName('checkOption')
+            self.group.addButton(button, index)
+            outer.addWidget(button)
+            self.options.append(button)
+        self.group.idClicked.connect(self._chose)
+
+        controls = QWidget()
+        control_row = QHBoxLayout(controls)
+        control_row.setContentsMargins(0, 0, 0, 0)
+        control_row.setSpacing(8)
+        self.reveal = QPushButton('Reveal the answer')
+        self.reveal.setObjectName('secondaryBtn')
+        self.reveal.clicked.connect(lambda: self._record(CHECK_REVEALED))
+        self.skip = QPushButton('Skip this')
+        self.skip.setObjectName('secondaryBtn')
+        self.skip.clicked.connect(lambda: self._record(CHECK_SKIPPED))
+        control_row.addWidget(self.reveal)
+        control_row.addWidget(self.skip)
+        control_row.addStretch(1)
+        outer.addWidget(controls)
+
+        self.explanation = label('', rich=True)
+        self.explanation.setObjectName('checkExplanation')
+        self.explanation.setVisible(False)
+        outer.addWidget(self.explanation)
+        self.footnote = label(
+            'Nothing here is graded, and Next works whether you answer or not.',
+            muted=True, small=True)
+        outer.addWidget(self.footnote)
+        self._facts = facts
+        if answer is not None:
+            self._apply(answer)
+
+    def _chose(self, index: int) -> None:
+        self._record(index)
+
+    def _record(self, value: int) -> None:
+        self._apply(value)
+        if self._on_answer is not None:
+            self._on_answer(self.spec.key, value)
+
+    def _apply(self, value: int) -> None:
+        """Render the outcome for a recorded answer.  Pure display; changes no state."""
+        spec, facts = self.spec, self._facts
+        correct = spec.options[spec.correct].format(**facts)
+        if value == CHECK_SKIPPED:
+            text = ('Skipped. You can answer it any time — nothing in the lesson is '
+                    'locked behind it.')
+        elif value == CHECK_REVEALED:
+            text = (f'<b>The answer is:</b> {correct}<br><br>'
+                    + spec.explain[spec.correct].format(**facts))
+        else:
+            if 0 <= value < len(self.options):
+                self.options[value].setChecked(True)
+            body = spec.explain[value].format(**facts)
+            if value == spec.correct:
+                text = f'<b>Correct.</b><br><br>{body}'
+            else:
+                text = (f'<b>Not this one.</b> {body}<br><br>'
+                        f'<b>The answer is:</b> {correct}')
+        self.explanation.setText(text)
+        self.explanation.setVisible(True)
+
+
+class StepProgress(QWidget):
+    """`Step 5 of 13` plus a thin segmented bar, in one fixed place."""
+
+    def __init__(self, total: int, tokens: dict | None = None, parent=None):
+        super().__init__(parent)
+        palette = tokens or {}
+        self._accent = palette.get('accent', '#3b82f6')
+        self._idle = palette.get('border', '#2e2e33')
+        self._total = max(1, total)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(5)
+        self.caption = label('', muted=True, small=True)
+        outer.addWidget(self.caption)
+        track = QWidget()
+        row = QHBoxLayout(track)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(3)
+        self.segments: list[QFrame] = []
+        for _ in range(self._total):
+            segment = QFrame()
+            segment.setMinimumHeight(4)
+            segment.setMaximumHeight(4)
+            row.addWidget(segment, 1)
+            self.segments.append(segment)
+        outer.addWidget(track)
+        self.set_current(0)
+
+    def set_current(self, index: int) -> None:
+        index = max(0, min(index, self._total - 1))
+        self.caption.setText(f'Step {index + 1} of {self._total}')
+        for position, segment in enumerate(self.segments):
+            colour = self._accent if position <= index else self._idle
+            segment.setStyleSheet(f'background: {colour}; border-radius: 2px;')
+
+
+class LessonRibbon(QFrame):
+    """The compact strip that keeps the real prompt and the current focus on screen.
+
+    One line, so it costs no vertical room the card needs.  The prompt is the run's
+    own stored prompt text; the focus string is whatever the current scene is looking
+    at (a position, a layer, a head, a query/key pair).
+    """
+
+    def __init__(self, prompt: str, tokens: dict | None = None, parent=None):
+        super().__init__(parent)
+        palette = tokens or {}
+        self.setObjectName('lessonRibbon')
+        self.setStyleSheet(
+            'QFrame#lessonRibbon { background: %s; border: 1px solid %s; border-radius: 6px; }'
+            % (palette.get('card_bg', '#1c1c20'), palette.get('border', '#2e2e33')))
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 7, 12, 7)
+        row.setSpacing(10)
+        tag = label('PROMPT', small=True)
+        tag.setStyleSheet(f"color: {palette.get('text_muted', '#636370')}; font-weight: 700;")
+        row.addWidget(tag)
+        shown = ' '.join((prompt or '').split()) or '(no prompt text stored)'
+        self.prompt_label = QLabel(shown if len(shown) <= 90 else shown[:89] + '…')
+        self.prompt_label.setObjectName('ribbonPrompt')
+        self.prompt_label.setToolTip(prompt or '')
+        self.prompt_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.prompt_label.setStyleSheet('font-weight: 600;')
+        row.addWidget(self.prompt_label)
+        row.addStretch(1)
+        self.focus_label = label('', muted=True, small=True)
+        self.focus_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row.addWidget(self.focus_label)
+
+    def set_focus(self, text: str) -> None:
+        self.focus_label.setText(text)
+
+
+class ContentsButton(QPushButton):
+    """One small button opening a menu of scenes.
+
+    Deliberately a menu rather than a panel: the lesson removed the persistent stage
+    sidebar, and replacing it with another permanent list on the other side would
+    reintroduce exactly what was removed.
+    """
+
+    def __init__(self, entries, on_pick, parent=None):
+        super().__init__('Contents', parent)
+        self.setObjectName('secondaryBtn')
+        self._menu = QMenu(self)
+        self._actions: dict[str, QAction] = {}
+        for position, (key, name) in enumerate(entries):
+            action = self._menu.addAction(f'{position + 1}.  {name}')
+            action.setCheckable(True)
+            action.triggered.connect(lambda _=False, k=key: on_pick(k))
+            self._actions[key] = action
+        self.setMenu(self._menu)
+
+    def set_current(self, key: str) -> None:
+        for existing, action in self._actions.items():
+            action.setChecked(existing == key)
