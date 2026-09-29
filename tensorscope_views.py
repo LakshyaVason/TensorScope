@@ -175,9 +175,19 @@ class JourneyView(QWidget):
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(0, 0, 0, 0)
         self.body.setSpacing(14)
+        self.prepare()
         self.go_to(self.stage_keys()[0])
 
     # ── Stage plumbing ────────────────────────────────────────────────────────
+
+    def prepare(self) -> None:
+        """Hook for state a subclass needs before its first stage is built.
+
+        The base class creates nothing here.  It exists so a subclass can set up caches or
+        per-phase selections after QWidget.__init__ has run but before `go_to` reaches a
+        builder -- assigning those attributes any earlier would mean touching a QWidget
+        that does not exist yet.
+        """
 
     @classmethod
     def stage_keys(cls) -> list[str]:

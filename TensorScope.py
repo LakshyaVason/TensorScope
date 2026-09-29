@@ -1281,6 +1281,10 @@ from tensorscope_content import (
     TENSOR_LABELS, TENSOR_LABEL_BY_KEY, TENSOR_EXPLANATIONS,
     InternalsStage, INTERNALS_STAGES, INTERNALS_STAGE_INDEX, INTERNALS_STEPS,
     LearnStage, LEARN_STAGES, LEARN_STAGE_INDEX, learn_facts, LOGITS_UNAVAILABLE,
+    LessonStage, LESSON_STAGES, LESSON_STAGE_INDEX, LESSON_STEPS,
+    LESSON_CHECKS, LESSON_CHECK_ORDER, LESSON_TIMING_CAVEAT, LESSON_DISPLAY_CALC,
+    PROMPT_SPAN_UNKNOWN, SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE,
+    EVIDENCE_KINDS, TYPED_BAND, prompt_token_bands, readable_spelling,
 )
 from tensorscope_views import InternalsView, LearnView, RawView
 from tensorscope_ui import ComputationRecap as _ComputationRecap
@@ -1787,7 +1791,13 @@ class TensorScopeMainWindow(QMainWindow):
 def self_test() -> None:
     """Small checks for persistence and real-array visualization helpers (no torch needed)."""
     import tempfile
-    layer_data = {name: np.arange(36, dtype=np.float32).reshape(1, 6, 6) for name in REQUIRED_LAYER_TENSORS}
+    # The prepared/attention tensors carry a head axis in a real capture, and the lesson reads
+    # its head geometry off exactly those shapes, so the fixture has to have one too.  The rest
+    # stay (1, 6, 6): the numeric_sample preview assertion below needs a 6x6 tail to sample.
+    head_shaped = {"q_attended", "k_attended", "v_attended", "attention_scores", "attention_weights"}
+    layer_data = {name: (np.arange(72, dtype=np.float32).reshape(1, 2, 6, 6) if name in head_shaped
+                         else np.arange(36, dtype=np.float32).reshape(1, 6, 6))
+                  for name in REQUIRED_LAYER_TENSORS}
     # argmax lands on index 1, matching token_ids[0]; validate() rejects any other peak.
     logits = np.array([0.5, 9.25, 1.0, -3.0], dtype=np.float32)
     capture = RunCapture(prompt="test", response="answer", token_ids=[1], tokens=["answer"],
@@ -1880,6 +1890,89 @@ def self_test() -> None:
     for key, copy in INTERNALS_STEPS.items():
         assert {"purpose", "concept", "equation"} <= set(copy), key
         assert all(str(copy[field]).strip() for field in ("purpose", "concept", "equation")), key
+
+    # The lesson player's copy is checked the same way: every screen formats against this run,
+    # every revealed step names a real screen and a real evidence tier, and every optional
+    # check formats with the extra placeholders it declares.
+    assert len(LESSON_STAGES) == 8, len(LESSON_STAGES)
+    assert len(LESSON_STAGE_INDEX) == len(LESSON_STAGES), "duplicate lesson stage key"
+    for stage in LESSON_STAGES:
+        stage.question.format(**facts)
+        stage.plain.format(**facts)
+        assert stage.nav.strip(), stage.key
+
+    for screen, steps in LESSON_STEPS.items():
+        assert screen in LESSON_STAGE_INDEX, screen
+        assert steps, screen
+        for step in steps:
+            assert str(step["caption"]).strip() and str(step["body"]).strip(), (screen, step)
+            # Both, not just the body: a caption carrying an unformatted placeholder put
+            # the literal "{head_dim}" on screen, and no check noticed.
+            step["caption"].format(**facts)
+            step["body"].format(**facts)
+            str(step.get("note") or "").format(**facts)
+            tier = step.get("tier")
+            assert tier is None or tier in EVIDENCE_KINDS, (screen, tier)
+
+    assert set(LESSON_CHECK_ORDER) == set(LESSON_CHECKS), "LESSON_CHECKS and its order disagree"
+    assert len(LESSON_CHECK_ORDER) == 4, len(LESSON_CHECK_ORDER)
+    for name in LESSON_CHECK_ORDER:
+        check = LESSON_CHECKS[name]
+        assert check["screen"] in LESSON_STAGE_INDEX, name
+        assert len(check["options"]) >= 2 and all(str(text).strip() for text in check["options"]), name
+        assert 0 <= check["answer"] < len(check["options"]), name
+        filled = {**facts, **{field: 0 for field in check["fields"]}}
+        check["question"].format(**filled)
+        check["explanation"].format(**filled)
+        for option in check["options"]:           # options reach a button unformatted too
+            option.format(**filled)
+
+    for note in (LESSON_TIMING_CAVEAT, LESSON_DISPLAY_CALC, PROMPT_SPAN_UNKNOWN,
+                 SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE):
+        assert note.strip()
+
+    # Byte-level BPE spellings stand for text a reader typed; specials stand for themselves.
+    assert readable_spelling("Ġcolor") == " color"
+    assert readable_spelling("Ċ") == "\n"
+    assert readable_spelling("<|im_start|>") == "<|im_start|>"
+
+    # Which tokens came from the reader's own text is TensorScope's alignment, not a captured
+    # fact, so it must refuse rather than guess when the match is not unique and exact.
+    chat_prompt = ["<|im_start|>", "user", "Ċ", "favorite", "Ġcolor", "?", "<|im_end|>",
+                   "Ċ", "<|im_start|>", "assistant", "Ċ", "<think>", "ĊĊ",
+                   "</think>", "ĊĊ"]
+    bands = prompt_token_bands("favorite color?", chat_prompt)
+    assert bands is not None and len(bands) == 3, bands
+    assert [(start, end) for start, end, band in bands if band == TYPED_BAND] == [(3, 6)], bands
+    assert prompt_token_bands("text that is not in the prompt", chat_prompt) is None
+    assert prompt_token_bands("", []) is None
+
+    # learn_facts() reads geometry off the captured arrays, so it has to stay total: a legacy
+    # capture with no score vector must still yield every field the copy interpolates.
+    for subject in (capture, legacy):
+        measured = learn_facts(subject)
+        for field in ("query_head_count", "kv_head_count", "head_dim", "key_position_count",
+                      "typed_token_count", "template_token_count", "phase_count",
+                      "layer_step_count", "candidate_count"):
+            assert isinstance(measured[field], int), (field, measured[field])
+        assert str(measured["attention_scale_text"]).strip()
+        assert str(measured["vocab_size_phrase"]).strip()
+        assert isinstance(measured["prompt_span_known"], bool)
+        assert str(measured["typed_token_summary"]).strip()
+    assert learn_facts(capture)["prompt_span_known"] is True
+
+    # The alignment fails for any prompt whose characters BYTE_BPE_REPLACEMENTS does not map,
+    # so the unknown branch is reached routinely and must not be described with the bare
+    # counts: those are 0 and prompt_count there, which reads as "you typed nothing".
+    aligned_prompt = capture.prompt
+    try:
+        capture.prompt = "text the stored spellings do not contain"
+        unaligned = learn_facts(capture)
+        assert unaligned["prompt_span_known"] is False
+        assert "0 of them" not in unaligned["typed_token_summary"], unaligned
+        assert str(unaligned["typed_token_summary"]).strip()
+    finally:
+        capture.prompt = aligned_prompt
 
     print("TensorScope self-test passed.")
 
