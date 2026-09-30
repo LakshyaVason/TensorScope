@@ -205,8 +205,11 @@ import would run while `TensorScope` is still half-initialised. Don't move that 
   drives its navigator, sidebar, breadcrumb and footer from those alone, so adding a mode
   is a row in `MODES`, not a layout change. Views other than the default are built on
   first visit.
-- Three modes, in the order a reader should meet them. **Understand** (`LearnView`, the
-  default) asks five questions a person actually asks — prompt & response, tokens,
+- Four modes, in the order a reader should meet them. **Lesson** (`LessonView`, the
+  default) is eight screens from prompt to first token, each revealing one real calculation
+  step by step (`StepReveal`) beside captured operands, with optional `PredictCheck`s; its
+  copy is `LESSON_STAGES` / `LESSON_STEPS` / `LESSON_CHECKS`, and a run with no retained
+  logits swaps the last three `select` steps for `LOGITS_UNAVAILABLE`. **Understand** (`LearnView`) asks five questions a person actually asks — prompt & response, tokens,
   building context, choosing each token, limits — and puts the explanation *above* the
   numbers. **Internals** (`InternalsView`) walks the same capture by architecture:
   embedding, one decoder layer's six steps, vocabulary scores, the next pass. **Raw

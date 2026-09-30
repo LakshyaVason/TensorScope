@@ -48,8 +48,6 @@ APP_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("MPLCONFIGDIR", str(APP_DIR / ".matplotlib"))
 
 import numpy as np
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 from PyQt5.QtCore import QLineF, QPointF, QRectF, QSize, QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
@@ -1243,6 +1241,7 @@ class LoadWorker(QThread):
     progress = pyqtSignal(str)
     loaded = pyqtSignal(str)
     failed = pyqtSignal(str)
+    warning = pyqtSignal(str)
 
     def __init__(self, capture_model: ModelCapture) -> None:
         super().__init__()
@@ -1250,6 +1249,16 @@ class LoadWorker(QThread):
 
     def run(self) -> None:
         try:
+            # Importing torch is slow, so the VRAM check lives here rather than on the GUI
+            # thread; the window no longer imports torch at all before it appears.
+            import torch
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if total_gb < 8.0:
+                    self.warning.emit(
+                        f"Your GPU has ~{total_gb:.1f} GB VRAM.\n"
+                        "Qwen3-4B needs ~7.6 GB peak (bf16).  "
+                        "Consider Qwen/Qwen2.5-0.5B-Instruct instead.")
             self.capture_model.load(self.progress.emit)
             self.loaded.emit(self.capture_model.describe())
         except Exception as exc:
@@ -1286,7 +1295,7 @@ from tensorscope_content import (
     PROMPT_SPAN_UNKNOWN, SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE,
     EVIDENCE_KINDS, TYPED_BAND, prompt_token_bands, readable_spelling,
 )
-from tensorscope_views import InternalsView, LearnView, RawView
+from tensorscope_views import InternalsView, LearnView, LessonView, RawView
 from tensorscope_ui import ComputationRecap as _ComputationRecap
 
 
@@ -1710,19 +1719,6 @@ class TensorScopeMainWindow(QMainWindow):
         if not wanted:
             QMessageBox.information(self, "Model required", "Enter a Hugging Face model id.")
             return
-        try:
-            import torch
-            if torch.cuda.is_available():
-                total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-                if total_gb < 8.0:
-                    QMessageBox.warning(
-                        self, "VRAM warning",
-                        f"Your GPU has ~{total_gb:.1f} GB VRAM.\n"
-                        "Qwen3-4B needs ~7.6 GB peak (bf16).  "
-                        "Consider Qwen/Qwen2.5-0.5B-Instruct instead.",
-                    )
-        except ImportError:
-            pass
         self.capture_model = ModelCapture(wanted)
         self.load_button.setEnabled(False)
         self.run_button.setEnabled(False)
@@ -1732,6 +1728,7 @@ class TensorScopeMainWindow(QMainWindow):
         self.loader.progress.connect(lambda msg: self._say(msg, TOKENS["accent"]))
         self.loader.loaded.connect(self.model_ready)
         self.loader.failed.connect(self.load_failed)
+        self.loader.warning.connect(lambda text: QMessageBox.warning(self, "VRAM warning", text))
         self.loader.start()
 
     def model_ready(self, description: str) -> None:
@@ -1983,10 +1980,9 @@ if __name__ == "__main__":
     else:
         demo_mode = "--demo" in sys.argv
         if not demo_mode:
-            try:
-                import torch as _torch_probe  # noqa: F401 — probe only, not used here
-            except Exception:
-                demo_mode = True
+            # find_spec answers "is torch installed?" without the multi-second import.
+            from importlib.util import find_spec
+            demo_mode = find_spec("torch") is None
 
         db_path: Path | None = None
         if "--db" in sys.argv:

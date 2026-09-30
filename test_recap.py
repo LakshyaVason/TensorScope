@@ -35,9 +35,11 @@ from PyQt5.QtWidgets import QApplication, QPushButton
 
 import TensorScope as app
 from tensor_widgets import AttentionExplorer, TensorInspector, TensorTableModel, exact_scalar
-from tensorscope_common import LAYER_STEPS, Disclosure
+from tensorscope_common import (
+    LAYER_STEPS, Disclosure, PredictCheck, ResponseTextView, StepReveal,
+)
 from tensorscope_ui import MODES, ComputationRecap
-from tensorscope_views import InternalsView, LearnView, RawView
+from tensorscope_views import InternalsView, LearnView, LessonView, RawView
 
 
 DATABASE = Path(sys.argv.pop(1)) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else app.DB_PATH
@@ -254,7 +256,7 @@ class SavedCaptureTests(unittest.TestCase):
         """
         for run_id, capture in self.captures.items():
             before = capture_digest(capture)
-            for factory in (LearnView, InternalsView):
+            for factory in (LessonView, LearnView, InternalsView):
                 view = factory(capture, tokens=app.TOKENS)
                 for key in view.stage_keys():
                     with self.subTest(run_id=run_id, view=factory.__name__, stage=key):
@@ -291,6 +293,49 @@ class SavedCaptureTests(unittest.TestCase):
                         inspector = raw.findChild(TensorInspector)
                         self.assertIsNotNone(inspector)
             raw.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.assertEqual(before, capture_digest(capture))
+
+    def test_lesson_reveals_every_step_and_restores_reader_state(self):
+        """Reveal every step, answer every check, move every selection, rebuild each screen."""
+        for run_id, capture in self.captures.items():
+            before = capture_digest(capture)
+            view = LessonView(capture, tokens=app.TOKENS)
+            last = len(capture.prompt_tokens) - 1
+            for key in view.stage_keys():
+                with self.subTest(run_id=run_id, stage=key):
+                    view.go_to(key)
+                    for reveal in view._stage_widget.findChildren(StepReveal):
+                        reveal.reveal_all()
+                        self.assertEqual(reveal.revealed(), reveal.step_count)
+                    for check in view._stage_widget.findChildren(PredictCheck):
+                        check.choose(-1)
+                        self.assertEqual(check.chosen(), -1)
+                    open_every_disclosure(view._stage_widget)
+                    view.go_to(key)     # a rebuilt screen must come back as it was left
+                    for reveal in view._stage_widget.findChildren(StepReveal):
+                        self.assertEqual(reveal.revealed(), reveal.step_count)
+                    for check in view._stage_widget.findChildren(PredictCheck):
+                        self.assertEqual(check.chosen(), -1)
+            for layer_index in {min(view.layer_indices), max(view.layer_indices)}:
+                view.layer_index = layer_index
+                for key in ("transform", "compare", "weights", "combine"):
+                    view.go_to(key)
+                    open_every_disclosure(view._stage_widget)
+            for position in {0, last}:
+                view.go_to("compare")
+                view._pick_key(position)
+                view.go_to("weights")
+                view._pick_mask(position)
+                view.go_to("vectors")
+                view._pick_vector(position)
+                view.go_to("received")
+                view._pick_received(position)
+            view.go_to("continue")
+            for step in range(len(capture.tokens)):
+                view._pick_decision(step)
+            self.assertTrue(view._stage_widget.findChildren(ResponseTextView))
+            view.deleteLater()
             QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
             self.assertEqual(before, capture_digest(capture))
 

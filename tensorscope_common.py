@@ -487,9 +487,9 @@ class Disclosure(QWidget):
         self.button = QPushButton('＋ ' + title)
         self.button.setCheckable(True)
         self.button.setAccessibleName(title)
+        self.title = title          # toggle() reads it, so it must exist before any restore
         self.button.toggled.connect(self.toggle)
         self.body.addWidget(self.button, 0, Qt.AlignLeft)
-        self.title = title
         if state is not None and state.get(self._state_key):
             self.button.setChecked(True)
 
@@ -674,21 +674,25 @@ class StepReveal(QWidget):
 
     def reveal_to(self, count: int) -> None:
         count = max(0, min(int(count), self.step_count))
-        while len(self._rows) > count:
-            row = self._rows.pop()
-            self._holder_layout.removeWidget(row)
-            row.setParent(None)
-            row.deleteLater()
-        while len(self._rows) < count:
-            row = self._build_row(len(self._rows))
-            self._holder_layout.addWidget(row)
-            self._rows.append(row)
-            self._highlight(row)
-        self._state[self._state_key] = len(self._rows)
-        self.next_button.setEnabled(len(self._rows) < self.step_count)
-        self.all_button.setEnabled(len(self._rows) < self.step_count)
-        self.reset_button.setEnabled(bool(self._rows))
-        self._counter.setText(f'{len(self._rows)} of {self.step_count} steps shown')
+        try:
+            while len(self._rows) > count:
+                row = self._rows.pop()
+                self._holder_layout.removeWidget(row)
+                row.setParent(None)
+                row.deleteLater()
+            while len(self._rows) < count:
+                row = self._build_row(len(self._rows))
+                self._holder_layout.addWidget(row)
+                self._rows.append(row)
+                self._highlight(row)
+        finally:
+            # A step whose build() raises leaves _rows short but consistent; the controls
+            # and remembered count must describe that, not the count that was asked for.
+            self._state[self._state_key] = len(self._rows)
+            self.next_button.setEnabled(len(self._rows) < self.step_count)
+            self.all_button.setEnabled(len(self._rows) < self.step_count)
+            self.reset_button.setEnabled(bool(self._rows))
+            self._counter.setText(f'{len(self._rows)} of {self.step_count} steps shown')
 
     # -- construction ---------------------------------------------------------
     def _build_row(self, index: int) -> QWidget:
@@ -880,7 +884,9 @@ class ResponseTextView(QWidget):
         self._tokens = list(tokens)
         self._response = response or ''
         self._current = max(0, min(int(selected), max(0, len(self._tokens) - 1)))
-        self._faithful = bool(self._tokens) and ''.join(self._tokens) == self._response
+        # Outer whitespace is trimmed from a stored response but not from its tokens; that
+        # alone is not a disagreement about the text.
+        self._faithful = bool(self._tokens) and ''.join(self._tokens).strip() == self._response.strip()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -957,6 +963,9 @@ class ResponseTextView(QWidget):
         for index, token in enumerate(self._tokens):
             # Verbatim: these are decoded text, not BPE spellings.  See the class docstring.
             text = html.escape(token).replace('\n', '<br>') or '&nbsp;'
+            if '\n' in token and not token.strip():
+                # An anchor around nothing but a line break has no width to click.
+                text = '↵' + text
             style = (f"text-decoration: none; border-bottom: 1px dotted {CHROME['muted']}; "
                      'color: inherit;')
             if index == self._current:

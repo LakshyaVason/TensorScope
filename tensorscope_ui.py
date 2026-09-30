@@ -1,9 +1,10 @@
 """The shell that hosts the reader-facing views of one capture.
 
 `ComputationRecap` owns the window, the palette, the banner, the provenance evidence and
-the navigation between three modes:
+the navigation between four modes:
 
-* **Understand** (`LearnView`) — the default.  What the model did with this prompt.
+* **Lesson** (`LessonView`) — the default.  Eight screens, one real calculation each.
+* **Understand** (`LearnView`) — five questions about what the model did with this prompt.
 * **Internals** (`InternalsView`) — the same capture ordered by architecture.
 * **Raw tensors** (`RawView`) — every captured array, with no framing at all.
 
@@ -20,16 +21,19 @@ import json
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSplitter,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
-from tensorscope_common import Card, Disclosure, PipelineNavigator, label
-from tensorscope_views import InternalsView, LearnView, RawView
+from tensorscope_common import (
+    Card, Disclosure, PipelineNavigator, StageProgress, StageStack, label,
+)
+from tensorscope_views import InternalsView, LearnView, LessonView, RawView
 
 
 # (key, sidebar/mode label, one-line purpose, view class).  Order is the order a reader
 # should meet them: meaning first, architecture second, unframed arrays last.
 MODES = [
+    ('lesson', 'Lesson', 'Eight screens from prompt to first token', LessonView),
     ('learn', 'Understand', 'What this model did with this prompt', LearnView),
     ('internals', 'Internals', 'The architecture, one step at a time', InternalsView),
     ('raw', 'Raw tensors', 'Every captured array, unframed', RawView),
@@ -237,6 +241,56 @@ class ComputationRecap(QDialog):
                 font-weight: 700;
             }}
 
+            /* Lesson: stepwise reveal, optional checks, value boxes, bands */
+            QFrame#revealStep {{
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+            }}
+            #revealStepCaption {{ font-size: 14px; font-weight: 700; }}
+            QPushButton#revealNext {{
+                background: {colors['accent']}; border: 1px solid {colors['accent']};
+                color: #ffffff; font-weight: 600; padding: 6px 14px; border-radius: 6px;
+            }}
+            QPushButton#revealNext:disabled {{
+                background: transparent; border-color: {colors['border']};
+                color: {colors['text_muted']};
+            }}
+            QPushButton#revealControl {{
+                border: 1px solid {colors['border']}; border-radius: 6px;
+                padding: 6px 12px; background: transparent;
+                color: {colors['text_secondary']};
+            }}
+            QPushButton#revealControl:hover {{ border-color: {colors['accent']}; }}
+            QPushButton#revealControl:disabled {{ color: {colors['text_muted']}; }}
+            QFrame#predictCheck {{
+                background: {colors['bg']};
+                border: 1px dashed {colors['border']};
+                border-radius: 8px;
+            }}
+            QPushButton#predictOption, QPushButton#predictSkip {{
+                text-align: left; border: 1px solid {colors['border']};
+                border-radius: 6px; padding: 6px 12px; background: transparent;
+                color: {colors['text_primary']};
+            }}
+            QPushButton#predictOption:hover, QPushButton#predictSkip:hover {{
+                border-color: {colors['accent']};
+            }}
+            QPushButton#predictOption:checked {{ border-color: {colors['accent']}; }}
+            #predictExplanation {{
+                padding: 8px 10px; border-left: 3px solid {colors['accent']};
+            }}
+            QFrame#valueBox {{
+                background: {colors['bg']};
+                border: 1px solid {colors['border']};
+                border-radius: 5px;
+            }}
+            #valueBoxNumber {{
+                font-family: Consolas, 'Courier New', monospace; font-size: 12px;
+            }}
+            #bandHeading {{ font-size: 10px; letter-spacing: 0.06em; padding-top: 4px; }}
+            #responseText {{ font-size: 14px; }}
+
             /* Operators between shape/flow boxes */
             #shapeOp {{
                 color: {colors['text_muted']};
@@ -258,7 +312,9 @@ class ComputationRecap(QDialog):
         pipeline_layout = QHBoxLayout(pipeline_bar)
         pipeline_layout.setContentsMargins(20, 8, 20, 8)
         self.pipeline_nav = PipelineNavigator([], self._nav_to, colors)
-        pipeline_layout.addWidget(self.pipeline_nav)
+        pipeline_layout.addWidget(self.pipeline_nav, 1)
+        self.progress = StageProgress()
+        pipeline_layout.addWidget(self.progress)
         root.addWidget(pipeline_bar)
 
         split = QSplitter(Qt.Horizontal)
@@ -349,7 +405,7 @@ class ComputationRecap(QDialog):
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(0, 0, 6, 0)
         inner_layout.setSpacing(0)
-        self.stack = QStackedWidget()
+        self.stack = StageStack()
         inner_layout.addWidget(self.stack)
         inner_layout.addStretch(1)
         self.scroll.setWidget(inner)
@@ -443,6 +499,7 @@ class ComputationRecap(QDialog):
             position = keys.index(key)
             self.previous_stage.setEnabled(position > 0)
             self.next_stage.setEnabled(position < len(keys) - 1)
+            self.progress.set_position(position, len(keys), getattr(self.view, 'NOUN', 'Stage'))
         self._refresh_breadcrumb(key)
         self.scroll.verticalScrollBar().setValue(0)
 

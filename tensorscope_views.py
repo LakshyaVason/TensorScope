@@ -1,8 +1,10 @@
 """Reader-facing journeys over one saved capture.  No model, no writes, no new numbers.
 
-Three views, in the order a first-time reader should meet them:
+Four views, in the order a first-time reader should meet them:
 
-* :class:`LearnView` -- the default.  Five stages, each answering a question a person
+* :class:`LessonView` -- the default.  Eight screens from prompt to first token, each
+  walking one real calculation a deliberate step at a time.
+* :class:`LearnView` -- five questions about the run.  Five stages, each answering a question a person
   actually asks, with the explanation above the numbers rather than beside them.
 * :class:`InternalsView` -- the optional technical journey.  Same capture, ordered
   purpose -> diagram -> equation -> dimensions -> tensor, so the array is the last rung
@@ -26,22 +28,28 @@ from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QPushButton, QVBoxLayout, QWidget,
 )
 
-from tensor_widgets import AttentionExplorer, TensorInspector
+from tensor_widgets import AttentionExplorer, TensorInspector, exact_scalar
 from tensorscope_common import (
-    COLORS, Card, Disclosure, EvidenceBadge, FlowDiagram, LAYER_STEPS, LayerStepSidebar,
-    MiniHeatmap, PhaseBadge, ShapeDiagram, TokenChipStrip, axes_for, badge_row,
+    COLORS, AnnotatedValueRow, BandedTokenStrip, Card, Disclosure, EvidenceBadge,
+    FlowDiagram, LAYER_STEPS, LayerStepSidebar, MiniHeatmap, PhaseBadge, PredictCheck,
+    ResponseTextView, ShapeDiagram, StepReveal, TokenChipStrip, axes_for, badge_row,
     chip_text, label, read_only_table, shape, token_labels, token_table,
 )
 from tensorscope_content import (
     EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
     EVIDENCE_UNATTESTED, INTERNALS_STAGE_INDEX, INTERNALS_STAGES, INTERNALS_STEPS,
-    LEARN_STAGE_INDEX, LEARN_STAGES, LOGITS_UNAVAILABLE, STOP_REASONS,
+    LEARN_STAGE_INDEX, LEARN_STAGES, LESSON_CHECKS, LESSON_DISPLAY_CALC,
+    LESSON_STAGE_INDEX, LESSON_STAGES, LESSON_STEPS, LOGITS_UNAVAILABLE,
+    CACHED_KV_NOTE, PROMPT_SPAN_UNKNOWN, STOP_REASONS, SYMBOLIC_WEIGHTS_NOTE,
     TELEMETRY_UNAVAILABLE, TENSOR_EXPLANATIONS, TENSOR_LABEL_BY_KEY,
-    WHAT_WE_CANNOT_CONCLUDE, WHAT_WE_KNOW, learn_facts,
+    WHAT_WE_CANNOT_CONCLUDE, WHAT_WE_KNOW, learn_facts, prompt_token_bands,
+    readable_spelling,
 )
 
 
 # The (key, sidebar label) lists the shell's navigator and pipeline bar are built from.
+# The shell numbers its own navigator, so the leading "1  " in `nav` is dropped here.
+LESSON_NAV = [(stage.key, stage.nav.split(None, 1)[-1]) for stage in LESSON_STAGES]
 LEARN_NAV = [(stage.key, stage.nav) for stage in LEARN_STAGES]
 INTERNALS_NAV = [(stage.key, stage.nav) for stage in INTERNALS_STAGES]
 
@@ -286,6 +294,549 @@ class JourneyView(QWidget):
     def _phase_changed(self, index: int) -> None:
         self.generated = bool(index)
         self.go_to(self._stage_key)
+
+
+# ── LessonView ────────────────────────────────────────────────────────────────
+
+class LessonView(JourneyView):
+    """The default journey: eight screens, one real calculation per screen.
+
+    Everything on a screen is read from the capture.  Where a value is arithmetic
+    TensorScope performed for the display (a product, a sum, a position of a maximum) it
+    is badged derived; where the architecture has a step this capture did not keep, the
+    step is drawn as symbols and badged conceptual.  Selections and reveal progress live
+    in dicts this view owns, so a screen that is rebuilt comes back as the reader left it.
+    """
+
+    NAV = LESSON_NAV
+    STAGE_INDEX = LESSON_STAGE_INDEX
+    HEADING = 'question'
+    NOUN = 'Screen'
+    HEAD = 0
+    PREVIEW = 8
+
+    def prepare(self) -> None:
+        last = max(0, len(self.capture.prompt_tokens) - 1)
+        self._reveals: dict = {}
+        self._checks: dict = {}
+        self._open: dict = {}
+        self._refresh = None
+        self.bands = prompt_token_bands(self.capture.prompt, self.capture.prompt_tokens)
+        self.token_pos = last              # the deciding position, unless the reader moves it
+        self.query_pos = last
+        self.key_pos = 0
+        self.mask_pos = max(0, last - 1)   # second to last: has a later position to mask
+        self.decision = 0
+
+    def builders(self) -> dict:
+        return {'received': self._received, 'vectors': self._vectors,
+                'transform': self._transform, 'compare': self._compare,
+                'weights': self._weights, 'combine': self._combine,
+                'select': self._select, 'continue': self._continue}
+
+    def context(self) -> str:
+        if self._stage_key in ('transform', 'compare', 'weights', 'combine'):
+            return f'Layer {self.layer_index}'
+        return 'Final layer' if self._stage_key == 'select' else ''
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+
+    def _spelling(self, index: int) -> str:
+        tokens = self.capture.prompt_tokens
+        return tokens[index] if 0 <= index < len(tokens) else f'position {index}'
+
+    def _layer_picker(self, card: Card) -> None:
+        picker = QComboBox()
+        picker.setAccessibleName('Layer')
+        for index in self.layer_indices:
+            picker.addItem(f'Layer {index}', index)
+        picker.setCurrentIndex(self.layer_indices.index(self.layer_index))
+        picker.currentIndexChanged.connect(self._layer_changed)
+        card.add(picker)
+
+    def _layer_changed(self, position: int) -> None:
+        self.layer_index = self.layer_indices[position]
+        if self._refresh is not None:
+            self._refresh()
+        self.context_changed.emit(self.context())
+
+    def _slot(self, card: Card) -> QVBoxLayout:
+        slot = QVBoxLayout()
+        slot.setContentsMargins(0, 0, 0, 0)
+        card.add_layout(slot)
+        return slot
+
+    def _panel(self) -> tuple[QWidget, QVBoxLayout]:
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(10)
+        return host, layout
+
+    def _check(self, layout, name: str, **fields) -> None:
+        check = LESSON_CHECKS[name]
+        values = {**self.facts, **fields}
+        layout.addWidget(PredictCheck(
+            check['question'].format(**values),
+            [option.format(**values) for option in check['options']],
+            check['answer'], check['explanation'].format(**values),
+            state=self._checks, state_key=name))
+
+    def _reveal(self, layout, screen: str, builds, steps=None) -> None:
+        source = steps if steps is not None else LESSON_STEPS[screen]
+        prepared = []
+        for step, build in zip(source, builds):
+            prepared.append({**step, 'caption': step['caption'].format(**self.facts),
+                             'body': step['body'].format(**self.facts), 'build': build})
+        layout.addWidget(StepReveal(prepared, state=self._reveals, state_key=screen))
+
+    def _values(self, values, *, kind=EVIDENCE_OBSERVED, note='', caption='', labels=None,
+                total=None, formatter=None) -> AnnotatedValueRow:
+        shown = list(values)[:self.PREVIEW]
+        return AnnotatedValueRow(
+            shown, labels=labels, indices=None if labels else range(len(shown)),
+            caption=caption, kind=kind, note=note,
+            total=total if total is not None else len(shown), formatter=formatter)
+
+    def _tensor_block(self, name: str, tensor) -> QWidget:
+        host, layout = self._panel()
+        title = TENSOR_LABEL_BY_KEY.get(name) or EXTRA_LABELS.get(name, name)
+        layout.addWidget(label(f'{title}   {shape(tensor)}   ·   stored {tensor.dtype}'))
+        layout.addWidget(Disclosure(f'Inspect captured {name}',
+                                    lambda n=name, t=tensor: self.inspector(n, t)))
+        return host
+
+    def _pair(self, *widgets) -> QWidget:
+        host, layout = self._panel()
+        for widget in widgets:
+            layout.addWidget(widget)
+        return host
+
+    # ── 1  Received ───────────────────────────────────────────────────────────
+
+    def _received(self) -> QWidget:
+        card = self.stage_card('received')
+        card.field('You typed', self.capture.prompt)
+        if self.facts['template_token_count'] > 0:
+            host, layout = self._panel()
+            self._check(layout, 'tokens')
+            card.add(host)
+        card.add(label('WHAT THE MODEL RECEIVED', muted=True))
+        if self.bands is None:
+            card.add(label(PROMPT_SPAN_UNKNOWN, muted=True))
+        strip = BandedTokenStrip(self.capture.prompt_tokens, self.bands,
+                                 selected=self.token_pos)
+        strip.selected.connect(self._pick_received)
+        card.add(strip)
+        card.add(label('Spellings are the tokenizer\'s own, so a chip that looks odd is '
+                       'usually a space or newline stored as part of a piece.', muted=True))
+        self._received_slot = self._slot(card)
+        self._show_received(self.token_pos)
+        card.add(Disclosure('Show the whole prompt as a table',
+                            lambda: token_table(self.capture),
+                            state=self._open, state_key='received-table'))
+        return card
+
+    def _pick_received(self, index: int) -> None:
+        self.token_pos = index
+        self._show_received(index)
+
+    def _show_received(self, index: int) -> None:
+        host, layout = self._panel()
+        token = self._spelling(index)
+        layout.addWidget(badge_row(EvidenceBadge(EVIDENCE_OBSERVED, 'stored token')))
+        layout.addWidget(label(
+            f'Position {index}  ·  vocabulary ID {self.capture.prompt_token_ids[index]}  ·  '
+            f'stored {token!r}  ·  reads as {readable_spelling(token)!r}'))
+        replace_in(self._received_slot, host)
+
+    # ── 2  Vectors ────────────────────────────────────────────────────────────
+
+    def _vectors(self) -> QWidget:
+        card = self.stage_card('vectors')
+        card.add(label('PICK A POSITION', muted=True))
+        strip = BandedTokenStrip(self.capture.prompt_tokens, None, selected=self.token_pos)
+        strip.selected.connect(self._pick_vector)
+        card.add(strip)
+        self._vector_slot = self._slot(card)
+        self._show_vector(self.token_pos)
+        return card
+
+    def _pick_vector(self, index: int) -> None:
+        self.token_pos = index
+        self._show_vector(index)
+
+    def _show_vector(self, index: int) -> None:
+        host, layout = self._panel()
+        row = embedding_row(self.capture.embedding, index)
+        token_id = self.capture.prompt_token_ids[index]
+        if row is None:
+            layout.addWidget(label(
+                'This run\'s stored embedding is not shaped [batch, token, feature], so a '
+                'single position cannot be sliced out of it.', muted=True))
+        else:
+            layout.addWidget(label(
+                f'ID {token_id} ({self._spelling(index)!r}) became {row.shape[-1]} numbers. '
+                f'The same ID always selects the same row; position is added later, by '
+                f'attention.'))
+            layout.addWidget(self._values(
+                row, note='embedding row', total=row.shape[-1],
+                caption=f'First {min(self.PREVIEW, row.shape[-1])} of {row.shape[-1]} features'))
+            layout.addWidget(Disclosure(
+                f'Inspect all {row.shape[-1]} stored values',
+                lambda r=row, i=index: TensorInspector(
+                    r, name=f'embedding · prompt position {i}', axes=['model feature'])))
+        replace_in(self._vector_slot, host)
+
+    # ── 3  Transformed ────────────────────────────────────────────────────────
+
+    def _transform(self) -> QWidget:
+        card = self.stage_card('transform')
+        self._layer_picker(card)
+        self._transform_slot = self._slot(card)
+        self._refresh = self._show_transform
+        self._show_transform()
+        return card
+
+    def _show_transform(self) -> None:
+        host, layout = self._panel()
+        tensors = self.tensors()
+        pos = self.token_pos
+        layout.addWidget(label(
+            f'Working on position {pos} ({self._spelling(pos)!r}) in layer '
+            f'{self.layer_index}. Change the position on the previous screen.', muted=True))
+        normalized = embedding_row(tensors['normalized_input'], pos)
+        width = self.facts['hidden_size']
+        if normalized is None:
+            layout.addWidget(label('This run\'s stored normalized input is not shaped '
+                                   '[batch, token, feature], so one position cannot be '
+                                   'sliced out of it.', muted=True))
+            replace_in(self._transform_slot, host)
+            return
+
+        def normalised():
+            return self._values(normalized, note='normalized_input', total=len(normalized))
+
+        def pairing():
+            symbols = [f'w{index}' for index in range(self.PREVIEW)]
+            return self._pair(
+                self._values(normalized, caption='Row: captured values', total=len(normalized),
+                             labels=[f'x{i}' for i in range(self.PREVIEW)]),
+                self._values(symbols, kind=EVIDENCE_CONCEPTUAL, note='learned, not captured',
+                             caption='Column: symbols', formatter=str,
+                             labels=[f'column entry {i}' for i in range(self.PREVIEW)]),
+                label(SYMBOLIC_WEIGHTS_NOTE, muted=True, small=True))
+
+        def summing():
+            equation = label(f'output feature = x0·w0 + x1·w1 + … + x{max(width - 1, 0)}·'
+                             f'w{max(width - 1, 0)}', rich=True)
+            equation.setObjectName('journeyEquation')
+            return equation
+
+        def purposes():
+            return FlowDiagram([('normalized vector', 'norm'), ('× W_Q  →  query', 'q'),
+                                ('× W_K  →  key', 'k'), ('× W_V  →  value', 'v')],
+                               caption='Three learned projections read the same vector.')
+
+        def produced():
+            blocks = []
+            for name in ('q', 'k', 'v'):
+                row = embedding_row(tensors[name], pos)
+                blocks.append(self._tensor_block(name, tensors[name]))
+                if row is not None:
+                    blocks.append(self._values(row, note=name, total=len(row)))
+            return self._pair(*blocks)
+
+        self._reveal(layout, 'transform', [normalised, pairing, summing, purposes, produced])
+        replace_in(self._transform_slot, host)
+
+    # ── 4  Compared ───────────────────────────────────────────────────────────
+
+    def _compare(self) -> QWidget:
+        card = self.stage_card('compare')
+        self._layer_picker(card)
+        card.add(label(
+            f'Query: the final prompt position, {self.query_pos} '
+            f'({self._spelling(self.query_pos)!r}). Pick the key it is compared with.',
+            muted=True))
+        strip = BandedTokenStrip(self.capture.prompt_tokens, None, selected=self.key_pos)
+        strip.selected.connect(self._pick_key)
+        card.add(strip)
+        self._compare_slot = self._slot(card)
+        self._refresh = self._show_compare
+        self._show_compare()
+        return card
+
+    def _pick_key(self, index: int) -> None:
+        self.key_pos = index
+        self._show_compare()
+
+    def _show_compare(self) -> None:
+        host, layout = self._panel()
+        tensors = self.tensors()
+        queries = head_slice(tensors['q_attended'], self.HEAD)
+        keys = head_slice(tensors['k_attended'], self.HEAD)
+        scores = head_slice(tensors['attention_scores'], self.HEAD)
+        qp = min(self.query_pos, queries.shape[0] - 1)
+        kp = min(self.key_pos, keys.shape[0] - 1)
+        query, key = queries[qp], keys[kp]
+        product = np.asarray(query, dtype=np.float64) * np.asarray(key, dtype=np.float64)
+        total = float(product.sum())
+        scale = len(query) ** -0.5
+        captured = scores[qp, kp]
+        self._check(layout, 'dot')
+
+        def operands():
+            return self._pair(
+                self._values(query, note='q_attended', total=len(query),
+                             caption=f'Query, position {qp}, head {self.HEAD}'),
+                self._values(key, note='k_attended', total=len(key),
+                             caption=f'Key, position {kp}, head {self.HEAD}'))
+
+        def multiplied():
+            return self._pair(
+                self._values(product, kind=EVIDENCE_DERIVED, note='calculated here',
+                             total=len(product), caption='Query × key, entry by entry'),
+                label(LESSON_DISPLAY_CALC, muted=True, small=True))
+
+        def summed():
+            return self._pair(
+                self._values([total], kind=EVIDENCE_DERIVED, note='calculated here',
+                             labels=[f'sum of {len(product)} products']),
+                label(LESSON_DISPLAY_CALC, muted=True, small=True))
+
+        def scaled():
+            return self._pair(
+                self._values([total * scale], kind=EVIDENCE_DERIVED, note='calculated here',
+                             labels=['scaled sum']),
+                self._values([captured], note='attention_scores', labels=['captured score']),
+                label(f'Difference: {exact_scalar(abs(total * scale - float(captured)))}',
+                      muted=True, small=True))
+
+        self._reveal(layout, 'compare', [operands, multiplied, summed, scaled])
+        replace_in(self._compare_slot, host)
+
+    # ── 5  Weights ────────────────────────────────────────────────────────────
+
+    def _weights(self) -> QWidget:
+        card = self.stage_card('weights')
+        self._layer_picker(card)
+        card.add(label('Pick the query position whose row to follow. Earlier positions have '
+                       'more of the row masked.', muted=True))
+        strip = BandedTokenStrip(self.capture.prompt_tokens, None, selected=self.mask_pos)
+        strip.selected.connect(self._pick_mask)
+        card.add(strip)
+        self._weights_slot = self._slot(card)
+        self._refresh = self._show_weights
+        self._show_weights()
+        return card
+
+    def _pick_mask(self, index: int) -> None:
+        self.mask_pos = index
+        self._show_weights()
+
+    def _show_weights(self) -> None:
+        host, layout = self._panel()
+        tensors = self.tensors()
+        scores = head_slice(tensors['attention_scores'], self.HEAD)
+        weights = head_slice(tensors['attention_weights'], self.HEAD)
+        qp = min(self.mask_pos, scores.shape[0] - 1)
+        score_row, weight_row = scores[qp], weights[qp]
+        masked = list(range(qp + 1, len(score_row)))
+        layout.addWidget(badge_row(EvidenceBadge(EVIDENCE_OBSERVED, 'attention_weights')))
+        layout.addWidget(MiniHeatmap(
+            weights, f'Layer {self.layer_index}, head {self.HEAD} — captured weights',
+            self.mpl_style()))
+        if masked:
+            self._check(layout, 'mask')
+
+        def raw_scores():
+            return self._values(score_row, note='attention_scores', total=len(score_row),
+                                caption=f'Row for position {qp}: first scores')
+
+        def masking():
+            if not masked:
+                return label('Nothing comes after this position, so nothing in its row is '
+                             'masked. Pick an earlier position to see the mask.', muted=True)
+            return self._values(score_row[masked], note='masked columns', total=len(masked),
+                                labels=[f'key {j}' for j in masked[:self.PREVIEW]],
+                                caption='Scores at positions after this one')
+
+        def softmaxed():
+            blocks = [self._values(weight_row, note='attention_weights', total=len(weight_row),
+                                   caption='First weights of the row')]
+            if masked:
+                blocks.append(self._values(
+                    weight_row[masked], note='masked columns', total=len(masked),
+                    labels=[f'key {j}' for j in masked[:self.PREVIEW]],
+                    caption='Weights at the masked positions'))
+            return self._pair(*blocks)
+
+        def adding_up():
+            return self._pair(
+                self._values([float(np.asarray(weight_row, dtype=np.float64).sum())],
+                             kind=EVIDENCE_DERIVED, note='calculated here',
+                             labels=['sum of the row']),
+                label(LESSON_DISPLAY_CALC, muted=True, small=True))
+
+        self._reveal(layout, 'weights', [raw_scores, masking, softmaxed, adding_up])
+        replace_in(self._weights_slot, host)
+
+    # ── 6  Combined ───────────────────────────────────────────────────────────
+
+    def _combine(self) -> QWidget:
+        card = self.stage_card('combine')
+        self._layer_picker(card)
+        self._combine_slot = self._slot(card)
+        self._refresh = self._show_combine
+        self._show_combine()
+        return card
+
+    def _show_combine(self) -> None:
+        host, layout = self._panel()
+        tensors = self.tensors()
+        pos = self.token_pos
+        layout.addWidget(badge_row(EvidenceBadge(EVIDENCE_CONCEPTUAL, 'steps not kept')))
+        layout.addWidget(FlowDiagram(
+            [('weights', 'weights'), ('× values', 'v'), ('blend (not kept)', 'layer'),
+             ('join heads', 'layer'), ('W_o', 'layer'), ('attention output', 'output'),
+             ('+ residual (not kept)', 'layer'), ('MLP (interior not kept)', 'layer'),
+             ('layer output', 'output')],
+            caption='Steps marked "not kept" are described, not reconstructed.'))
+        layout.addWidget(label(f'What was captured, for position {pos} '
+                               f'({self._spelling(pos)!r}):', muted=True))
+        for name in ('attention_output', 'layer_output'):
+            row = embedding_row(tensors[name], pos)
+            layout.addWidget(self._tensor_block(name, tensors[name]))
+            if row is not None:
+                layout.addWidget(self._values(row, note=name, total=len(row)))
+        replace_in(self._combine_slot, host)
+
+    # ── 7  Selected ───────────────────────────────────────────────────────────
+
+    def _select(self) -> QWidget:
+        card = self.stage_card('select')
+        host, layout = self._panel()
+        logits = self.capture.logits
+        final = self.capture.layers[max(self.layer_indices)].tensors
+        pos = len(self.capture.prompt_tokens) - 1
+        flat = np.asarray(logits).reshape(-1) if logits is not None else None
+        order = np.argsort(-flat)[:5] if flat is not None else []
+
+        if flat is not None and len(order) >= 2:
+            winner, runner = float(flat[order[0]]), float(flat[order[1]])
+            if runner > 0:
+                self._check(layout, 'logits', winner=f'{winner:.4g}',
+                            runner_up=f'{runner:.4g}', ratio=f'{winner / runner:.2f}')
+
+        def finished():
+            row = embedding_row(final['layer_output'], pos)
+            return (self._values(row, note='final layer output', total=len(row))
+                    if row is not None else label('Not shaped [batch, token, feature].'))
+
+        def normalization():
+            return FlowDiagram([('final vector', 'output'), ('RMSNorm (not kept)', 'norm')])
+
+        def projection():
+            return FlowDiagram([('normalized vector', 'norm'),
+                                ('× vocabulary matrix (not kept)', 'layer'),
+                                ('one score per entry', 'scores')],
+                               caption=SYMBOLIC_WEIGHTS_NOTE)
+
+        def vector():
+            return self._pair(
+                self._tensor_block('final_logits', logits),
+                label(f'{len(flat):,} scores, one per vocabulary entry.', muted=True))
+
+        def candidates():
+            trace = self.capture.generation_trace
+            if trace:
+                rows = [(rank + 1, entry['id'], repr(str(entry.get('token', ''))),
+                         f'{float(entry["logit"]):.6f}')
+                        for rank, entry in enumerate(trace[0].top_candidates[:5])]
+            else:
+                rows = [(rank + 1, int(index), '', exact_scalar(flat[index]))
+                        for rank, index in enumerate(order[:5])]
+            return read_only_table(['Rank', 'Token ID', 'Token', 'Captured score'], rows,
+                                   stretch=2, highlight=0)
+
+        def selection():
+            best = int(np.argmax(flat))
+            return self._pair(
+                self._values([best], kind=EVIDENCE_DERIVED, formatter=str,
+                             note='position of the maximum', labels=['token ID']),
+                self._values([flat[best]], note='final_logits', labels=['its score']),
+                label(f'That ID is the token this run produced: '
+                      f'{self.capture.tokens[0]!r}.'))
+
+        builds = [finished, normalization, projection, vector, candidates, selection]
+        steps = list(LESSON_STEPS['select'])
+        if flat is None:
+            builds = builds[:3] + [lambda: label(LOGITS_UNAVAILABLE)]
+            steps = steps[:3] + [{'caption': 'The score vector was not retained',
+                                  'body': LOGITS_UNAVAILABLE, 'tier': EVIDENCE_CONCEPTUAL}]
+        self._reveal(layout, 'select', builds, steps)
+        card.add(host)
+        return card
+
+    # ── 8  Continues ──────────────────────────────────────────────────────────
+
+    def _continue(self) -> QWidget:
+        card = self.stage_card('continue')
+        card.add(label('THE ANSWER — SELECT A TOKEN', muted=True))
+        view = ResponseTextView(self.capture.tokens, self.capture.response,
+                                selected=self.decision)
+        view.selected.connect(self._pick_decision)
+        card.add(view)
+        self._continue_slot = self._slot(card)
+        self._show_continue(view.current())
+        card.section_rule()
+        card.add(label(CACHED_KV_NOTE, muted=True))
+        card.add(Disclosure(
+            'Show the first generated pass\'s attention (head 0)',
+            lambda: self._generated_attention()))
+        return card
+
+    def _generated_attention(self) -> QWidget:
+        weights = self.capture.generated_layers[self.layer_index].tensors['attention_weights']
+        host, layout = self._panel()
+        layout.addWidget(badge_row(EvidenceBadge(EVIDENCE_OBSERVED, 'attention_weights')))
+        layout.addWidget(MiniHeatmap(
+            head_slice(weights, self.HEAD),
+            f'Layer {self.layer_index}, head {self.HEAD} — the new token against every '
+            f'earlier position', self.mpl_style()))
+        return host
+
+    def _pick_decision(self, index: int) -> None:
+        self.decision = index
+        self._show_continue(index)
+
+    def _show_continue(self, step: int) -> None:
+        capture = self.capture
+        host, layout = self._panel()
+        if 0 <= step < len(capture.tokens):
+            layout.addWidget(label(f'Step {step}  ·  selected {capture.tokens[step]!r}  ·  '
+                                   f'vocabulary ID {capture.token_ids[step]}'))
+            trace = capture.generation_trace
+            if step >= len(trace):
+                layout.addWidget(badge_row(EvidenceBadge(EVIDENCE_CONCEPTUAL, 'not recorded')))
+                layout.addWidget(label(TELEMETRY_UNAVAILABLE))
+            else:
+                decision = trace[step]
+                tier = EVIDENCE_OBSERVED if (step == 0 or decision.attested) \
+                    else EVIDENCE_UNATTESTED
+                layout.addWidget(badge_row(
+                    EvidenceBadge(tier, 'scores from the forward pass'),
+                    EvidenceBadge(EVIDENCE_DERIVED, 'ranking')))
+                winner = next((i for i, entry in enumerate(decision.top_candidates)
+                               if int(entry['id']) == decision.selected_token_id), None)
+                layout.addWidget(read_only_table(
+                    ['Rank', 'Token ID', 'Token', 'Captured score'],
+                    [(rank + 1, entry['id'], repr(str(entry.get('token', ''))),
+                      f'{float(entry["logit"]):.6f}')
+                     for rank, entry in enumerate(decision.top_candidates)],
+                    stretch=2, highlight=winner))
+        replace_in(self._continue_slot, host)
 
 
 # ── LearnView ─────────────────────────────────────────────────────────────────
