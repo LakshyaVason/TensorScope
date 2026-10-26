@@ -30,6 +30,7 @@ import html
 import io
 import json
 import math
+import re
 import os
 import sqlite3
 import sys
@@ -41,6 +42,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
 
+import tensorscope_content
 from tensorscope_content import GenerationDecision
 
 # Keep matplotlib's cache beside the application when a user profile is locked down.
@@ -1288,14 +1290,22 @@ class GenerationWorker(QThread):
 # Re-export copy/helpers for the existing verification entry points.
 from tensorscope_content import (
     TENSOR_LABELS, TENSOR_LABEL_BY_KEY, TENSOR_EXPLANATIONS,
-    InternalsStage, INTERNALS_STAGES, INTERNALS_STAGE_INDEX, INTERNALS_STEPS,
-    LearnStage, LEARN_STAGES, LEARN_STAGE_INDEX, learn_facts, LOGITS_UNAVAILABLE,
-    LessonStage, LESSON_STAGES, LESSON_STAGE_INDEX, LESSON_STEPS,
-    LESSON_CHECKS, LESSON_CHECK_ORDER, LESSON_TIMING_CAVEAT, LESSON_DISPLAY_CALC,
-    PROMPT_SPAN_UNKNOWN, SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE,
-    EVIDENCE_KINDS, TYPED_BAND, prompt_token_bands, readable_spelling,
+    EXTRA_TENSOR_EXPLANATIONS, EXTRA_TENSOR_LABELS,
+    CONCEPTUAL_VARIABLES, CONCEPTUAL_VARIABLE_ORDER, TENSOR_SYMBOLS, VARIABLE_ROLES,
+    PROVENANCE_ABSENT, PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED,
+    PROVENANCE_TIERS,
+    ILLUSTRATIONS, REFERENCE_TOPICS, REFERENCE_TOPIC_INDEX,
+    CONTINUATION, NOTEBOOK_OPERATIONS, OPERATION_INDEX, OPERATION_ORDER,
+    NOTEBOOK_CHECKS, NOTEBOOK_CHECK_ORDER,
+    BATCH_AXIS_NOTE, CACHED_KV_NOTE, DISPLAY_CALC_NOTE, EOS_IS_A_SCORED_ENTRY,
+    ILLUSTRATION_DISCLAIMER, INTERMEDIATE_NOT_KEPT, LEARNED_VALUES_NOT_SAVED,
+    LOGITS_UNAVAILABLE, PROMPT_SPAN_UNKNOWN, ROW_VECTOR_NOTE, SHAPE_IS_NOT_CONTENTS,
+    STRUCTURE_NOT_TIMING_NOTE, SYMBOLIC_WEIGHTS_NOTE, TELEMETRY_UNAVAILABLE,
+    EVIDENCE_KINDS, STOP_REASONS, TYPED_BAND, learn_facts, prompt_token_bands,
+    readable_spelling,
 )
-from tensorscope_views import InternalsView, LearnView, LessonView, RawView
+from tensorscope_common import shape_line
+from tensorscope_views import NotebookView, RawTensorDialog, RawView, ReferenceView
 from tensorscope_ui import ComputationRecap as _ComputationRecap
 
 
@@ -1869,53 +1879,101 @@ def self_test() -> None:
     # tensor that no longer exists cannot linger.
     assert set(TENSOR_EXPLANATIONS) == labelled, set(TENSOR_EXPLANATIONS) ^ labelled
     assert all(text.strip() for text in TENSOR_EXPLANATIONS.values())
-    assert len(LEARN_STAGE_INDEX) == len(LEARN_STAGES), "duplicate learn stage key"
-    assert len(INTERNALS_STAGE_INDEX) == len(INTERNALS_STAGES), "duplicate internals stage key"
 
-    # Both journeys interpolate real run quantities into their copy; a stage naming a field
+    # The same parity for the two captured arrays that sit outside the per-layer set, and
+    # for the symbol and role tables, so a tensor cannot reach a variable chip unnamed or
+    # a panel unexplained.
+    assert set(EXTRA_TENSOR_LABELS) == set(EXTRA_TENSOR_EXPLANATIONS), \
+        set(EXTRA_TENSOR_LABELS) ^ set(EXTRA_TENSOR_EXPLANATIONS)
+    assert all(text.strip() for text in EXTRA_TENSOR_EXPLANATIONS.values())
+    assert set(TENSOR_SYMBOLS) == set(VARIABLE_ROLES), \
+        set(TENSOR_SYMBOLS) ^ set(VARIABLE_ROLES)
+    assert REQUIRED_LAYER_TENSORS <= set(TENSOR_SYMBOLS), \
+        REQUIRED_LAYER_TENSORS - set(TENSOR_SYMBOLS)
+    assert all(symbol.strip() for symbol in TENSOR_SYMBOLS.values())
+    assert all(role.strip() for role in VARIABLE_ROLES.values())
+
+    # Conceptual variables are described, never shown as data, so the one thing that must
+    # hold is that every one of them has a description and a provenance the badge knows.
+    assert set(CONCEPTUAL_VARIABLE_ORDER) == set(CONCEPTUAL_VARIABLES), \
+        "CONCEPTUAL_VARIABLES and its order disagree"
+    for key in CONCEPTUAL_VARIABLE_ORDER:
+        spec = CONCEPTUAL_VARIABLES[key]
+        assert spec.symbol.strip() and spec.title.strip() and spec.role.strip(), key
+        assert spec.provenance in (PROVENANCE_LEARNED, PROVENANCE_ABSENT), (key, spec.provenance)
+        assert PROVENANCE_TIERS[spec.provenance] in EVIDENCE_KINDS, key
+    assert set(PROVENANCE_TIERS) == {PROVENANCE_CAPTURED, PROVENANCE_LEARNED,
+                                     PROVENANCE_ABSENT, PROVENANCE_DISPLAY}
+
+    # Both pages interpolate real run quantities into their copy; a line naming a field
     # learn_facts() does not supply would otherwise raise KeyError in front of a reader.
     facts = learn_facts(capture)
-    for stage in LEARN_STAGES:
-        stage.question.format(**facts)
-        stage.plain.format(**facts)
-    for stage in INTERNALS_STAGES:
-        stage.heading.format(**facts)
-        stage.plain.format(**facts)
 
-    # Every layer step needs all three rungs of its disclosure ladder, or the technical
-    # journey would show an equation with no purpose above it.
-    for key, copy in INTERNALS_STEPS.items():
-        assert {"purpose", "concept", "equation"} <= set(copy), key
-        assert all(str(copy[field]).strip() for field in ("purpose", "concept", "equation")), key
+    # ── Page 1: the illustrated reference ────────────────────────────────────
+    assert len(REFERENCE_TOPICS) == 12, len(REFERENCE_TOPICS)
+    assert len(REFERENCE_TOPIC_INDEX) == len(REFERENCE_TOPICS), "duplicate topic key"
+    for topic in REFERENCE_TOPICS:
+        assert topic.nav.strip() and topic.heading.strip() and topic.purpose.strip(), topic.key
+        for field in ("heading", "purpose", "formula", "caption", "deeper"):
+            getattr(topic, field).format(**facts)
+        for symbol in topic.symbols:
+            assert symbol in TENSOR_SYMBOLS or symbol in CONCEPTUAL_VARIABLES, \
+                (topic.key, symbol)
+        for operation in topic.operations:
+            assert operation in OPERATION_INDEX, (topic.key, operation)
+        assert not topic.illustration or topic.illustration in ILLUSTRATIONS, topic.key
 
-    # The lesson player's copy is checked the same way: every screen formats against this run,
-    # every revealed step names a real screen and a real evidence tier, and every optional
-    # check formats with the extra placeholders it declares.
-    assert len(LESSON_STAGES) == 8, len(LESSON_STAGES)
-    assert len(LESSON_STAGE_INDEX) == len(LESSON_STAGES), "duplicate lesson stage key"
-    for stage in LESSON_STAGES:
-        stage.question.format(**facts)
-        stage.plain.format(**facts)
-        assert stage.nav.strip(), stage.key
+    # The reference must follow the same order as the worked computation, which is a
+    # mechanical property rather than an editorial promise: every operation is explained
+    # by some topic, and the topics' first operations never run backwards.
+    explained = set()
+    for topic in REFERENCE_TOPICS:
+        explained.update(topic.operations)
+    assert explained == set(OPERATION_ORDER), set(OPERATION_ORDER) ^ explained
+    first_seen = [min(OPERATION_ORDER.index(key) for key in topic.operations)
+                  for topic in REFERENCE_TOPICS if topic.operations]
+    assert first_seen == sorted(first_seen), first_seen
 
-    for screen, steps in LESSON_STEPS.items():
-        assert screen in LESSON_STAGE_INDEX, screen
-        assert steps, screen
-        for step in steps:
-            assert str(step["caption"]).strip() and str(step["body"]).strip(), (screen, step)
-            # Both, not just the body: a caption carrying an unformatted placeholder put
-            # the literal "{head_dim}" on screen, and no check noticed.
-            step["caption"].format(**facts)
-            step["body"].format(**facts)
-            str(step.get("note") or "").format(**facts)
-            tier = step.get("tier")
-            assert tier is None or tier in EVIDENCE_KINDS, (screen, tier)
+    # Invented content is fenced off by type, so that the box it renders in and the
+    # disclaimer under it cannot be forgotten for one of them.
+    for key, illustration in ILLUSTRATIONS.items():
+        assert illustration.heading.strip() and illustration.body.strip(), key
+        assert illustration.disclaimer.strip(), key
+    # The analogy for what a head might match on is useful and made up.  It may appear
+    # only inside an Illustration, never in a sentence that reads as a statement of fact.
+    fenced = " ".join(item.body for item in ILLUSTRATIONS.values())
+    for module_value in vars(tensorscope_content).values():
+        if isinstance(module_value, str) and module_value not in fenced:
+            assert not re.search(r"\b(noun|adjective)\b", module_value, re.I), module_value[:80]
 
-    assert set(LESSON_CHECK_ORDER) == set(LESSON_CHECKS), "LESSON_CHECKS and its order disagree"
-    assert len(LESSON_CHECK_ORDER) == 4, len(LESSON_CHECK_ORDER)
-    for name in LESSON_CHECK_ORDER:
-        check = LESSON_CHECKS[name]
-        assert check["screen"] in LESSON_STAGE_INDEX, name
+    # ── Page 2: the worked notebook ──────────────────────────────────────────
+    # Twelve operations, thirteen sections: the continuation is part of the page but not
+    # one of the operations, and stating both numbers is what stops either drifting.
+    assert len(NOTEBOOK_OPERATIONS) == 12, len(NOTEBOOK_OPERATIONS)
+    assert len(OPERATION_INDEX) == 12, "duplicate operation key"
+    assert OPERATION_ORDER == [operation.key for operation in NOTEBOOK_OPERATIONS]
+    assert [operation.number for operation in NOTEBOOK_OPERATIONS] == list(range(1, 13))
+    assert CONTINUATION.key not in OPERATION_INDEX
+    for operation in NOTEBOOK_OPERATIONS + [CONTINUATION]:
+        assert operation.nav.strip() and operation.heading.strip(), operation.key
+        filled = {**facts, **{field: 0 for field in operation.fields}}
+        for field in ("heading", "lede", "formula"):
+            getattr(operation, field).format(**filled)
+        for key in operation.variables:
+            assert key in TENSOR_SYMBOLS or key in CONCEPTUAL_VARIABLES, \
+                (operation.key, key)
+        assert operation.tiers, operation.key
+        for tier in operation.tiers:
+            assert tier in EVIDENCE_KINDS, (operation.key, tier)
+        assert not operation.topic or operation.topic in REFERENCE_TOPIC_INDEX, operation.key
+        assert not operation.check or operation.check in NOTEBOOK_CHECKS, operation.key
+
+    assert set(NOTEBOOK_CHECK_ORDER) == set(NOTEBOOK_CHECKS), \
+        "NOTEBOOK_CHECKS and its order disagree"
+    assert len(NOTEBOOK_CHECK_ORDER) == 5, len(NOTEBOOK_CHECK_ORDER)
+    for name in NOTEBOOK_CHECK_ORDER:
+        check = NOTEBOOK_CHECKS[name]
+        assert check["operation"] in OPERATION_INDEX, name
         assert len(check["options"]) >= 2 and all(str(text).strip() for text in check["options"]), name
         assert 0 <= check["answer"] < len(check["options"]), name
         filled = {**facts, **{field: 0 for field in check["fields"]}}
@@ -1924,9 +1982,21 @@ def self_test() -> None:
         for option in check["options"]:           # options reach a button unformatted too
             option.format(**filled)
 
-    for note in (LESSON_TIMING_CAVEAT, LESSON_DISPLAY_CALC, PROMPT_SPAN_UNKNOWN,
-                 SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE):
+    for note in (STRUCTURE_NOT_TIMING_NOTE, DISPLAY_CALC_NOTE, PROMPT_SPAN_UNKNOWN,
+                 SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE, BATCH_AXIS_NOTE,
+                 ROW_VECTOR_NOTE, SHAPE_IS_NOT_CONTENTS, LEARNED_VALUES_NOT_SAVED,
+                 INTERMEDIATE_NOT_KEPT, EOS_IS_A_SCORED_ENTRY, ILLUSTRATION_DISCLAIMER,
+                 TELEMETRY_UNAVAILABLE, LOGITS_UNAVAILABLE):
         assert note.strip()
+
+    # A shape written short must always say that it was, and must never pretend a real
+    # batch axis away.
+    short, caption = shape_line(np.zeros((1, 4, 8)), omit_batch=True)
+    assert short == "[4 × 8]" and "1 × 4 × 8" in caption, (short, caption)
+    full, no_caption = shape_line(np.zeros((1, 4, 8)))
+    assert full == "[1 × 4 × 8]" and not no_caption
+    batched, batched_caption = shape_line(np.zeros((3, 4, 8)), omit_batch=True)
+    assert batched == "[3 × 4 × 8]" and not batched_caption, batched
 
     # Byte-level BPE spellings stand for text a reader typed; specials stand for themselves.
     assert readable_spelling("Ġcolor") == " color"
@@ -1950,13 +2020,41 @@ def self_test() -> None:
         measured = learn_facts(subject)
         for field in ("query_head_count", "kv_head_count", "head_dim", "key_position_count",
                       "typed_token_count", "template_token_count", "phase_count",
-                      "layer_step_count", "candidate_count"):
+                      "candidate_count", "kv_group_size", "q_projection_width",
+                      "kv_projection_width", "position_count", "batch_size",
+                      "cached_key_count", "remaining_layer_count", "continuation_count",
+                      "candidate_top_k", "hidden_size", "layer_count",
+                      "prompt_token_count", "generated_count", "vocab_size_raw"):
             assert isinstance(measured[field], int), (field, measured[field])
-        assert str(measured["attention_scale_text"]).strip()
-        assert str(measured["vocab_size_phrase"]).strip()
-        assert isinstance(measured["prompt_span_known"], bool)
-        assert str(measured["typed_token_summary"]).strip()
+        for field in ("attention_scale_text", "vocab_size_phrase", "typed_token_summary",
+                      "hidden_size_text", "head_dim_text", "query_head_count_text",
+                      "kv_head_count_text", "q_projection_width_text",
+                      "kv_projection_width_text", "position_count_text",
+                      "continuation_summary", "decoding_rule", "candidate_source_phrase",
+                      "stop_reason_text", "stop_token_id_text", "stop_token_spelling",
+                      "stop_token_logit_text", "ffn_description", "ffn_interior_note",
+                      "model", "vocab_size"):
+            assert str(measured[field]).strip(), field
+        for field in ("prompt_span_known", "vocab_size_known", "stop_token_known"):
+            assert isinstance(measured[field], bool), field
     assert learn_facts(capture)["prompt_span_known"] is True
+
+    # The legacy fixture records no stop reason at all, so the three stop fields have to
+    # read as unknown rather than as a confident claim about why generation ended.
+    stale = learn_facts(legacy)
+    assert stale["stop_token_known"] is False
+    assert stale["stop_token_id_text"] == "not recorded", stale["stop_token_id_text"]
+    assert stale["stop_reason_text"] == STOP_REASONS["unknown"]
+
+    # An answer of n tokens continues for n - 1 more.  The single-token case is the one
+    # that reads wrong if the count is interpolated bare, so it has its own sentence.
+    assert learn_facts(capture)["continuation_count"] == len(capture.token_ids) - 1
+    assert "nothing after it" in learn_facts(capture)["continuation_summary"],         learn_facts(capture)["continuation_summary"]
+
+    # The feed-forward interior width is genuinely absent from a capture, so nothing may
+    # put a number in its place.
+    assert not any(character.isdigit()
+                   for character in learn_facts(capture)["ffn_interior_note"])
 
     # The alignment fails for any prompt whose characters BYTE_BPE_REPLACEMENTS does not map,
     # so the unknown branch is reached routinely and must not be described with the bare

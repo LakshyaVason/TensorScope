@@ -19,25 +19,38 @@ from __future__ import annotations
 import json
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSplitter,
+    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QShortcut, QSplitter,
     QVBoxLayout, QWidget,
 )
 
 from tensorscope_common import (
     Card, Disclosure, PipelineNavigator, StageProgress, StageStack, label,
 )
-from tensorscope_views import InternalsView, LearnView, LessonView, RawView
+from tensorscope_views import NotebookView, RawTensorDialog, ReferenceView
 
 
-# (key, sidebar/mode label, one-line purpose, view class).  Order is the order a reader
-# should meet them: meaning first, architecture second, unframed arrays last.
+# (key, sidebar/mode label, one-line purpose, view class).  Two pages, in the order the
+# reader is meant to think of them: the reference is page one and the worked run is page
+# two, and they use the same order and the same notation as each other.
+#
+# Every captured array is still reachable, through the notebook ribbon's
+# "All captured arrays..." button, which opens `RawTensorDialog`.  It is deliberately not
+# a third row here: a mode in this list competes with the pages for the reader's
+# attention, and the whole point of the redesign was to stop offering four readings of one
+# run instead of one that accumulates.
 MODES = [
-    ('lesson', 'Lesson', 'Eight screens from prompt to first token', LessonView),
-    ('learn', 'Understand', 'What this model did with this prompt', LearnView),
-    ('internals', 'Internals', 'The architecture, one step at a time', InternalsView),
-    ('raw', 'Raw tensors', 'Every captured array, unframed', RawView),
+    ('understand', 'Understand the calculation',
+     'Purpose, formula and a picture for each operation', ReferenceView),
+    ('run', 'Follow this run',
+     'One worked calculation, prompt to selected token', NotebookView),
 ]
+
+# Which page opens first.  Not MODES[0]: the reference is page one by numbering, but a
+# reader arriving at a finished capture wants the run, and comes back here when a step
+# stops making sense.
+DEFAULT_MODE = 'run'
 
 MODE_INDEX = {key: (name, purpose, view) for key, name, purpose, view in MODES}
 
@@ -58,6 +71,10 @@ class ComputationRecap(QDialog):
         self.capture = capture
         self._tokens = tokens
         self._views: dict[str, QWidget] = {}
+        self._hosts: dict[str, QWidget] = {}
+        # Modeless, so a reader can hold an array beside the operation that produced it.
+        # Held on the shell because it has to outlive the page that asked for it.
+        self._raw_dialog = None
         self._mode = None
         self._context = ''
         self.setWindowTitle('TensorScope — Computation Recap')
@@ -300,6 +317,115 @@ class ComputationRecap(QDialog):
 
             /* Mode purpose line under each mode button */
             #modePurpose {{ color: {colors['text_muted']}; font-size: 10px; padding-left: 10px; }}
+
+            /* ── The two scrolling pages ──────────────────────────────────── */
+
+            /* One anchored section of a long page.  The reader's current section is
+               marked with a dynamic property rather than an inline stylesheet, so both
+               palettes are handled here and the widget code stays colour-free. */
+            QFrame#notebookSection {{
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']};
+                border-left: 3px solid transparent;
+                border-radius: 10px;
+            }}
+            QFrame#notebookSection[current="true"] {{
+                border-left: 3px solid {colors['accent']};
+            }}
+            QFrame#notebookSection[flash="true"] {{
+                border-left: 3px solid {colors['accent']};
+                background: {colors['nav_active_bg']};
+            }}
+            QFrame#notebookSection:focus {{
+                border-color: {colors['accent']};
+            }}
+            #sectionHeader {{ font-size: 17px; font-weight: 700; }}
+
+            /* Invented content.  A dashed border and a different surface, so a made-up
+               example can never be skim-read as a captured result. */
+            QFrame#illustrationBox {{
+                background: {colors['bg']};
+                border: 1px dashed {colors['accent']};
+                border-radius: 10px;
+            }}
+
+            /* A clickable variable.  The provenance is in the text; the colour only
+               agrees with the diagrams. */
+            QPushButton#variableChip {{
+                text-align: left;
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+                padding: 5px 10px;
+                background: transparent;
+                color: {colors['text_primary']};
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 12px;
+            }}
+            QPushButton#variableChip:hover {{
+                border-color: {colors['accent']};
+                background: {colors['nav_active_bg']};
+            }}
+            QPushButton#variableChip:focus {{ border-color: {colors['accent']}; }}
+
+            QWidget#equationRow {{
+                background: {colors['bg']};
+                border-left: 3px solid {colors['accent']};
+                border-radius: 4px;
+            }}
+            QPushButton#equationTerm {{
+                text-align: center;
+                border: 1px solid transparent;
+                border-bottom: 1px dotted {colors['text_muted']};
+                border-radius: 3px;
+                padding: 2px 6px;
+                background: transparent;
+                color: {colors['text_primary']};
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            QPushButton#equationTerm:hover {{
+                border-color: {colors['accent']};
+                background: {colors['nav_active_bg']};
+            }}
+            QPushButton#equationTerm:focus {{ border-color: {colors['accent']}; }}
+            #equationOperator {{
+                color: {colors['text_secondary']};
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 14px;
+            }}
+
+            /* The one shared inspection panel. */
+            QWidget#variablePanel {{
+                background: {colors['card_bg']};
+                border-left: 1px solid {colors['border']};
+            }}
+
+            #glossarySymbol {{
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 13px;
+                font-weight: 600;
+                color: {colors['text_primary']};
+            }}
+
+            /* Reference page <-> notebook links. */
+            QPushButton#crossPageLink {{
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+                padding: 6px 12px;
+                background: transparent;
+                color: {colors['accent']};
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton#crossPageLink:hover {{
+                border-color: {colors['accent']};
+                background: {colors['nav_active_bg']};
+            }}
+            #referencePreamble, #contextRibbon {{
+                background: {colors['bg']};
+                border-bottom: 1px solid {colors['border']};
+            }}
         ''')
 
         root = QVBoxLayout(self)
@@ -323,7 +449,11 @@ class ComputationRecap(QDialog):
         split.addWidget(self._content())
         split.setSizes([235, 1065])
 
-        self._show_mode(MODES[0][0])
+        for sequence, amount in (('Alt+Right', 1), ('Alt+Left', -1)):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(lambda step=amount: self._advance(step))
+
+        self._show_mode(DEFAULT_MODE)
 
     # ── Chrome ────────────────────────────────────────────────────────────────
 
@@ -398,18 +528,12 @@ class ComputationRecap(QDialog):
         layout.addWidget(self.breadcrumb)
         layout.addWidget(Disclosure('Capture provenance & verification', self._provenance))
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
-        inner_layout.setContentsMargins(0, 0, 6, 0)
-        inner_layout.setSpacing(0)
+        # The shell no longer owns a scroll area.  A page that scrolls as one long
+        # document has to control its own scrollbar — it navigates by moving the reader to
+        # a section, which is the opposite of the scroll-to-top this used to force on every
+        # stage change.  Views that do not scroll themselves get wrapped in `_host`.
         self.stack = StageStack()
-        inner_layout.addWidget(self.stack)
-        inner_layout.addStretch(1)
-        self.scroll.setWidget(inner)
-        layout.addWidget(self.scroll, 1)
+        layout.addWidget(self.stack, 1)
 
         footer = QHBoxLayout()
         self.previous_stage = QPushButton('← Previous')
@@ -431,9 +555,73 @@ class ComputationRecap(QDialog):
             view = MODE_INDEX[key][2](self.capture, tokens=self._tokens)
             view.stage_changed.connect(self._stage_changed)
             view.context_changed.connect(self._context_changed)
-            self.stack.addWidget(view)
+            # Only the scrolling pages offer this, and the shell stays out of their way.
+            jump = getattr(view, 'jump_requested', None)
+            if jump is not None:
+                jump.connect(self._jump_to)
             self._views[key] = view
+            self._hosts[key] = self._host(view)
+            self.stack.addWidget(self._hosts[key])
         return self._views[key]
+
+    def _host(self, view: QWidget) -> QWidget:
+        """What goes in the stack: the view, or the view inside a scroll area.
+
+        A page that owns its scrolling says so by offering `reset_scroll`.  Anything else
+        is a plain tall widget that used to rely on the shell's scroll area, so it gets one
+        of its own — nesting two scroll areas would give the reader two scrollbars for one
+        page.
+        """
+        if hasattr(view, 'reset_scroll'):
+            return view
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 6, 0)
+        inner_layout.setSpacing(0)
+        inner_layout.addWidget(view)
+        inner_layout.addStretch(1)
+        area.setWidget(inner)
+        return area
+
+    def _reset_scroll(self) -> None:
+        """Put a view back at its top, for the views where that is the right gesture.
+
+        A scrolling page is navigated by `go_to`, which moves the reader to a section; the
+        shell forcing it to the top afterwards would undo exactly that.
+        """
+        view = self._views.get(self._mode)
+        if view is None or hasattr(view, 'reset_scroll'):
+            return
+        host = self._hosts.get(self._mode)
+        if isinstance(host, QScrollArea):
+            host.verticalScrollBar().setValue(0)
+
+    def open_raw_tensors(self) -> QWidget:
+        """Every captured array, as a secondary control rather than a competing mode."""
+        if self._raw_dialog is None:
+            self._raw_dialog = RawTensorDialog(self.capture, self, tokens=self._tokens)
+        self._raw_dialog.show()
+        self._raw_dialog.raise_()
+        return self._raw_dialog
+
+    def _jump_to(self, mode: str, stage: str) -> None:
+        """Follow a cross-page link.
+
+        Three kinds: the reference page's "follow this in the run", the notebook's
+        "explain this operation", and the ribbon's request for every captured array --
+        which is a window, not a mode, so it is handled before the mode lookup.
+        """
+        if mode == 'raw' and not stage:
+            self.open_raw_tensors()
+            return
+        if mode not in MODE_INDEX:
+            return
+        self._show_mode(mode)
+        if stage and stage in self.view.stage_keys():
+            self._nav_to(stage)
 
     @property
     def view(self) -> QWidget:
@@ -443,7 +631,7 @@ class ComputationRecap(QDialog):
         view = self._view(key)
         self._mode = key
         self._context = ''
-        self.stack.setCurrentWidget(view)
+        self.stack.setCurrentWidget(self._hosts[key])
         for existing, button in self._mode_buttons.items():
             button.setChecked(existing == key)
 
@@ -454,6 +642,8 @@ class ComputationRecap(QDialog):
         self._stage_header.setVisible(bool(stages))
         self.previous_stage.setVisible(bool(stages))
         self.next_stage.setVisible(bool(stages))
+        self.previous_stage.setText(getattr(view, 'PREVIOUS_LABEL', '← Previous'))
+        self.next_stage.setText(getattr(view, 'NEXT_LABEL', 'Next →'))
         if stages:
             self._stage_changed(view.current_stage())
         else:
@@ -463,7 +653,7 @@ class ComputationRecap(QDialog):
                 announce()
             else:
                 self._refresh_breadcrumb('')
-            self.scroll.verticalScrollBar().setValue(0)
+            self._reset_scroll()
 
     def _rebuild_stage_buttons(self, stages) -> None:
         while self._stage_box.count():
@@ -501,7 +691,7 @@ class ComputationRecap(QDialog):
             self.next_stage.setEnabled(position < len(keys) - 1)
             self.progress.set_position(position, len(keys), getattr(self.view, 'NOUN', 'Stage'))
         self._refresh_breadcrumb(key)
-        self.scroll.verticalScrollBar().setValue(0)
+        self._reset_scroll()
 
     def _context_changed(self, context: str) -> None:
         self._context = context

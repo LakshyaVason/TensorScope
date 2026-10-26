@@ -4,16 +4,36 @@ Watch a real language model answer a real prompt — and inspect the *exact* ten
 produced while doing it.
 
 TensorScope loads a Hugging Face causal LM into its own process, runs it with a custom
-eager attention implementation plus PyTorch forward hooks, and shows you every
-intermediate tensor from the run: tokenization, embeddings, per-layer Q/K/V before and
-after RoPE, the pre-softmax attention scores, the attention weights (as a heatmap), the
-attention block output, and each layer's output.
+eager attention implementation plus PyTorch forward hooks, and keeps every intermediate
+tensor the run produced: tokenization, embeddings, per-layer Q/K/V before and after RoPE,
+the pre-softmax attention scores, the attention weights, the attention block output, and
+each layer's output.
+
+Then it shows you the calculation those tensors came from, as one scrollable worked
+notebook: twelve operations from the tokens the model received to the token it selected,
+each with its formula, a picture of what the operation does, and the real captured numbers
+beside it. Every variable in every formula is something you can click. A second page
+explains the idea behind each operation, in the same order and the same notation, for when
+a step stops making sense.
 
 **No value is ever inferred, simulated, or reconstructed.** Everything displayed is a
 tensor the running model actually computed. Before a run can be saved or displayed,
 TensorScope re-runs the same prefill with stock attention and requires the logits to match
 bit for bit — if the capture machinery perturbed the computation at all, the run is thrown
 away rather than shown to you.
+
+The corollary matters just as much. A forward pass computes plenty that it then throws
+away — the learned weight matrices are never activations at all, and the residual sums, the
+per-head value mix and everything inside the feed-forward network are computed and
+discarded. TensorScope **names those, explains what they do, and shows you what it does
+have instead.** It never fills the gap with a plausible-looking number.
+
+So every set of values on screen is labelled with where it came from, in one of four ways:
+a tensor the model produced and the checks above cover; real output of the real forward pass
+that no check independently re-derived (the candidate scores for the second generated token
+onwards); something TensorScope worked out from captured numbers for the display; or an
+operation the model performed whose result this capture did not keep, described rather than
+shown.
 
 ---
 
@@ -79,10 +99,30 @@ Then, in the window:
    line reports progress and finishes with the layer count, hidden size and device.
 3. Type a question into **Prompt** (e.g. *What is the capital of France?*).
 4. Click **Run Model.** The answer streams into **Model answer**, the run is saved, and a
-   **Computation Recap** window opens with the captured tensors. The recap is modal — close
-   it to get back to the main window.
-5. In the recap, click any **Layer *n*** header to expand it. Layers build their contents
-   on first expand, which is why a 36-layer model opens instantly.
+   **Computation Recap** window opens with the captured tensors. It is a separate window,
+   so you can leave it open and run another prompt beside it.
+5. The recap has two pages.
+
+   **Follow this run** is where it opens: one scrollable worked calculation that goes from
+   the tokens the model received to the token it selected, in the order the model did it.
+   Twelve operations, then the rest of the answer. **Next operation** at the bottom moves
+   you through them and nothing above you disappears, so you can always scroll back to a
+   value you met earlier.
+
+   Every named variable is clickable — in a formula or in the list under it. Clicking one
+   fills the panel on the right with what it is, its shape in this run, where its numbers
+   came from, a few real values, and the complete stored array one click further on. A
+   variable the model computed but this capture did not keep says so instead, and shows you
+   what *was* captured in its place. Nothing is ever reconstructed to fill a gap.
+
+   **Understand the calculation** is the reference: twelve topics, each with the purpose,
+   the formula, a picture and an optional longer explanation. Every operation has an
+   **Explain this operation →** button pointing at the topic behind it, and every topic has
+   a **Follow this in the run →** button pointing back.
+
+   The ribbon at the top keeps the prompt, the captured phase, the layer and the selected
+   token in view, and its **All captured arrays…** button opens every stored tensor with no
+   framing at all.
 6. **Saved Runs** lists every past capture; select one and click **Open Recap** to
    reopen it. The stored tensors are the original values, at their original dtype.
    To browse a database from somewhere else, click **Choose Database…** (also on the
@@ -131,11 +171,15 @@ This loads a real model, runs a real capture, and asserts that:
 - every required tensor is present for every layer of both passes;
 - the SQLite round-trip is bit-exact and never changes a dtype.
 
-There is also a fast check with no torch or GPU required, covering the persistence and
-display helpers:
+Two more checks need no GPU, no model download and no torch at all. The first covers the
+persistence and display helpers and every line of copy on both pages; the second drives the
+whole recap over your own saved runs — every operation, every variable, every disclosure,
+both themes — and re-hashes the database afterwards to prove that reading a capture never
+rewrites it:
 
 ```bash
 ./.venv/Scripts/python.exe TensorScope.py --self-test
+./.venv/Scripts/python.exe test_recap.py
 ```
 
 ## What gets captured
@@ -152,7 +196,7 @@ Per layer, per pass:
 | `q`, `k`, `v` | raw projection outputs — **before** RoPE and QK-norm |
 | `q_attended`, `k_attended`, `v_attended` | the tensors that actually enter QKᵀ — after RoPE, with GQA heads already expanded |
 | `attention_scores` | the pre-softmax matrix, exactly as handed to softmax |
-| `attention_weights` | post-softmax attention (shown as the heatmap) |
+| `attention_weights` | post-softmax attention — each query's row sums to 1 |
 | `attention_output` | `W_o · concat(heads)` — the attention block's output |
 | `layer_output` | the decoder layer's output |
 
@@ -181,6 +225,4 @@ and with the square of the prompt length.
 working. It means the capture would not have shown you the tensors this model normally
 computes, so nothing was saved. Most likely cause is a transformers version whose eager
 attention path changed.
-
->claude --resume c3c9511e-a38a-4954-a3fc-0aabceaa5e19
 

@@ -17,17 +17,18 @@ import os
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QSize, Qt, QVariantAnimation, pyqtSignal
+from PyQt5.QtCore import QPoint, QSize, Qt, QVariantAnimation, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QSizePolicy, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from tensor_widgets import exact_scalar
 from tensorscope_content import (
     EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
-    EVIDENCE_UNATTESTED, LAYER_STEP_ORDER, LESSON_TIMING_CAVEAT, readable_spelling,
+    EVIDENCE_UNATTESTED, STRUCTURE_NOT_TIMING_NOTE, readable_spelling,
 )
 
 
@@ -36,15 +37,6 @@ from tensorscope_content import (
 # changes nothing a reader or a test can observe except the tint.
 OFFSCREEN = os.environ.get('QT_QPA_PLATFORM', '') == 'offscreen'
 
-
-# The six operations inside one decoder layer, in execution order.  Shared by the
-# internals sidebar and the card builders.
-LAYER_STEPS = [('input', '1  Normalize'), ('qkv', '2  Project Q / K / V'),
-               ('prepare', '3  Prepare for attention'), ('scores', '4  Scores → weights'),
-               ('mix', '5  Mix values & project'), ('output', '6  Finish the layer')]
-
-assert [key for key, _ in LAYER_STEPS] == LAYER_STEP_ORDER, \
-    "LAYER_STEPS and the INTERNALS_STEPS copy have drifted apart"
 
 COLORS = {'q': '#60a5fa', 'k': '#c084fc', 'v': '#34d399',
           'scores': '#fbbf24', 'weights': '#22d3ee', 'output': '#fb923c',
@@ -89,6 +81,27 @@ def shape(array):
     return '[' + ' × '.join(str(d) for d in array.shape) + ']'
 
 
+def shape_line(array, *, omit_batch: bool = False) -> tuple[str, str]:
+    """A shape to read, and the sentence that keeps it honest.
+
+    Returns `(written, caption)`.  Every stored activation here carries a leading batch
+    axis of 1, which is noise in an equation a person is trying to follow -- `[15 × 2560]`
+    reads, `[1 × 15 × 2560]` does not.  Dropping it silently would be a different shape
+    from the one on disk, so the caption always says so and always names the stored shape.
+    One helper, so no surface can drop the axis without also saying it did.
+
+    The axis is only ever dropped when it really is 1: a batched capture would print in
+    full, caption-free.
+    """
+    dims = tuple(int(d) for d in array.shape)
+    full = '[' + ' × '.join(f'{d:,}' for d in dims) + ']'
+    if not (omit_batch and len(dims) > 1 and dims[0] == 1):
+        return full, ''
+    short = '[' + ' × '.join(f'{d:,}' for d in dims[1:]) + ']'
+    return short, (f'Batch axis of size 1 omitted for readability. '
+                   f'The stored array is {full}.')
+
+
 def chip_text(token: str, limit: int = 18) -> str:
     """A token's spelling, safe to put on a button.
 
@@ -122,6 +135,69 @@ def axes_for(name, tensor):
     if tensor.ndim == 3:
         return ['batch', 'token', 'projection feature' if name in ('q', 'k', 'v') else 'hidden feature']
     return [f'axis {i}' for i in range(tensor.ndim)]
+
+
+# ── Captured-array helpers ────────────────────────────────────────────────────
+# Read-only views over stored arrays, plus the one layout swap every selection-driven
+# panel uses.  These sit here rather than in a view because the notebook, the reference
+# page and the raw inspector all need them and none of those may import another.
+
+def replace_in(layout, widget) -> None:
+    """Swap the single widget held by `layout`, disposing of the previous one.
+
+    Used by the panels that update on a token or layer selection.  Rebuilding a panel
+    rather than mutating labels in place keeps every builder a pure function of the
+    current selection, which is what makes them safe to call from the tests.
+    """
+    while layout.count():
+        item = layout.takeAt(0)
+        child = item.widget()
+        if child is not None:
+            # Bind first: setParent(None) can leave the item's widget() returning None.
+            child.setParent(None)
+            child.deleteLater()
+    if widget is not None:
+        layout.addWidget(widget)
+
+
+def bullets(items) -> QWidget:
+    """A bulleted list as one selectable rich label."""
+    body = '<br>'.join(f'•&nbsp;&nbsp;{text}' for text in items)
+    return label(body, rich=True)
+
+
+def head_slice(array, head: int = 0) -> np.ndarray:
+    """A 2-D [query x key] *view* of a captured attention tensor.
+
+    Basic indexing only, so this borrows the stored buffer and can never write to it.
+    """
+    view = np.asarray(array)
+    if view.ndim == 4:
+        view = view[0, min(head, view.shape[1] - 1)]
+    elif view.ndim == 3:
+        view = view[min(head, view.shape[0] - 1)]
+    while view.ndim > 2:
+        view = view[0]
+    return view[np.newaxis, :] if view.ndim == 1 else view
+
+
+def embedding_row(array, index: int):
+    """One token's embedding vector, or None when this capture cannot supply it.
+
+    Returns None rather than raising: a run whose stored embedding is not
+    [batch, token, feature] should degrade to a note, not take the stage down.
+    """
+    view = np.asarray(array)
+    if view.ndim < 2:
+        return None
+    while view.ndim > 2:
+        view = view[0]
+    return view[index] if 0 <= index < view.shape[0] else None
+
+
+def head_count(array) -> int:
+    view = np.asarray(array)
+    return int(view.shape[-3]) if view.ndim >= 3 else 1
 
 
 # ── Evidence badge ────────────────────────────────────────────────────────────
@@ -568,40 +644,12 @@ def read_only_table(headings, rows, *, stretch: int | None = None,
     return table
 
 
-# ── Layer step sidebar ────────────────────────────────────────────────────────
-
-class LayerStepSidebar(QWidget):
-    """Vertical step navigator for the operations inside one decoder layer."""
-
-    def __init__(self, on_step, parent=None):
-        super().__init__(parent)
-        self._on_step = on_step
-        self._buttons: dict[str, QPushButton] = {}
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        header = label('LAYER OPERATIONS', muted=True, small=True)
-        header.setObjectName('stepSidebarHeader')
-        layout.addWidget(header)
-        for key, title in LAYER_STEPS:
-            button = QPushButton(title)
-            button.setObjectName('layerStepBtn')
-            button.setCheckable(True)
-            button.clicked.connect(lambda _, k=key: on_step(k))
-            layout.addWidget(button)
-            self._buttons[key] = button
-        layout.addStretch(1)
-
-    def set_current(self, key: str) -> None:
-        for existing, button in self._buttons.items():
-            button.setChecked(existing == key)
-
-
-# ── Lesson primitives ─────────────────────────────────────────────────────────
+# ── Reveal and check primitives ───────────────────────────────────────────────
 # Each of these takes an optional `state` dict plus a `state_key`, and the contract is
 # the same everywhere: restore from `state` synchronously while constructing, and write
-# back on every change.  The owner keeps the dict, which is what lets the lesson cache a
-# screen, rebuild it when the phase changes, and still show the reader what they had.
+# back on every change.  The owner keeps the dict.  With the notebook's sections built
+# once and never replaced, a reader's reveals and answers usually survive simply by still
+# being on the page; the dicts still matter for the parts that do rebuild.
 
 class StepReveal(QWidget):
     """Reveal one calculation a deliberate step at a time.
@@ -615,7 +663,7 @@ class StepReveal(QWidget):
     ANIMATION_MS = 320
 
     def __init__(self, steps, *, state: dict | None = None, state_key: str = '',
-                 caption: str = LESSON_TIMING_CAVEAT, animate: bool = True, parent=None):
+                 caption: str = STRUCTURE_NOT_TIMING_NOTE, animate: bool = True, parent=None):
         super().__init__(parent)
         self._steps = list(steps)
         self._state = state if state is not None else {}
@@ -1094,3 +1142,290 @@ class StageProgress(QWidget):
                                'border-radius: 2px;')
         self._caption.setText(f'{noun} {index + 1} of {total}' if total else '')
         self.setVisible(bool(total))
+
+
+# ── A long page whose NAV entries are anchors, not replacements ──────────────────
+# The older views replaced the whole screen on every navigation, which is why a reader
+# could never see a calculation accumulate: the step they had just understood was gone.
+# These two classes are the alternative.  A page builds all of its sections once, in
+# order, and navigating scrolls to one and highlights it.  Nothing is destroyed, so every
+# selection, expansion and reveal survives navigation by construction rather than by
+# being saved and replayed.
+
+class Section(QFrame):
+    """One anchor on a long page: a numbered header, a lede, and a lazily built body.
+
+    The split matters for a 36-layer model.  Constructing a section is a header and a
+    sentence, which costs nothing, so a page can hold every section from the start and the
+    reader can scroll freely.  The body -- diagrams, value rows, tables -- is built the
+    first time the section is reached, and the heavy things inside it stay behind a
+    `Disclosure` even then.
+
+    `slot(name)` hands out named sub-layouts for the parts that change when the reader
+    picks a different token or layer.  Refreshing one slot with `replace_in` repaints a few
+    widgets; it does not reflow the page or lose anybody's place.
+    """
+
+    def __init__(self, key: str, title: str, lede: str = '', *, number: str = '',
+                 build_body=None, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.setObjectName('notebookSection')
+        self.setProperty('current', False)
+        # Focusable so the page can be walked from the keyboard, and so `go_to` has
+        # somewhere to put focus that a screen reader will read out.
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._build_body = build_body
+        self._built = False
+        self._animation = None
+
+        self._body = QVBoxLayout(self)
+        self._body.setContentsMargins(22, 18, 22, 20)
+        self._body.setSpacing(10)
+        heading = f'{number}   {title}' if number else title
+        self.header = label(heading, title=True)
+        self.header.setObjectName('sectionHeader')
+        self._body.addWidget(self.header)
+        if lede:
+            self._body.addWidget(label(lede, rich=True))
+        self._body_slot = QVBoxLayout()
+        self._body_slot.setContentsMargins(0, 0, 0, 0)
+        self._body_slot.setSpacing(10)
+        self._body.addLayout(self._body_slot)
+        self.setAccessibleName(heading)
+
+    # -- lazy body ------------------------------------------------------------
+
+    def is_built(self) -> bool:
+        return self._built
+
+    def ensure_built(self) -> None:
+        """Build the body once.  Idempotent, so every caller can be careless."""
+        if self._built:
+            return
+        self._built = True                      # set first: a raising builder must not retry
+        if self._build_body is not None:
+            widget = self._build_body(self)
+            if widget is not None:
+                self._body_slot.addWidget(widget)
+
+    def add(self, widget: QWidget) -> QWidget:
+        self._body_slot.addWidget(widget)
+        return widget
+
+    def anchor(self) -> QWidget:
+        """What to scroll to: the header, so the title lands at the top of the viewport."""
+        return self.header
+
+    # -- the reader's place --------------------------------------------------
+
+    def set_active(self, active: bool) -> None:
+        """Mark this as where the reader is.
+
+        A dynamic property and a re-polish, so the *stylesheet* owns the colour and the
+        light and dark palettes need no branching here.
+        """
+        if self.property('current') == bool(active):
+            return
+        self.setProperty('current', bool(active))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def flash(self) -> None:
+        """A brief emphasis after a jump.  Decoration on an already-finished move.
+
+        Nothing waits for this and nothing reads its state, which is why it can be skipped
+        outright under the offscreen platform.  It says "the thing you asked for is here",
+        not anything about how long an operation took.
+        """
+        if OFFSCREEN:
+            return
+        def tint(value) -> None:
+            self.setProperty('flash', float(value or 0.0) > 0.05)
+            self.style().unpolish(self)
+            self.style().polish(self)
+
+        animation = QVariantAnimation(self)
+        animation.setDuration(220)
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.valueChanged.connect(tint)
+        animation.finished.connect(lambda: tint(0.0))
+        self._animation = animation             # an unreferenced animation is collected
+        animation.start()
+
+
+class AnchoredScrollPage(QWidget):
+    """A scrolling page the shell's existing navigator drives by scrolling, not swapping.
+
+    The view contract is unchanged -- `NAV`, `stage_keys()`, `current_stage()`, `go_to()`,
+    `stage_changed`, `context_changed` -- so the sidebar list, the pipeline chips, the
+    progress pills and the footer Previous/Next buttons all keep working with no layout
+    code in the shell.  What changes is what `go_to` *means*: it moves the reader to a
+    section instead of replacing the screen with it.
+
+    Ordering inside `go_to` is deliberate.  The state change and its signal happen first
+    and completely; the scroll is best-effort afterwards.  So a test can assert
+    `current_stage()` without knowing anything about pixels, and a section that grows when
+    it is built cannot leave the page in a half-navigated state.
+    """
+
+    stage_changed = pyqtSignal(str)
+    context_changed = pyqtSignal(str)
+    # (mode key, section key): "explain this" / "show me this in the run" links between the
+    # reference page and the worked notebook.  The shell wires it; neither page knows the
+    # other exists.
+    jump_requested = pyqtSignal(str, str)
+
+    NAV: list = []
+    NOUN = 'Section'
+    NEXT_LABEL = 'Next →'
+    PREVIOUS_LABEL = '← Previous'
+
+    def __init__(self, capture, parent=None, tokens: dict | None = None):
+        super().__init__(parent)
+        capture.validate()
+        self.capture = capture
+        self._tokens = tokens or {}
+        self._sections: dict[str, Section] = {}
+        self._order: list[str] = []
+        self._stage_key = ''
+        self._scrolling = False
+        self._context = ''
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._header_slot = QVBoxLayout()
+        self._header_slot.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(self._header_slot)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        # Always on, so the viewport width does not change the moment the page grows past
+        # the scrollbar threshold -- which otherwise reflows every section mid-scroll.
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        inner = QWidget()
+        self._page = QVBoxLayout(inner)
+        self._page.setContentsMargins(4, 10, 10, 40)
+        self._page.setSpacing(14)
+        self.scroll.setWidget(inner)
+        # A splitter from the start, so a page that wants a panel beside its scroll area
+        # can add one without the scroll area having to be re-parented afterwards.
+        self.split = QSplitter(Qt.Horizontal)
+        self.split.addWidget(self.scroll)
+        self.split.setStretchFactor(0, 1)
+        outer.addWidget(self.split, 1)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+
+    # ── Construction ─────────────────────────────────────────────────────────
+
+    def add_header(self, widget: QWidget) -> QWidget:
+        """A pinned strip above the scroll area -- a context ribbon, say."""
+        self._header_slot.addWidget(widget)
+        return widget
+
+    def add_side_panel(self, widget: QWidget, *, width: int = 330) -> QWidget:
+        """A panel beside the scrolling page, reader-resizable and collapsible."""
+        self.split.addWidget(widget)
+        self.split.setStretchFactor(self.split.count() - 1, 0)
+        self.split.setCollapsible(self.split.count() - 1, True)
+        widget.setMinimumWidth(200)
+        self.split.setSizes([900, width])
+        return widget
+
+    def add_section(self, section: Section) -> Section:
+        self._sections[section.key] = section
+        self._order.append(section.key)
+        self._page.addWidget(section)
+        return section
+
+    def finish_sections(self) -> None:
+        """Called once after the last section, so the page does not stretch them."""
+        self._page.addStretch(1)
+
+    def section(self, key: str) -> Section:
+        return self._sections[key]
+
+    def sections(self) -> list:
+        return [self._sections[key] for key in self._order]
+
+    # ── The view contract ────────────────────────────────────────────────────
+
+    @classmethod
+    def stage_keys(cls) -> list[str]:
+        return [key for key, _ in cls.NAV]
+
+    def current_stage(self) -> str:
+        return self._stage_key
+
+    def context(self) -> str:
+        return self._context
+
+    def set_context(self, text: str) -> None:
+        self._context = text
+        self.context_changed.emit(text)
+
+    def go_to(self, key: str) -> None:
+        """Move the reader to a section.  State first, then the scroll."""
+        if key not in self._sections:
+            raise KeyError(key)
+        # Build the target and anything between here and there: those are about to be on
+        # screen anyway, and a section growing above the target is what makes a scroll
+        # land in the wrong place.
+        self._build_through(key)
+        previous, self._stage_key = self._stage_key, key
+        if previous and previous in self._sections:
+            self._sections[previous].set_active(False)
+        target = self._sections[key]
+        target.set_active(True)
+        self.stage_changed.emit(key)
+        self.context_changed.emit(self.context())
+        # Everything above is final.  What follows is presentation.
+        self._page.activate()
+        self._scrolling = True
+        try:
+            self.scroll.ensureWidgetVisible(target.anchor(), 0, 18)
+        finally:
+            self._scrolling = False
+        target.setFocus(Qt.OtherFocusReason)
+        target.flash()
+
+    def reset_scroll(self) -> None:
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def _build_through(self, key: str) -> None:
+        if key not in self._order:
+            return
+        target = self._order.index(key)
+        current = self._order.index(self._stage_key) if self._stage_key in self._order else 0
+        low, high = sorted((current, target))
+        for position in range(low, high + 1):
+            self._sections[self._order[position]].ensure_built()
+
+    def _on_scrolled(self, value: int) -> None:
+        """Keep the navigator in step with free scrolling.
+
+        Guarded against the scroll `go_to` performs itself: without the flag this re-emits
+        `stage_changed` for whatever happens to be at the top mid-animation, and a shell
+        handler that scrolled in response would oscillate.
+        """
+        if self._scrolling or not self._order:
+            return
+        viewport_top = self.scroll.viewport().mapTo(self.scroll.widget(), QPoint(0, 0)).y()
+        reached = self._order[0]
+        for key in self._order:
+            section = self._sections[key]
+            if section.y() <= viewport_top + 24:
+                reached = key
+            else:
+                break
+        self._sections[reached].ensure_built()
+        if reached != self._stage_key:
+            previous = self._stage_key
+            self._stage_key = reached
+            if previous and previous in self._sections:
+                self._sections[previous].set_active(False)
+            self._sections[reached].set_active(True)
+            self.stage_changed.emit(reached)
