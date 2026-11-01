@@ -14,6 +14,7 @@ import importlib.abc
 import itertools
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import sys
@@ -41,15 +42,18 @@ import TensorScope as app
 import tensorscope_diagrams as diagrams
 from tensor_widgets import AttentionExplorer, TensorInspector, TensorTableModel, exact_scalar
 from tensorscope_common import (
-    COLORS, AnnotatedValueRow, Disclosure, EvidenceBadge, PredictCheck,
+    COLORS, AnnotatedValueRow, Disclosure, EvidenceBadge, PassTimeline, PredictCheck,
     ResponseTextView, StepReveal,
 )
 from tensorscope_content import (
-    CONCEPTUAL_VARIABLES, CONTINUATION, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
-    EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE, NOTEBOOK_CHECKS, NOTEBOOK_OPERATIONS,
-    PROVENANCE_ABSENT, PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED,
-    REFERENCE_TOPICS, ROLE_LEGEND, TELEMETRY_UNAVAILABLE, VARIABLE_ROLES, learn_facts,
+    CHAPTERS, CONCEPTUAL_VARIABLES, CONTINUATION, EVIDENCE_CONCEPTUAL, EVIDENCE_KINDS,
+    EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE, NOTEBOOK_CHECKS,
+    NOTEBOOK_OPERATIONS, NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, PROVENANCE_ABSENT,
+    PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED, REFERENCE_TOPICS,
+    ROLE_LEGEND, TELEMETRY_UNAVAILABLE, TYPED_BAND, VARIABLE_ROLES, learn_facts,
+    prompt_token_bands, readable_spelling,
 )
+import tensorscope_operations as operations
 from tensorscope_diagrams import CausalMaskTriangle, Diagram
 from tensorscope_ui import DEFAULT_MODE, MODE_INDEX, MODES, ComputationRecap
 from tensorscope_variables import (
@@ -263,8 +267,12 @@ class SavedCaptureTests(unittest.TestCase):
                         getattr(topic, field).format(**facts)
                 for operation in NOTEBOOK_OPERATIONS + [CONTINUATION]:
                     filled = {**facts, **{name: 0 for name in operation.fields}}
-                    for field in ('heading', 'lede', 'formula'):
+                    for field in ('heading', 'lede', 'formula', 'takeaway', 'note',
+                                  'action'):
                         getattr(operation, field).format(**filled)
+                for key, text in NOTEBOOK_TEXT.items():
+                    text.format(**{**facts, **{name: 0 for name in
+                                               NOTEBOOK_TEXT_FIELDS.get(key, ())}})
                 for name, check in NOTEBOOK_CHECKS.items():
                     filled = {**facts, **{key: 0 for key in check['fields']}}
                     check['question'].format(**filled)
@@ -486,11 +494,12 @@ class SavedCaptureTests(unittest.TestCase):
                 notebook.go_to(key)
             identities = {key: id(notebook.section(key)) for key in keys}
 
+            # Disclosures first: the optional checks sit behind one, collapsed.
+            open_every_disclosure(notebook)
             for reveal in notebook.findChildren(StepReveal):
                 reveal.reveal_all()
             for check in notebook.findChildren(PredictCheck):
                 check.choose(-1)
-            open_every_disclosure(notebook)
             opened = [disclosure for disclosure in notebook.findChildren(Disclosure)
                       if disclosure.findChild(QPushButton).isChecked()]
             self.assertTrue(opened, 'the notebook should have something to expand')
@@ -719,19 +728,22 @@ class SavedCaptureTests(unittest.TestCase):
         for key, _ in notebook.NAV:
             notebook.go_to(key)
         notebook.layout().activate()
-        # Measured at this width, the twelve operations run from about 720 to about 2,000
-        # pixels -- one to three screens each, which is the readable chunk the Next
-        # operation control is there to move between. The bounds are set just above that,
-        # so a change that turns a section into a page of its own fails here. They are
-        # not an aspiration: heavy content belongs behind a `Disclosure`, which is what
-        # `test_no_matplotlib_canvas_is_built_until_the_reader_asks` checks.
+        # Measured under the offscreen platform at this width, the twelve operations run
+        # from about 1,250 to about 2,520 pixels.  Offscreen fonts render roughly twice the
+        # size of the real ones: with Segoe UI 10 the same sections measure 525 to 1,271,
+        # and the continuation 1,545 -- one to two screens of a 1366x768 laptop each, the
+        # readable chunk Next moves between.  Every operation now carries its in/does/out
+        # line and its "Next" line by design; the optional checks, the feed-forward
+        # interior and each step's variable list sit behind a `Disclosure`.  The bounds are
+        # set just above the offscreen measurements, so a change that turns a section into
+        # a page of its own still fails here.
         heights = {}
         for section in notebook.sections():
             heights[section.key] = section.sizeHint().height()
             with self.subTest(section=section.key):
                 # The continuation holds the whole answer plus three tables, which is the
                 # one place where showing everything at once is the point.
-                limit = 3200 if section.key == 'continuation' else 2200
+                limit = 3400 if section.key == 'continuation' else 2600
                 self.assertLessEqual(heights[section.key], limit)
         self.assertLessEqual(sum(heights.values()), 24000, heights)
         notebook.deleteLater()
@@ -762,14 +774,25 @@ class SavedCaptureTests(unittest.TestCase):
         for chip in notebook.findChildren(VariableChip):
             self.assertEqual(chip.focusPolicy(), Qt.StrongFocus)
             self.assertTrue(chip.accessibleName())
-        for name in ('phase_picker', 'layer_picker', 'head_picker'):
-            self.assertTrue(getattr(notebook, name).accessibleName(), name)
+        # The pickers are contextual now: each appears in the operation that explains it.
+        for key in ('prepare', 'layers', 'continuation'):
+            notebook.go_to(key)
+        for kind in ('head', 'layer', 'phase'):
+            built = notebook.pickers(kind)
+            self.assertTrue(built, f'no {kind} control was built')
+            for widget in built:
+                self.assertTrue(widget.accessibleName(), kind)
+        chip = notebook.toolbar_widget()
+        self.assertNotEqual(chip.focusPolicy(), Qt.NoFocus)
+        self.assertTrue(chip.accessibleName())
+        self.assertNotEqual(recap.contents.focusPolicy(), Qt.NoFocus)
         # Every emitted token must be reachable without a mouse, because the response
         # anchors only answer linkActivated.
         notebook.go_to('continuation')
         response = notebook.findChild(ResponseTextView)
         steppers = [button for button in notebook.section('continuation')
-                    .findChildren(QPushButton) if 'token' in button.text()]
+                    .findChildren(QPushButton)
+                    if button.text() in ('← Previous token', 'Next token →')]
         self.assertEqual(len(steppers), 2)
         following = next(button for button in steppers if 'Next' in button.text())
         following.click()
@@ -781,20 +804,31 @@ class SavedCaptureTests(unittest.TestCase):
         run_id, capture = next(iter(self.captures.items()))
         before = capture_digest(capture)
         recap = ComputationRecap(capture, run_id=run_id, tokens=app.TOKENS)
-        self.assertEqual([key for key, _, _, _ in MODES], ['understand', 'run'])
+        self.assertEqual([key for key, _, _, _ in MODES], ['run', 'understand'])
         self.assertEqual(recap._mode, DEFAULT_MODE)
+        chapter_titles = {chapter.title for chapter in CHAPTERS}
         for key, name, _, _ in MODES:
             recap._show_mode(key)
             self.assertTrue(recap._mode_buttons[key].isChecked())
-            self.assertEqual(set(recap._stage_buttons), {k for k, _ in recap.view.NAV})
-            self.assertIn(name, recap.breadcrumb.text())
-            for stage_key, stage_name in recap.view.NAV:
+            self.assertEqual(set(recap.contents.actions_by_key),
+                             {k for k, _ in recap.view.NAV})
+            for position, (stage_key, _stage_name) in enumerate(recap.view.NAV):
                 recap._nav_to(stage_key)
                 self.assertEqual(recap.view.current_stage(), stage_key)
-                self.assertTrue(recap._stage_buttons[stage_key].isChecked())
-                self.assertIn(stage_name, recap.breadcrumb.text())
+                self.assertTrue(recap.contents.actions_by_key[stage_key].isChecked())
+                if key == 'run':
+                    # Every section reports which of the four chapters it belongs to.
+                    self.assertIn(recap.view.chapter_of(stage_key), chapter_titles)
+                    self.assertIn(recap.view.chapter_of(stage_key), recap.progress.text())
+                else:
+                    self.assertIn(f'Topic {position + 1} of {len(recap.view.NAV)}',
+                                  recap.progress.text())
+            # Previous / Next walk the same list the contents menu does.
+            recap._nav_to(recap.view.NAV[0][0])
             recap._advance(1)
+            self.assertEqual(recap.view.current_stage(), recap.view.NAV[1][0])
             recap._advance(-1)
+            self.assertEqual(recap.view.current_stage(), recap.view.NAV[0][0])
         recap.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.assertEqual(before, capture_digest(capture))
@@ -812,19 +846,19 @@ class SavedCaptureTests(unittest.TestCase):
         run_id, capture = next(iter(self.captures.items()))
         recap = ComputationRecap(capture, run_id=run_id, tokens=app.TOKENS)
 
-        def chips():
-            return [b for b in recap.findChildren(QPushButton)
-                    if b.objectName() == 'pipelineChip']
-
         for _ in range(3):
             for mode, _name, _purpose, _cls in MODES:
                 recap._show_mode(mode)
                 live = {key for key, _ in recap.view.NAV}
-                # No deferred-delete pump: the point is that they are gone *now*.
-                self.assertEqual(len(chips()), len(live))
-                self.assertEqual(set(recap._stage_buttons), live)
-                for chip in chips():
-                    self.assertTrue(chip.isVisible() or not recap.isVisible())
+                # No deferred-delete pump: the point is that they are gone *now*.  The
+                # contents menu is the one list of sections; it must hold exactly the live
+                # page's, not accumulate the other page's across switches.
+                actions = recap.contents.section_actions()
+                self.assertEqual(len(actions), len(live))
+                self.assertEqual(set(recap.contents.actions_by_key), live)
+                # And only the live page's toolbar control is shown.
+                for key, toolbar in recap._toolbars.items():
+                    self.assertEqual(not toolbar.isHidden(), key == mode)
 
         # And a navigation slot handed a key from the other page does nothing, rather
         # than raising out of a slot.
@@ -881,6 +915,290 @@ class SavedCaptureTests(unittest.TestCase):
             recap.deleteLater()
             QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
             self.assertEqual(before, capture_digest(capture))
+
+
+    # ── The presentation's own promises ───────────────────────────────────────
+
+    def test_initial_focus_is_a_meaningful_prompt_token(self):
+        """The page follows the last typed word, never a template marker or punctuation."""
+        for run_id, capture in self.captures.items():
+            bands = prompt_token_bands(capture.prompt, capture.prompt_tokens)
+            typed = [index for start, end, name in (bands or []) if name == TYPED_BAND
+                     for index in range(start, end)]
+            words = [index for index in typed
+                     if any(ch.isalnum() for ch in readable_spelling(capture.prompt_tokens[index]))]
+            expected = (words[-1] if words else typed[-1] if typed
+                        else len(capture.prompt_tokens) - 1)
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            with self.subTest(run_id=run_id):
+                self.assertEqual(notebook.registry.position, expected)
+                self.assertIn(f'at {expected}', notebook.toolbar_widget().text())
+            notebook.hide()
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_the_decision_shifts_to_the_final_prompt_position(self):
+        """The followed position must never look as if it chose the token."""
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            facts = learn_facts(capture)
+            final = len(capture.prompt_tokens) - 1
+            followed = notebook.registry.position
+            notebook.go_to('decide')
+            section = notebook.section('decide')
+            shown = section_text(section)
+            with self.subTest(run_id=run_id):
+                self.assertNotEqual(followed, final, 'the fixture runs follow a typed word')
+                self.assertIn(f'final prompt position, {final}', shown)
+                self.assertIn(f'followed position {followed}', shown)
+                # The page offers the jump; it does not make it.
+                self.assertEqual(notebook.registry.position, followed)
+                projection = section.findChildren(diagrams.VocabularyProjection)
+                self.assertTrue(projection)
+                spoken = ' '.join(projection[0].describe())
+                self.assertIn(f'only position {final} chose', spoken)
+                self.assertIn(f'you followed position {followed}', spoken)
+                if capture.logits is not None:
+                    self.assertIn(f'= {int(np.argmax(capture.logits))}', shown)
+                    self.assertIn(repr(capture.tokens[0]), shown)
+                    self.assertNotIn('%', shown)
+                jump = [button for button in section.findChildren(QPushButton)
+                        if button.text() == NOTEBOOK_TEXT['follow_final'].format(**facts)]
+                self.assertEqual(len(jump), 1)
+                jump[0].click()
+                self.assertEqual(notebook.registry.position, final)
+                self.assertIn(NOTEBOOK_TEXT['focus_is_final'].format(**facts),
+                              section_text(section))
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_mix_products_add_up_to_the_shown_total(self):
+        """Operation 8's visible products plus the remainder are the whole sum."""
+        for run_id, capture in self.captures.items():
+            before = capture_digest(capture)
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            context = notebook.context_builder
+            for generated in (False, True):
+                for head in {0, notebook.head_count() - 1}:
+                    notebook.select(generated=generated, head=head)
+                    example = operations.mix_example(context)
+                    with self.subTest(run_id=run_id, generated=generated, head=head):
+                        self.assertIsNotNone(example)
+                        layers = capture.generated_layers if generated else capture.layers
+                        tensors = layers[notebook.registry.layer_index].tensors
+                        query = min(notebook.registry.position,
+                                    tensors['attention_weights'].shape[-2] - 1)
+                        weights = tensors['attention_weights'][0, head, query].astype(np.float64)
+                        values = tensors['v_attended'][0, head, :, 0].astype(np.float64)
+                        expected_keys = sorted(np.argsort(-weights, kind='stable')[
+                            :operations.MIX_KEYS].tolist())
+                        self.assertEqual(example['shown'], expected_keys)
+                        products = example['products']
+                        shown = float(products[example['shown']].sum())
+                        rest = float(products[example['rest']].sum()) if example['rest'] else 0.0
+                        self.assertLessEqual(abs(shown + rest - example['total']), 1e-12)
+                        self.assertLessEqual(abs(example['total'] - float(weights @ values)),
+                                             1e-12)
+            notebook.hide()
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.assertEqual(before, capture_digest(capture))
+
+    def test_the_per_layer_view_reads_captured_attention(self):
+        """One row per layer, each from that layer's own captured arrays."""
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            rows = operations.layer_summary_rows(notebook.context_builder)
+            with self.subTest(run_id=run_id):
+                self.assertEqual([row['layer'] for row in rows], sorted(capture.layers))
+                position = notebook.registry.position
+                for row in rows:
+                    tensors = capture.layers[row['layer']].tensors
+                    mean = tensors['attention_weights'][0, :, position, :].astype(
+                        np.float64).mean(axis=0)
+                    self.assertEqual(row['key'], int(np.argmax(mean)))
+                    self.assertLessEqual(row['key'], position)      # causal: never later
+                    output = tensors['layer_output'][0, position].astype(np.float64)
+                    self.assertEqual(row['feature'], int(np.argmax(np.abs(output))))
+            notebook.go_to('layers')
+            # The thirty-six identical shape tables are gone: one summary table, one shape
+            # table behind a single disclosure.
+            titles = [d.title for d in notebook.section('layers').findChildren(Disclosure)]
+            self.assertFalse(any(title.startswith('Layer ') for title in titles), titles)
+            notebook.hide()
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_rounded_values_carry_their_exact_value(self):
+        """Rounding is for reading: the exact stored digits are always one hover away."""
+        capture = next(iter(self.captures.values()))
+        notebook = NotebookView(capture, tokens=app.TOKENS)
+        for key, _ in notebook.NAV:
+            notebook.go_to(key)
+        for reveal in notebook.findChildren(StepReveal):
+            reveal.reveal_all()
+        boxes = [frame for frame in notebook.findChildren(QLabel)
+                 if frame.objectName() == 'valueBoxNumber']
+        self.assertTrue(boxes)
+        for box in boxes:
+            with self.subTest(value=box.text()):
+                self.assertTrue(box.toolTip().startswith('Exact stored value: '))
+                if box.text().startswith('≈'):
+                    self.assertNotEqual(box.toolTip().split(': ', 1)[1], box.text())
+        # Logits are scores, never percentages.  Markup is not text a reader sees, so the
+        # response's rich-text styling ("line-height: 160%") is stripped first.
+        for key in ('decide', 'continuation'):
+            readable = re.sub(r'<[^>]*>', '', section_text(notebook.section(key)))
+            self.assertNotIn('%', readable, key)
+        notebook.hide()
+        notebook.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_controls_appear_where_they_explain_something(self):
+        """Head, layer and phase pickers live in the operations that need them."""
+        capture = next(iter(self.captures.values()))
+        recap = ComputationRecap(capture, run_id=1, tokens=app.TOKENS)
+        notebook = recap.view
+        for key, _ in notebook.NAV:
+            notebook.go_to(key)
+        homes = {'head': {'prepare', 'scores', 'mix'}, 'layer': {'layers'},
+                 'phase': {'continuation'}}
+        for kind, allowed in homes.items():
+            for widget in notebook.pickers(kind):
+                owner = next(section.key for section in notebook.sections()
+                             if section.isAncestorOf(widget))
+                with self.subTest(kind=kind, section=owner):
+                    self.assertIn(owner, allowed)
+                    self.assertFalse(recap.reading_bar.isAncestorOf(widget))
+        # Several copies of one picker agree, because they all follow the registry.
+        notebook.select(head=3, layer_index=max(notebook.registry.layer_indices))
+        for picker in notebook.pickers('head'):
+            self.assertEqual(picker.combo.currentIndex(), 3)
+        for picker in notebook.pickers('layer'):
+            self.assertEqual(picker.combo.currentData(), notebook.registry.layer_index)
+        notebook.pickers('phase')[0].click()
+        self.assertTrue(notebook.registry.generated)
+        self.assertIn('generated-token pass', notebook.toolbar_widget().text())
+        recap.hide()
+        recap.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_the_timeline_marks_what_each_pass_kept(self):
+        """Layer tensors for two passes, a full vector for one, candidates where recorded."""
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            notebook.go_to('continuation')
+            timelines = notebook.section('continuation').findChildren(PassTimeline)
+            self.assertEqual(len(timelines), 1)
+            timeline = timelines[0]
+            stop_known = capture.metadata.get('stop_token_id') is not None
+            trace = capture.generation_trace
+            with self.subTest(run_id=run_id):
+                self.assertEqual(timeline.count(), len(capture.tokens) + int(stop_known))
+                for index in range(timeline.count()):
+                    row = timeline.row(index)
+                    self.assertEqual(row['layers'], index <= 1)
+                    if index >= len(capture.tokens):
+                        self.assertIn('stopping', row['title'])
+                        self.assertEqual(row['tier'], EVIDENCE_UNATTESTED)
+                        continue
+                    self.assertIn(repr(capture.tokens[index]), row['title'])
+                    if index == 0 and capture.logits is not None:
+                        self.assertIn('full', row['capabilities'])
+                    elif index < len(trace):
+                        self.assertIn('leading candidate', row['capabilities'])
+                    else:
+                        self.assertIn('not recorded', row['capabilities'])
+                        self.assertEqual(row['tier'], EVIDENCE_CONCEPTUAL)
+                # The two passes that kept layer tensors are always on screen.
+                self.assertTrue(timeline.is_row_shown(0) and timeline.is_row_shown(1))
+                # Selecting in either place selects in both.
+                response = notebook.findChild(ResponseTextView)
+                last = len(capture.tokens) - 1
+                response.select(last)
+                self.assertEqual(timeline.current(), last)
+                timeline._clicked(1)
+                self.assertEqual(response.current(), 1)
+            notebook.hide()
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_the_shell_fits_a_laptop_screen(self):
+        """Two bands of chrome and no sideways scrolling at 1366 x 768."""
+        capture = next(iter(self.captures.values()))
+        recap = ComputationRecap(capture, run_id=1, tokens=app.TOKENS)
+        recap.resize(1366, 768)
+        recap.show()
+        self.application.processEvents()
+        # Measured in lines and characters of this platform's font, not raw pixels: the
+        # offscreen platform substitutes Helvetica 12 (17 px per average character) for
+        # Segoe UI 10 (7 px at 96 dpi), so a pixel bound would test the font, not the
+        # layout.  A 1366-pixel window holds about 195 Segoe UI characters across.
+        metrics = recap.fontMetrics()
+        chrome_lines = (recap.banner.height() + recap.reading_bar.height()) / metrics.lineSpacing()
+        self.assertLessEqual(chrome_lines, 6.5, chrome_lines)
+        across = recap.minimumSizeHint().width() / max(1, metrics.averageCharWidth())
+        self.assertLessEqual(across, 1366 / 7, across)
+        for mode, _name, _purpose, _cls in MODES:
+            recap._show_mode(mode)
+            for key, _ in recap.view.NAV:
+                recap._nav_to(key)
+            self.application.processEvents()
+            with self.subTest(mode=mode):
+                self.assertTrue(recap.next_stage.isVisible())
+                self.assertTrue(recap.contents.isVisible())
+        recap.hide()
+        recap.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_the_variable_panel_opens_on_demand_and_keeps_the_readers_place(self):
+        """No permanent empty panel; choosing a variable opens it, closing hides it, and a
+        visit to the reference page and back loses nothing."""
+        capture = next(iter(self.captures.values()))
+        recap = ComputationRecap(capture, run_id=1, tokens=app.TOKENS)
+        notebook = recap.view
+        self.assertFalse(notebook.side_panel_open())
+        notebook.go_to('norm')
+        chip = next(chip for chip in notebook.section('norm').findChildren(VariableChip)
+                    if chip.key() == 'normalized_input')
+        chip.click()
+        self.assertTrue(notebook.side_panel_open())
+        self.assertEqual(notebook.panel.current_symbol(), 'normalized_input')
+        notebook.select(head=2)
+        chosen = dict(notebook.selection())
+        following = notebook.toolbar_widget().text()
+        recap._jump_to('understand', 'qkv')
+        self.assertEqual(recap.view.current_stage(), 'qkv')
+        recap._jump_to('run', 'norm')
+        self.assertIs(recap.view, notebook)
+        self.assertTrue(notebook.side_panel_open())
+        self.assertEqual(notebook.panel.current_symbol(), 'normalized_input')
+        self.assertEqual(notebook.selection(), chosen)
+        self.assertEqual(notebook.toolbar_widget().text(), following)
+        notebook.panel.close_button.click()
+        self.assertFalse(notebook.side_panel_open())
+        self.assertEqual(notebook.current_stage(), 'norm')
+        recap.hide()
+        recap.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_the_page_opens_on_its_destination(self):
+        """Prompt, the start of the real answer, and the token being explained, first."""
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            first = notebook.section('input')
+            preface = first.preface
+            with self.subTest(run_id=run_id):
+                self.assertIsNotNone(preface)
+                shown = section_text(preface)
+                self.assertIn(capture.prompt, shown)
+                self.assertIn(repr(capture.tokens[0]), shown)
+                self.assertIn(learn_facts(capture)['response_excerpt'].split(' ')[1], shown)
+                self.assertIs(first.anchor(), preface)
+            notebook.hide()
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
 
 class ModuleLayeringTests(unittest.TestCase):
     """The import graph is a declared, one-directional DAG, not a convention.
@@ -1168,6 +1486,40 @@ class DiagramTests(unittest.TestCase):
         self.assertIn("1 query × 16 keys", described)
         self.assertIn("15 keys came from the cache", described)
         self.assertFalse(any("queries" in text for text in described))
+
+    def test_a_highlighted_row_is_labelled_with_its_own_index(self):
+        """Position 13 of 15 is drawn on the row that stands for 13, not clamped to 14."""
+        grid = diagrams.MatrixGrid(15, 2560, symbol='X', highlight_row=13,
+                                   tokens=app._TOKENS_DARK)
+        self.assertIn(13, grid.drawn_rows())
+        self.assertIn('row 13', grid.describe())
+        for total, mark in ((15, 4), (16, 5), (14, 13), (36, 20)):
+            window = diagrams.Diagram.row_window(total, 8, mark)
+            self.assertIn(mark, window)
+            self.assertEqual(window[0], 0)
+            self.assertEqual(window[-1], total - 1)
+            real = [index for index in window if index is not None]
+            self.assertEqual(real, sorted(set(real)))
+
+    def test_attention_bars_name_their_keys(self):
+        scores = np.array([2.0, 3.0, 1.0, 0.5], dtype=np.float32)
+        weights = np.array([0.2, 0.5, 0.2, 0.1], dtype=np.float32)
+        bars = diagrams.SoftmaxBars(scores, weights, labels=['0', '1', '2', '3'],
+                                    sublabels=['the', ' color', '?', 'x'], indices=[1, 3],
+                                    tokens=app._TOKENS_DARK)
+        self.assertEqual(bars.drawn_keys(), [1, 3])
+        self.assertIn(' color', bars.describe())
+        self.assertIn('2 of 4 key positions drawn', bars.describe())
+
+    def test_the_vocabulary_projection_names_both_rows(self):
+        projection = diagrams.VocabularyProjection(
+            2560, 151936, positions=15, final_position=14, focus_position=4,
+            tokens=app._TOKENS_DARK)
+        spoken = ' '.join(projection.describe())
+        self.assertIn('only position 14 chose', spoken)
+        self.assertIn('you followed position 4', spoken)
+        self.assertIn(4, projection.drawn_rows())
+        self.assertIn(14, projection.drawn_rows())
 
     def test_no_diagram_creates_a_matplotlib_canvas(self):
         """A 15x15 grid is not worth a FigureCanvas; painting it is why this module exists."""

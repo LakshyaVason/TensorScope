@@ -54,8 +54,8 @@ mechanism cheaply. Run it against `Qwen/Qwen3-4B` as well before trusting a chan
 adds QK-norm and a head_dim decoupled from `hidden_size / num_heads`, which has caught
 shape assumptions that the 0.5B model does not.
 
-`test_recap.py` is the one to run after any UI change: 38 tests over every saved run, no
-torch, no GPU, about two and a half minutes. It takes an optional database path first, then
+`test_recap.py` is the one to run after any UI change: 53 tests over every saved run, no
+torch, no GPU, about three minutes. It takes an optional database path first, then
 test names — `test_recap.py SavedCaptureTests.test_token_span_selection_matches_the_recorded_candidates`
 runs one. (It only treats the first argument as a database when it looks like one, so
 passing a bare test name works.)
@@ -386,24 +386,81 @@ this comment. Two rules it checks that are easy to break by accident:
 `tensorscope_common` exists to break a cycle rather than for tidiness: the colour and stage
 constants are read by both the shell and the pages.
 
-### Two pages, not four modes
+### Two pages, two bands of chrome
 
-- `ComputationRecap` (`tensorscope_ui`) owns the window, the palette, the banner, the
-  provenance evidence card and the navigation. It knows nothing about tensors. Each page
-  exposes the same small contract — a `NAV` list of `(section key, label)`, `go_to(key)`,
-  `current_stage()`, and the `stage_changed` / `context_changed` signals — and the shell
-  drives its navigator, sidebar, breadcrumb, progress pills and footer from those alone.
-- `MODES` has exactly two rows. **Understand the calculation** (`ReferenceView`) is twelve
-  illustrated topics: purpose → formula → symbols → picture → optional deeper explanation.
-  **Follow this run** (`NotebookView`) is one scrollable worked calculation: twelve
-  operations and then the continuation, thirteen anchors in all. `DEFAULT_MODE` is `run`,
-  because a reader opening a finished capture wants the run and comes back to the reference
-  when a step stops making sense.
-- Every captured array is still reachable, through the notebook ribbon's
-  **All captured arrays…** button, which opens `RawView` in a modeless `RawTensorDialog`.
-  `RawView` itself is unchanged. It is deliberately *not* a third `MODES` row: a mode there
-  competes with the pages, and the point of the redesign was to stop offering four readings
-  of one run instead of one that accumulates.
+- `ComputationRecap` (`tensorscope_ui`) owns the window, the palette and two rows of chrome,
+  and knows nothing about tensors. The **banner**: which run, the mode toggle, "✓ Validated
+  capture" with a **Details…** button (the provenance card, in its own dialog), and
+  **All captured arrays…**. The **reading bar**: the prompt, `ChapterProgress` (which
+  chapter, "Operation 7 of 12"), the page's own toolbar control, a `ContentsButton` menu,
+  and Previous / Next (also Alt+←/→). That replaced a pipeline of 13 chips, a sidebar list
+  of the same 13, a breadcrumb, progress pills, a footer and a pinned ribbon of pickers —
+  six bands and five ways of navigating one list, which left the page a quarter of a laptop
+  screen. `test_the_shell_fits_a_laptop_screen` holds the line.
+- The page contract the shell drives all of that from: `NAV`, `go_to(key)`,
+  `current_stage()`, `stage_keys()`, `stage_changed` / `context_changed`, and optionally
+  `CHAPTERS` (a list of `(title, section keys)`), `progress_text(key)` and
+  `toolbar_widget()`. The shell may import only `tensorscope_common` and
+  `tensorscope_views`, so chapters reach it through this contract and never by importing
+  content.
+- `MODES` has exactly two rows, **Follow this run** first: it is the page a reader opening
+  a finished capture wants and the one that opens (`DEFAULT_MODE = 'run'`). **Understand
+  the calculation** (`ReferenceView`) is twelve illustrated topics, each kicked with the
+  operation it explains ("Explains operation 4"), because topic and operation numbers do
+  not line up one to one.
+- Every captured array is still reachable, through **All captured arrays…** (banner, and the
+  variable panel's header), which opens `RawView` in a modeless `RawTensorDialog`. It is
+  deliberately *not* a third `MODES` row.
+
+### The notebook's teaching structure
+
+The notebook is built to be followed by an engineering student who knows vectors and matrix
+multiplication, and its structure is mechanical rather than editorial:
+
+- **It opens on its destination.** The `input` section's `preface` is a card with the
+  prompt, the start of the real answer (`response_excerpt`) with its first token marked, and
+  one sentence saying the page follows the calculation that chose that token.
+- **Four chapters** (`CHAPTERS` in content): Represent the input, Exchange information,
+  Refine the representation, Select a token. They are read, not navigated: a kicker on the
+  first section of each, the progress indicator, and the contents menu's groups. Nothing
+  moves by chapter. `--self-test` asserts the four titles and that they cover the 13
+  anchors in order.
+- **Every operation reads in the same order**, and the `Operation` fields are that order:
+  `lede` (purpose, one sentence, ≤260 characters by assertion) → `terms` (clickable
+  formula) → `inputs` / `action` / `outputs` (`ctx.io_row`: IN · DOES · OUT) → a diagram →
+  a few values → `note` (the one misconception worth heading off here, as a callout) →
+  `takeaway` ("NEXT", how the result is used). The variable list, the optional check and
+  heavy extras sit behind `Disclosure`s. Captions live in `NOTEBOOK_TEXT`; the ones that
+  need a builder value (a weight, a count) declare it in `NOTEBOOK_TEXT_FIELDS`, and the
+  self-test formats every caption against both fixtures with zeros for those.
+- **One position is followed.** `default_focus_position` picks the last typed token with a
+  letter or digit (the last word of the question, not its `?`), only when
+  `prompt_token_bands` resolves; otherwise the last typed token, then the last position.
+  The registry starts there, the `FocusChip` in the reading bar shows and changes it, and
+  every diagram highlights that real row. `Diagram.row_window` is what makes "real row"
+  true: the old rule clamped a selection onto the last drawn row, so position 13 of 15
+  was painted on the row that stood for 14 and labelled "row 13".
+- **The hand-off is explicit.** Operation 12 says the decision is made at the final prompt
+  position and names both positions when they differ (`focus_shift`), the
+  `VocabularyProjection` draws the followed row dashed beside the final one, and a button
+  offers to follow the final position. It never moves the selection by itself.
+- **Controls appear where they explain something.** `HeadPicker` in operations 6–8,
+  `LayerPicker` in 11, `PhaseToggle` in the continuation. Several copies feed one registry,
+  so each syncs from it with its own signals blocked, through a *bound method* so Qt
+  disconnects it when the widget dies (a closure would outlive a slot rebuild and raise in
+  a slot — the abort described above). `test_controls_appear_where_they_explain_something`.
+- **The variable panel is closed until a variable is chosen**, has a close button and Esc,
+  scrolls its own content, and carries the colour key (`RoleLegend`), which no longer pins
+  a band above the page. Opening or closing it changes the page width, so it goes through
+  `AnchoredScrollPage.preserve_place()`, which records (section, offset), sets
+  `_scrolling`, settles the layout synchronously and restores the place.
+- **The continuation has a timeline** (`PassTimeline`, buttons not a table — the
+  candidate-table helpers in the tests read any `QTableWidget` with a "Token ID" column).
+  One row per pass, from the run: pass 1 is the prefill (layer tensors, full vector when
+  `logits` exists); pass 2 processed token 1 and chose token 2, and is the one later pass
+  with layer tensors; later passes have leading candidates where `generation_trace` has
+  them, "not recorded" otherwise; a stop row when the stopping token is known. Collapsed to
+  the first two, the selected and the last.
 
 ### `go_to` scrolls; it does not swap
 
@@ -423,7 +480,12 @@ Three details are load-bearing:
   safety net with no current caller, because both modes are `AnchoredScrollPage`s: they are
   there so that adding a plain tall view later does not silently become unscrollable.
 - Inside `go_to`, the state change and `stage_changed` happen **first and completely**; the
-  `ensureWidgetVisible` and the flash are presentation afterwards. So tests assert
+  scroll and the flash are presentation afterwards. The scroll puts the section's first
+  line at the top of the viewport (`_scroll_to`: the anchor's offset in the section plus
+  the section's in the page, no `mapTo` at all) — `ensureWidgetVisible` only made it
+  *visible*, so going forward the new title sat at the bottom edge. Freshly built sections
+  have only posted their layout requests, so `go_to` delivers them first and re-applies the
+  scroll once more on a zero timer (`_settle_scroll`, only if the reader has not moved). So tests assert
   `current_stage()` and never a pixel offset. `_on_scrolled` keeps the navigator in step
   with free scrolling and is guarded by `_scrolling` against the scroll `go_to` performs.
   That guard also made a crash invisible for a whole branch, so it is worth knowing how:
@@ -441,9 +503,10 @@ Three details are load-bearing:
   the only thing that exercises any of this; a recurrence takes the interpreter down
   rather than failing an assertion, because an access violation cannot be caught.
 - A section's header and lede are built up front (cheap text); its **body** builds on first
-  arrival. Operation 11's per-layer group is a `Disclosure` of `Disclosure`s, so a 36-layer
-  model builds one layer's widgets when a reader opens one layer — which is why
-  `open_every_disclosure` in the tests now *loops* until no new ones appear.
+  arrival. Operation 11 is one summary table (a row per layer, for the followed position)
+  plus a single shape table behind a `Disclosure` — it used to be 36 identical shape
+  tables. `open_every_disclosure` still *loops* until no new ones appear, because
+  disclosures can contain disclosures.
 
 ### Variables are the interactive objects
 
@@ -463,9 +526,16 @@ asserts it.
 
 `display` is reserved and currently has no variables: every `CONCEPTUAL_VARIABLES` entry is
 `learned` or `absent`, and `--self-test` asserts that. Numbers TensorScope worked out reach
-the screen as a value row badged `EVIDENCE_DERIVED` — operation 8's worked scalar, the
-weight-row sum, the argmax — rather than as a clickable variable, because there is no array
-behind them for a panel to be about.
+the screen badged `EVIDENCE_DERIVED` — operation 8's worked scalar, the weight-row total,
+the argmax, the top-two margin, the head-mean in operation 11 — rather than as a clickable
+variable, because there is no array behind them for a panel to be about.
+
+Values in the teaching view are rounded for reading (`approx`: "≈0.252"), and every value
+box carries the exact stored digits (`exact_scalar`) as its tooltip; the panel's complete
+array and `RawView` show exact digits only. `approx_share` turns an **attention weight**
+into "≈25.2% of this head's mixing weight" — the only percentage anywhere, always beside
+operation 7's note that attention weights are not next-token probabilities. Logits are
+never shown as percentages. `test_rounded_values_carry_their_exact_value`.
 
 `layer_input` (`X`) is the one indirection worth knowing: a layer's input *is* captured, just
 under another name — the embedding output at layer 0, the previous layer's output after that.
@@ -479,9 +549,13 @@ batch axis can never be dropped quietly. One helper, used everywhere.
 
 `TENSOR_LABELS`, `TENSOR_EXPLANATIONS`, `EXTRA_TENSOR_LABELS`/`EXTRA_TENSOR_EXPLANATIONS`,
 `TENSOR_SYMBOLS`, `VARIABLE_ROLES`, `ROLE_LEGEND`, `CONCEPTUAL_VARIABLES`,
-`REFERENCE_TOPICS`, `NOTEBOOK_OPERATIONS`, `CONTINUATION`, `NOTEBOOK_CHECKS`,
-`ILLUSTRATIONS`, `STOP_REASONS`, `WHAT_WE_KNOW` and `WHAT_WE_CANNOT_CONCLUDE` are all in
-`tensorscope_content`.
+`REFERENCE_TOPICS`, `NOTEBOOK_OPERATIONS`, `CONTINUATION`, `CHAPTERS`, `NOTEBOOK_TEXT`,
+`NOTEBOOK_CHECKS`, `ILLUSTRATIONS`, `STOP_REASONS`, `WHAT_WE_KNOW` and
+`WHAT_WE_CANNOT_CONCLUDE` are all in `tensorscope_content`. `WHAT_WE_KNOW` lines carry the
+capability they need (`logits`, `trace`, `decoding`) and are read through
+`what_we_know(facts)`: a schema-2 run must not be told it has a score vector or a recorded
+greedy rule. Likewise `selection_rule_sentence` has three forms — greedy recorded; schema 3,
+where `validate()` still proves the stored vector peaks at the emitted token; and neither.
 `--self-test` formats every one of them against `learn_facts()` for a full *and* a legacy
 fixture, so a line naming a field that function does not supply fails the test instead of
 raising `KeyError` in front of a reader.
@@ -510,11 +584,21 @@ declares the `tiers` it may show and a test enforces it, and `EVIDENCE_UNATTESTE
 confined to two places — a later generation step's scores, and the stopping score, which
 also comes from a non-prefill pass.
 
-Operation 8 is the only place arithmetic is done on captured values: one scalar of `A @ V`,
-in float64, from two captured operands, badged derived and shown beside `DISPLAY_CALC_NOTE`.
+Operation 8 is the only place an intermediate is *computed*: one scalar of `A @ V`, in
+float64, from two captured operands, badged derived and shown beside `DISPLAY_CALC_NOTE`.
 It exists because that is the step whose result the model discarded, so a reader who has
-never watched a weighted average happen has not seen attention. It is one number, and it
-never claims to equal a captured result. It is also the only surviving user of `StepReveal`:
+never watched a weighted average happen has not seen attention. It shows the heaviest six
+keys and one "other N positions" remainder, so the visible products plus the remainder are
+exactly the total (`test_mix_products_add_up_to_the_shown_total`); it used to show the first
+eight keys in position order beside a total over all of them.
+
+Everything else derived is *selection or summary*, never reconstruction: which features
+are largest (`tracked_features`, followed through operations 2, 4, 9 and 10), which keys
+carry the weight, a head-mean of one weight row, a row total, the margin between two
+scores. **Forbidden**, because each would recreate something the capture discarded: the RMS
+or vector length of X or X_norm (`rms` is a named absent variable, and ‖X‖ = rms·√d), any
+difference of two captured tensors (`X_next − X` is O + F), and H, F or Z beyond that one
+scalar. It is also the only surviving user of `StepReveal`:
 four steps at the reader's pace, captioned with `STRUCTURE_NOT_TIMING_NOTE`, which says the
 order represents how the operation is built and not how long any of it took. No copy
 anywhere states a duration.
@@ -523,7 +607,7 @@ anywhere states a duration.
 
 Nothing on either page uses these any more. They still import and still work, so nothing
 is broken — but do not reach for one assuming it is part of the current design. Only
-`numeric_sample` is still covered by a test; the other three have no remaining caller and
+`numeric_sample` is still covered by a test; the others have no remaining caller and
 therefore no remaining coverage:
 
 | Dead | Why, and what replaced it |
@@ -532,13 +616,15 @@ therefore no remaining coverage:
 | `FlowDiagram` | The reference page draws with QPainter, so a numberless box-and-arrow sketch has no remaining caller. |
 | `ShapeDiagram`, `Card.shape_diagram` | Replaced by `MatMulShapes`, which also ties the shared inner dimension across both operands. |
 | `sample_text` | Had no caller before this change either. `numeric_sample` survives only as its helper and as a `--self-test` assertion. |
+| `PipelineNavigator`, `StageProgress` | The shell's chip pipeline and pills, replaced by `ContentsButton` and `ChapterProgress`. |
+| `PhaseBadge` | Lived in the removed context ribbon; dark-palette only. The `FocusChip` says when the generated-token pass is on screen. |
 
 `TokenChipStrip` looks dead and is not quite: `ResponseTextView` falls back to it when the
 stored token spellings do not reassemble into the stored response. No run in the shipped
 database trips that, so the branch is reachable and currently unexercised — see the
 capability-tiers section above. Do not delete it on the strength of a coverage report.
 
-Deleting the dead four is a reasonable cleanup; it would also leave `display_matrix` with
+Deleting the dead ones is a reasonable cleanup; it would also leave `display_matrix` with
 no caller, which is capture-adjacent code, so it is a decision rather than a tidy-up.
 
 ### On the softmax cross-check

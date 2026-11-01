@@ -290,20 +290,57 @@ def prompt_token_bands(prompt: str, prompt_tokens: list[str]) -> list[tuple[int,
     return [band for band in bands if band[1] > band[0]]
 
 
+def default_focus_position(prompt: str, prompt_tokens: list[str]) -> int:
+    """Which prompt position the notebook follows first.
+
+    A token the reader typed is more interesting to follow than a chat-template marker, so
+    this is the last typed token that contains a letter or a digit -- the last word of the
+    question rather than its question mark.  It is only chosen when the typed text lines up
+    with the stored spellings exactly (`prompt_token_bands`); otherwise, and for a prompt of
+    pure punctuation, it falls back to something that needs no alignment at all: the last
+    typed token, then the last position.  Never a guess about which token "matters".
+    """
+    tokens = list(prompt_tokens or [])
+    if not tokens:
+        return 0
+    bands = prompt_token_bands(prompt, tokens)
+    typed = [index for start, end, name in (bands or []) if name == TYPED_BAND
+             for index in range(start, end)]
+    for index in reversed(typed):
+        if any(character.isalnum() for character in readable_spelling(tokens[index])):
+            return index
+    return typed[-1] if typed else len(tokens) - 1
+
+
 # ── What can and cannot be concluded ─────────────────────────────────────────────
 
+# Each line carries the capability it depends on, because three of them are false for the
+# runs saved before that capability existed: a schema-2 run has no score vector, and
+# neither schema 2 nor schema 3 records its decoding rule.  `what_we_know(facts)` filters.
 WHAT_WE_KNOW = [
-    "The exact token IDs the model was given, after any chat template was applied.",
-    "The exact embedding vectors those IDs produced in this run.",
-    "The exact queries, keys, values, attention scores and attention weights for every "
-    "head of every layer, in both captured passes.",
-    "The exact output of every decoder layer.",
-    "The full vocabulary score vector that chose the first generated token.",
-    "The leading candidate scores at every later generation step, and which token won.",
-    "The decoding rule: greedy, so the highest score is selected with no sampling.",
-    "That capture did not change the computation — the prompt pass was re-run under "
-    "stock eager attention and the logits matched bit for bit.",
+    (None, "The exact token IDs the model was given, after any chat template was applied."),
+    (None, "The exact embedding vectors those IDs produced in this run."),
+    (None, "The exact queries, keys, values, attention scores and attention weights for "
+           "every head of every layer, in both captured passes."),
+    (None, "The exact output of every decoder layer."),
+    ("logits", "The full vocabulary score vector that chose the first generated token."),
+    ("trace", "The leading candidate scores at every later generation step, and which "
+              "token won."),
+    ("decoding", "The decoding rule: greedy, so the highest score is selected with no "
+                 "sampling."),
+    (None, "That capture did not change the computation — the prompt pass was re-run "
+           "under stock eager attention and the logits matched bit for bit."),
 ]
+
+
+def what_we_know(facts: dict) -> list[str]:
+    """The lines of WHAT_WE_KNOW that are true of the run `facts` describes."""
+    have = {"logits": facts.get("vocab_size_known"),
+            "trace": facts.get("trace_known"),
+            "decoding": facts.get("decoding_known")}
+    return [text for requirement, text in WHAT_WE_KNOW
+            if requirement is None or have.get(requirement)]
+
 
 WHAT_WE_CANNOT_CONCLUDE = [
     "Why the model learned this association. Training data and training dynamics are "
@@ -1133,7 +1170,15 @@ assert len(REFERENCE_TOPIC_INDEX) == len(REFERENCE_TOPICS), "duplicate reference
 
 @dataclass(frozen=True)
 class Operation:
-    """One anchored step of the worked notebook."""
+    """One anchored step of the worked notebook.
+
+    Every operation is taught in the same order, and the fields are that order:
+    `lede` is the purpose in one sentence; `terms` is the clickable formula; `inputs`,
+    `action` and `outputs` say what entered, what happened and what came out; `note` is the
+    one misunderstanding worth heading off at this step, if there is one; and `takeaway` is
+    how the result is used next.  The full explanation lives on the reference page, behind
+    `topic`, so none of it is repeated here.
+    """
 
     key: str
     number: int
@@ -1147,102 +1192,126 @@ class Operation:
     check: str = ""
     topic: str = ""
     fields: tuple = ()
+    action: str = ""
+    inputs: tuple = ()
+    outputs: tuple = ()
+    takeaway: str = ""
+    note: str = ""
 
 
 NOTEBOOK_OPERATIONS = [
     Operation(
         "input", 1, "The model's input",
         "What this run actually received",
-        "Your prompt reached the model as {position_count} positions, each one vocabulary "
-        "entry. {typed_token_summary} The rest were added by the chat template, which is "
-        "part of how an instruction-tuned model is told whose turn it is. Every position "
-        "below is a token this run really was given, in the order it was given them.",
+        "Your prompt reached the model as {position_count} token positions, one vocabulary "
+        "ID each. {typed_token_summary}",
         terms=("text", "→", "[id₀, id₁, …]"),
         tiers=(EVIDENCE_OBSERVED,),
         topic="ids",
+        action="split into tokens",
+        inputs=("your text",),
+        outputs=("token IDs",),
+        takeaway="Each ID is used exactly once, as a row number into the embedding table.",
     ),
     Operation(
         "embed", 2, "Embedding lookup",
         "From a token ID to a vector",
-        "A token ID is used exactly once: as a row number. The model reads that row out of "
-        "a learned table and gets {hidden_size_text} numbers — one point in a "
-        "{hidden_size_text}-dimensional space, not a {hidden_size_text} × "
-        "{hidden_size_text} grid. Those coordinates were fixed during training; this run "
-        "only looked them up.",
+        "Each token ID picks one row of a learned table, giving the vector of "
+        "{hidden_size_text} numbers the layers will compute with.",
         terms=("E", "[", "selected token ID", "]", "→", "embedding"),
         variables=("embedding", "E"),
-        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL),
+        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         check="embed",
         topic="shapes",
+        action="look up one row",
+        inputs=("token ID",),
+        outputs=("embedding",),
+        takeaway="Stacked one row per position, these vectors become X, the first layer's "
+                 "input.",
+        note="No single coordinate has a known meaning. Meaning is spread across many "
+             "coordinates at once, so the values below are worth watching for how they "
+             "change, not for what any one of them says.",
     ),
     Operation(
         "shape", 3, "The input tensor",
         "One tensor for the whole sequence",
-        "Stack one embedding row per position and you have the tensor the first layer "
-        "reads. The line below is the *arrangement* of those numbers: one batch, "
-        "{position_count_text} token positions, {hidden_size_text} features each. It is "
-        "not the numbers themselves — open X to see those.",
+        "Stacking the {position_count_text} rows gives X, the single tensor the first layer "
+        "reads: token positions down, features across.",
         formula="shape(X) = [{batch_size}, {position_count}, {hidden_size}]",
         variables=("layer_input",),
         tiers=(EVIDENCE_OBSERVED,),
         check="shape",
         topic="shapes",
+        action="stack the rows",
+        inputs=("embedding",),
+        outputs=("layer_input",),
+        takeaway="Every layer reads a tensor of exactly this shape and writes one back, so "
+                 "this arrangement holds all the way to the last layer.",
     ),
     Operation(
         "norm", 4, "Input normalization",
-        "Putting each position's vector on a predictable scale",
-        "RMSNorm divides each position's vector by a measure of its own magnitude and then "
-        "scales it feature by feature with learned values. X and X_norm hold the same "
-        "number of token vectors in the same arrangement; only the values differ, and no "
-        "number crossed between positions. The result was captured; the magnitude "
-        "statistic, the learned scales and ε were not.",
+        "Putting each row on a predictable scale",
+        "RMSNorm rescales each position's row on its own, so the layer's arithmetic starts "
+        "from vectors of a predictable size.",
         formula="X_norm[i] = X[i] / √(mean(X[i]²) + ε)  ⊙  g",
         terms=("normalized_input", "=", "RMSNorm", "(", "layer_input", ")"),
         variables=("layer_input", "g", "epsilon", "rms", "normalized_input"),
-        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL),
+        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         topic="norm",
+        action="rescale each row on its own",
+        inputs=("layer_input",),
+        outputs=("normalized_input",),
+        takeaway="X_norm feeds the three projections next. X itself is kept aside: it is "
+                 "added back in operation 10.",
+        note="Same shape, same rows: each value changed, but no number moved between "
+             "positions.",
     ),
     Operation(
         "project", 5, "Raw projections",
-        "Three learned views of the same vector",
-        "The same normalized vector is read by three different learned matrices. The query "
-        "is what a position is looking for, the key is what it advertises, the value is "
-        "what it contributes when matched. All three weight matrices were learned during "
-        "training; none of their values are in this capture, and all three of their "
-        "outputs are.",
+        "Three learned views of the same row",
+        "Three learned matrices read the same normalized row and produce a query (what this "
+        "position looks for), a key (what it can be matched on) and a value (what it hands "
+        "over).",
         formula="Q_raw = X_norm W_Qᵀ        K_raw = X_norm W_Kᵀ        "
                 "V_raw = X_norm W_Vᵀ",
         terms=("q", "=", "normalized_input", "@", "W_Q"),
         variables=("normalized_input", "W_Q", "q", "W_K", "k", "W_V", "v"),
         tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL),
         topic="qkv",
+        action="multiply by three learned matrices",
+        inputs=("normalized_input",),
+        outputs=("q", "k", "v"),
+        takeaway="These are not yet what attention compares: next they are split into heads "
+                 "and Q and K are rotated by position.",
+        note="This is the step that changes the width — {hidden_size_text} features in, "
+             "{q_projection_width_text} out for Q and {kv_projection_width_text} for K and "
+             "V — because a learned matrix computed new numbers.",
     ),
     Operation(
         "prepare", 6, "Preparing for attention",
-        "Four distinct things happen here",
-        "Between the raw projections and the comparison there are four separate steps, and "
-        "they are different kinds of operation. The projection computed new numbers. "
-        "Reshaping into {query_head_count} heads of {head_dim} only regroups the numbers "
-        "that already exist — no arithmetic at all. A rotation by position is then applied, "
-        "and any per-head normalization the architecture uses. Finally each of the "
-        "{kv_head_count} key/value heads is copied out to the {kv_group_size} query heads "
-        "that share it. Only the finished tensors were captured, so the steps between are "
-        "described here rather than shown.",
+        "Splitting into heads and marking position",
+        "The projections are regrouped into heads, Q and K are rotated by position, and the "
+        "shared key/value heads are copied out to the query heads that use them.",
         formula="Q_raw → reshape to [{query_head_count} × {head_dim}] → "
                 "rotate by position → Q",
         terms=("q", "→", "q_attended"),
         variables=("q", "q_attended", "k", "k_attended", "v", "v_attended"),
         tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL),
         topic="heads",
+        action="regroup into heads · rotate Q and K · share K and V",
+        inputs=("q", "k", "v"),
+        outputs=("q_attended", "k_attended", "v_attended"),
+        takeaway="Q and K are compared next. V waits for operation 8, where the weights "
+                 "decide how much of each value is collected.",
+        note="Regrouping does no arithmetic: the same {q_projection_width_text} query numbers "
+             "are read as {query_head_count_text} heads of {head_dim_text}. The rotation "
+             "does change values, which is why Q differs from Q_raw.",
     ),
     Operation(
         "scores", 7, "Scores and weights",
         "Deciding what to read",
-        "Every query is compared with every key by a dot product, the totals are scaled by "
-        "{attention_scale_text}, and a causal mask is added so no position can read a later "
-        "one. Softmax then turns each query's row of scores into weights that add up to 1. "
-        "The captured scores already have the scale and the mask in them — they are exactly "
-        "the tensor softmax received — and the mask alone was not saved separately.",
+        "Each head compares one position's query with the key of every position it may see, "
+        "and softmax turns those scores into weights that add up to 1.",
         formula="S = s·(Q Kᵀ) + M            A = softmax(S)",
         terms=("attention_scores", "→ softmax →", "attention_weights"),
         variables=("q_attended", "k_attended", "QK_raw", "M", "attention_scores",
@@ -1250,73 +1319,92 @@ NOTEBOOK_OPERATIONS = [
         tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         check="scores",
         topic="softmax",
+        action="compare · scale · mask · softmax",
+        inputs=("q_attended", "k_attended"),
+        outputs=("attention_scores", "attention_weights"),
+        takeaway="The weights are used straight away, to decide how much of each "
+                 "position's value this head collects.",
+        note="These attention weights control how information is mixed within this head. "
+             "They are not next-token probabilities.",
     ),
     Operation(
         "mix", 8, "Mixing the values",
         "Collecting what was decided",
-        "Each head now takes a weighted average of the values it attended to, using the "
-        "weights from the previous step. That per-head result was computed by the model and "
-        "then discarded: what this capture keeps is the attention block's output after the "
-        "heads have been joined and projected. One entry of it is worked through below from "
-        "captured operands, marked as calculated for this display.",
+        "Each head takes a weighted average of the value vectors, so information from the "
+        "positions it attended to flows into this one.",
         formula="Z_h = A_h V_h",
         terms=("Z_head", "=", "attention_weights", "@", "v_attended"),
         variables=("attention_weights", "v_attended", "Z_head"),
         tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         topic="matching",
+        action="weighted sum of value rows",
+        inputs=("attention_weights", "v_attended"),
+        outputs=("Z_head",),
+        takeaway="Every head's result goes on to operation 9, where the heads are joined and "
+                 "projected back to the model's width.",
+        note="A weight near 1 means this head copies almost all of one position's value; "
+             "weights spread evenly mean it blends many positions together.",
     ),
     Operation(
         "join", 9, "Joining the heads and projecting",
-        "Back to the model's own feature width",
-        "Every head's result is laid side by side, giving {q_projection_width} features, and "
-        "one more learned matrix maps those back to {hidden_size}. This is also the only "
-        "point at which heads can influence each other. The captured tensor here is the "
-        "output *after* that projection — it is not the per-head mix, and it is not "
-        "A @ V.",
+        "Combining the heads",
+        "Every head's result is laid side by side and one learned matrix maps them back to "
+        "{hidden_size_text} features — the only point at which heads combine.",
         formula="Z_joined = concat(Z_h)            O = Z_joined W_Oᵀ",
         terms=("attention_output", "=", "Z_joined", "@", "W_O"),
         variables=("Z_joined", "W_O", "attention_output"),
-        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL),
+        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         topic="block",
+        action="join the heads · multiply by W_O",
+        inputs=("Z_joined",),
+        outputs=("attention_output",),
+        takeaway="O does not replace X: it is added to it, which is the next operation.",
+        note="O is captured after this projection. It is not A @ V, and it is not the "
+             "joined heads — neither of those was kept.",
     ),
     Operation(
         "block", 10, "Residual and feed-forward",
-        "Finishing one layer",
-        "The attention block's output is added to what came into the layer, rather than "
-        "replacing it. The sum is normalized again and passed through the feed-forward "
-        "network — learned nonlinear processing of each position on its own, gated in this "
-        "model — and that result is added back in turn. The layer's output was captured; "
-        "the residual sums and everything inside the feed-forward network were not.",
+        "Add, refine, add again",
+        "The attention result is added to the layer's input, then a feed-forward network "
+        "refines each position on its own and its result is added in turn.",
         formula="H = X + O            F = {ffn_description}            X_next = H + F",
         terms=("layer_output", "=", "H", "+", "F"),
         variables=("layer_input", "attention_output", "H", "H_norm", "W_gate", "W_up",
                    "W_down", "F", "layer_output"),
-        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL),
+        tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         check="block",
         topic="block",
+        action="add O · feed-forward · add F",
+        inputs=("layer_input", "attention_output"),
+        outputs=("layer_output",),
+        takeaway="X_next is the next layer's X: operations 4 to 10 run again with that "
+                 "layer's own learned parameters.",
+        note="Attention moved information between positions. The feed-forward network works "
+             "on each position separately, and its gate is a nonlinearity, which lets it "
+             "compute combinations of features that no single matrix multiplication can.",
     ),
     Operation(
         "layers", 11, "The remaining layers",
         "That completed one layer of {layer_count}",
-        "X_next is the next layer's X, and the whole of operations 4 to 10 happens again "
-        "with a different set of learned parameters — nothing is shared between layers. "
-        "The {position_count} token positions stay separate rows throughout: attention is "
-        "the only step that moves anything between them. Every one of the "
-        "{remaining_layer_count} other layers was captured in full and is listed below.",
+        "Operations 4 to 10 repeat once per layer, {layer_count} times in all, each with its "
+        "own learned parameters, and the token positions stay separate rows throughout.",
         formula="X → layer 0 → layer 1 → … → "
                 "layer {remaining_layer_count} → X_final",
         variables=("layer_output",),
-        tiers=(EVIDENCE_OBSERVED,),
+        tiers=(EVIDENCE_OBSERVED, EVIDENCE_DERIVED),
         topic="heads",
+        action="repeat operations 4–10 once per layer",
+        inputs=("layer_input",),
+        outputs=("layer_output",),
+        takeaway="After the last layer, one position's row is turned into a score for every "
+                 "vocabulary entry.",
     ),
     Operation(
         "decide", 12, "The token decision",
         "Choosing the first generated token",
-        "After the last layer, attention is finished and only one position matters: the "
-        "final prompt position, because it is the only one whose next token has not been "
-        "written yet. Its vector is normalized once more and compared against every "
-        "vocabulary entry, giving one score per entry. The generation code then applies the "
-        "recorded selection rule — {decoding_rule} — to those scores.",
+        "After the last layer, the final prompt position's row is normalized once more and "
+        "scored against every vocabulary entry, and the first token is picked from those "
+        "scores.",
         formula="logits = RMSNorm(X_final[{position_count}−1]) W_Uᵀ        "
                 "selected_token_id = argmax(logits)",
         terms=("final_logits", "→ argmax →", "selected token ID"),
@@ -1325,6 +1413,13 @@ NOTEBOOK_OPERATIONS = [
         tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
         check="decide",
         topic="vocabulary",
+        action="final norm · score every entry · pick the highest",
+        inputs=("layer_output",),
+        outputs=("final_logits",),
+        takeaway="That token is appended to the text, and the same calculation runs again "
+                 "for the next one.",
+        note="A logit is a score, not a probability. Nothing here was passed through "
+             "softmax, and the highest score wins without one.",
     ),
 ]
 
@@ -1338,12 +1433,9 @@ OPERATION_ORDER = [operation.key for operation in NOTEBOOK_OPERATIONS]
 CONTINUATION = Operation(
     "continuation", 0, "The rest of the answer",
     "What happened after that token",
-    "The calculation above produced one token. {continuation_summary} Each later step ran "
-    "the same layers with the same learned parameters over the text so far, and reused the "
-    "keys and values already computed for earlier positions rather than recalculating the "
-    "prompt. Detailed layer tensors were captured for the prompt pass and the first "
-    "generated-token pass only; for the later steps this run kept the candidate scores and "
-    "nothing else.",
+    "{continuation_summary} Each later step processed only the newest token, reusing the "
+    "same learned parameters and the keys and values already computed for earlier "
+    "positions.",
     variables=("final_logits",),
     tiers=(EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED, EVIDENCE_DERIVED, EVIDENCE_CONCEPTUAL),
     topic="stopping",
@@ -1352,6 +1444,276 @@ CONTINUATION = Operation(
 assert len(NOTEBOOK_OPERATIONS) == 12, len(NOTEBOOK_OPERATIONS)
 assert len(OPERATION_INDEX) == 12, "duplicate operation key"
 assert [operation.number for operation in NOTEBOOK_OPERATIONS] == list(range(1, 13))
+
+
+# ── Chapters ────────────────────────────────────────────────────────────────────
+# Four chapters over the same thirteen anchors.  They are a way of reading the page, not
+# a way of moving around it: the shell shows where the reader is in them and the page
+# marks where each begins, but nothing navigates by chapter -- the contents menu groups
+# its sections under these titles and that is all.  A second navigation system is exactly
+# what the redesign set out to remove.
+
+@dataclass(frozen=True)
+class Chapter:
+    key: str
+    title: str
+    summary: str
+    sections: tuple
+
+
+CHAPTERS = [
+    Chapter("represent", "Represent the input",
+            "Text becomes token IDs, IDs become vectors, and the vectors are stacked into "
+            "one tensor.",
+            ("input", "embed", "shape")),
+    Chapter("exchange", "Exchange information",
+            "Inside one layer, each position gathers information from the positions before "
+            "it.",
+            ("norm", "project", "prepare", "scores", "mix", "join")),
+    Chapter("refine", "Refine the representation",
+            "Each position is refined on its own, and the layer repeats with new "
+            "parameters.",
+            ("block", "layers")),
+    Chapter("select", "Select a token",
+            "The final position's row becomes a score for every vocabulary entry, and the "
+            "answer is built one token at a time.",
+            ("decide", "continuation")),
+]
+
+CHAPTER_OF = {key: chapter for chapter in CHAPTERS for key in chapter.sections}
+
+assert [key for chapter in CHAPTERS for key in chapter.sections] == \
+    OPERATION_ORDER + [CONTINUATION.key], "chapters must cover the page in order"
+
+
+# ── Captions used by the notebook's operation bodies ───────────────────────────────
+# Kept here so no widget carries copy of its own.  Most format against learn_facts();
+# the few that need a value only the builder has (a weight, a count of keys) declare those
+# extra fields in NOTEBOOK_TEXT_FIELDS, and the self-test fills them with zeros so every
+# line is checked against every run anyway.
+
+NOTEBOOK_TEXT = {
+    # The destination card at the top of the page.
+    "destination_asked": "YOU ASKED",
+    "destination_answered": "THE MODEL ANSWERED",
+    "destination_follow":
+        "This page follows the calculation that chose the first token of that answer, "
+        "{first_token_text}. To watch one row change from step to step it follows one "
+        "prompt position, {focus_token_text} at position {focus_position}, among the "
+        "{position_count} the model processed together. Choose another with the "
+        "Following control.",
+    "destination_unaligned":
+        "To watch one row change from step to step, this page follows the last prompt "
+        "position, {focus_position}, among the {position_count} the model processed "
+        "together. Choose another with the Following control.",
+
+    # The three-part line every operation opens with.
+    "io_in": "IN",
+    "io_does": "DOES",
+    "io_out": "OUT",
+    "takeaway_prefix": "NEXT",
+    "kept_captured": "Captured here: {names}",
+    "kept_described": "Described, not shown: {names}",
+
+    # Op 1.
+    "control_markers":
+        "Spellings written <|like this|> are control markers added by the chat template.",
+    "template_position":
+        "You did not type this one. The chat template adds markers like it to say whose "
+        "turn it is.",
+    "focus_hint": "Choose a token to follow it through the operations below.",
+
+    # Followed-feature samples, ops 2, 4, 9 and 10.
+    "tracked_features_caption":
+        "the {count} features of position {position}'s layer input with the largest "
+        "magnitude, followed through this layer",
+    "tracked_features_note":
+        "Chosen for display by size, at this layer's input, so the same coordinates can be "
+        "watched from operation to operation. TensorScope picked them; the model did not.",
+    "rounded_values":
+        "Values are rounded for reading. Hover over one for the exact stored number, or "
+        "open the variable for the whole array.",
+
+    # Op 3.
+    "row_highlight":
+        "The highlighted row is the position you are following. The other rows are the "
+        "other positions, computed alongside it.",
+
+    # Op 5 / 6.
+    "projection_widths":
+        "K_raw = X_norm W_Kᵀ and V_raw = X_norm W_Vᵀ work the same way with their own "
+        "learned matrices, and come out narrower — {kv_projection_width_text} features — "
+        "because each of their heads is shared by several query heads.",
+    "head_width_decoupled":
+        "In this model {query_head_count_text} heads × {head_dim_text} features is "
+        "{q_projection_width_text}, not the model width of {hidden_size_text}: a head's "
+        "width is its own setting, read here off the captured tensors.",
+    "kv_sharing":
+        "This model has {query_head_count_text} query heads but only {kv_head_count_text} "
+        "key/value heads, so each key/value head is copied out to {kv_group_size} query "
+        "heads. The captured K and V already have {query_head_count_text} heads.",
+    "rotation_unrecorded":
+        "The captured Q and K are after the rotation by position, and after any per-head "
+        "normalization this architecture applies. A saved run holds no model "
+        "configuration, so the reference page describes those steps rather than this one.",
+    "head_slice_caption": "first {count} features of head {head}, position {position}",
+
+    # Op 7.
+    "mask_caption":
+        "Click a cell to choose a query row and a key column. Blocked cells had a large "
+        "negative number added to their score before softmax.",
+    "compare_caption":
+        "The query row and key row behind the selected cell. Their dot product, scaled, is "
+        "that cell's score.",
+    "cached_keys":
+        "This pass has one query and {cached_key_count} keys: the earlier positions' keys "
+        "were reused from the cache, which is why the matrix is one row tall.",
+    "bars_caption":
+        "Head {head}, query position {query}: the {count} keys with the most weight, in "
+        "position order. Score above, the weight softmax gave it below.",
+    "bars_caption_all":
+        "Head {head}, query position {query}: every key it may read. Score above, the "
+        "weight softmax gave it below.",
+    "weight_share": "≈{percent} of this head's mixing weight for this query",
+    "heaviest_key":
+        "The heaviest key is position {key} ({spelling}): weight {weight} — approximately "
+        "{percent} of this head's mixing weight for this query.",
+    "weight_row_total": "the whole weight row added up",
+    "scores_scaled_masked":
+        "The scale {attention_scale_text} and the mask are already inside the captured "
+        "scores: they are exactly what softmax received.",
+    "head_grid_title": "Show every query and key for head {head}",
+    "explorer_title": "Open the full attention explorer for this layer",
+
+    # Op 8.
+    "mix_weights_caption":
+        "the {count} largest weights in head {head}'s row for query position {query}",
+    "mix_values_caption":
+        "feature 0 of each of those positions' value vectors, head {head}",
+    "mix_products_caption": "each weight times its value",
+    "mix_remainder": "the other {count} positions together",
+    "mix_total_caption": "every product added up: feature 0 of head {head}'s output",
+    "mix_step_weights": "The weights this head gave",
+    "mix_step_weights_body":
+        "One weight per position this query may read; they add up to 1, so what follows "
+        "is an average. Only the largest are shown separately.",
+    "mix_step_values": "The values it is choosing between",
+    "mix_step_values_body":
+        "Each position contributes a whole vector of {head_dim} features. One feature is "
+        "followed here; the same arithmetic runs independently for every one of them.",
+    "mix_step_products": "Multiply each weight by its value",
+    "mix_step_products_body":
+        "A position with a large weight contributes most of its value; one with a weight "
+        "near zero contributes almost nothing.",
+    "mix_step_total": "Add them up",
+    "mix_step_total_body":
+        "The shown products plus the remainder are the whole sum. The result is one "
+        "number of the head's output for this position.",
+
+    # Op 9.
+    "join_shape_caption":
+        "The joined heads were not kept, so their width here comes from the captured "
+        "tensors on either side: {q_projection_width_text} features in, "
+        "{hidden_size_text} out.",
+    "join_side_by_side":
+        "X (what entered the layer) and O (what attention proposes adding), at the same "
+        "features. The next operation adds them; that sum was not captured.",
+
+    # Op 10.
+    "residual_caption":
+        "Each branch proposes a change; the input travels around it on the bypass and is "
+        "added back. The first sum, H, was not captured. The second is X_next, the "
+        "layer's captured output.",
+    "scope_caption":
+        "Attention reads across positions. The feed-forward network reads one position at "
+        "a time.",
+    "layer_out_caption":
+        "X_next at the same features: this layer's output, and the next layer's X.",
+
+    # Op 11.
+    "layer_table_caption":
+        "One row per layer, for the position you are following. Click a row to point the "
+        "operations above at that layer.",
+    "layer_table_note":
+        "Most-attended position is where this position's attention weight went, averaged "
+        "over the {query_head_count_text} heads; the feature is the largest-magnitude "
+        "coordinate of that layer's output. Both are picked out for display — rankings of "
+        "captured values, not values the model reported.",
+    "layer_shapes_title": "Stored tensors and their shapes (the same for every layer)",
+    "layer_stack_caption":
+        "The highlighted layer is the one the operations above are describing.",
+
+    # Op 12.
+    "decision_chain_caption":
+        "Solid steps were captured. Dashed steps happened in the model and were not kept.",
+    "projection_caption": "Only the final position's score row was stored.",
+    "focus_shift":
+        "Until now this page followed position {focus_position}, {focus_token_text}. The "
+        "next token is chosen at the final prompt position, {final_position} "
+        "({final_token_text}), because it is the last one: its row after the final layer "
+        "is the one turned into vocabulary scores. Position {focus_position} was computed "
+        "through every layer too, but its row did not make this choice.",
+    "focus_is_final":
+        "The position this page has been following, {final_position} "
+        "({final_token_text}), is the final prompt position: its row after the final "
+        "layer is the one turned into vocabulary scores.",
+    "follow_final": "Follow position {final_position} instead",
+    "score_count": "The final position's score vector holds {count} numbers, one per "
+                   "vocabulary entry.",
+    "selected_line":
+        "selected_token_id = argmax(logits) = {token_id}, which decodes to {token}.",
+    "margin_line":
+        "It leads the runner-up by ≈{margin} — a difference in score, not in probability.",
+
+    # The continuation.
+    "answer_heading": "THE ANSWER — SELECT ANY TOKEN",
+    "timeline_heading": "ONE PASS PER TOKEN",
+    "timeline_first": "Process the prompt → select token 1, {token}",
+    "timeline_next": "Process token {previous} with cached context → select token {number}, "
+                     "{token}",
+    "timeline_stop": "Process token {previous} with cached context → the stopping marker "
+                     "won, and was not emitted",
+    "timeline_layers_saved": "layer tensors saved",
+    "timeline_layers_not_saved": "no layer tensors",
+    "timeline_full_vector": "full vocabulary scores saved",
+    "timeline_leading": "leading candidate scores saved",
+    "timeline_not_recorded": "candidate scores not recorded",
+    "timeline_show_all": "Show all {count} passes",
+    "timeline_show_fewer": "Show fewer passes",
+    "kv_reuse":
+        "Every pass uses the same learned parameters. After the first, each pass computes "
+        "only the newest token's row and reuses the keys and values already computed for "
+        "earlier positions; it does not recompute the prompt.",
+    "phase_toggle_on": "Show the first generated-token pass in operations 4–11",
+    "phase_toggle_off": "Back to the prompt pass",
+    "phase_toggle_note":
+        "Only two passes kept their layer tensors: the prompt pass, and the pass that "
+        "processed the first generated token.",
+}
+
+# Fields a NOTEBOOK_TEXT entry needs beyond learn_facts(), supplied by its builder.
+NOTEBOOK_TEXT_FIELDS = {
+    "kept_captured": ("names",),
+    "kept_described": ("names",),
+    "tracked_features_caption": ("count", "position"),
+    "head_slice_caption": ("count", "head", "position"),
+    "bars_caption": ("head", "query", "count"),
+    "heaviest_key": ("key", "spelling", "weight", "percent"),
+    "bars_caption_all": ("head", "query"),
+    "weight_share": ("percent",),
+    "head_grid_title": ("head",),
+    "mix_weights_caption": ("count", "head", "query"),
+    "mix_values_caption": ("head",),
+    "mix_remainder": ("count",),
+    "mix_total_caption": ("head",),
+    "score_count": ("count",),
+    "selected_line": ("token_id", "token"),
+    "margin_line": ("margin",),
+    "timeline_first": ("token",),
+    "timeline_next": ("previous", "number", "token"),
+    "timeline_stop": ("previous",),
+    "timeline_show_all": ("count",),
+}
 
 
 # ── Optional checks ─────────────────────────────────────────────────────────────
@@ -1542,6 +1904,41 @@ def learn_facts(capture: Any) -> dict[str, Any]:
                 break
     stop_logit = metadata.get("stop_token_logit")
 
+    # The position the notebook follows, and the one that actually chose the token.  The
+    # decision section has to name both, and say which is which, whenever they differ.
+    focus = default_focus_position(getattr(capture, "prompt", ""), prompt_tokens)
+    final = max(prompt_count - 1, 0)
+
+    def spelled(index: int) -> str:
+        return repr(readable_spelling(prompt_tokens[index])) if 0 <= index < len(prompt_tokens) else "''"
+
+    emitted = list(getattr(capture, "tokens", None) or [])
+    response = str(getattr(capture, "response", "") or "").strip()
+    # The first sentence of the answer, so the page can open on where it is going.  Cut at
+    # a word boundary and marked as cut, never silently shortened.
+    excerpt = response
+    for stop in (". ", "! ", "? ", "\n"):
+        cut = excerpt.find(stop)
+        if 0 < cut < len(excerpt) - 1:
+            excerpt = excerpt[:cut + 1].strip()
+    if len(excerpt) > 160:
+        excerpt = excerpt[:160].rsplit(" ", 1)[0] + "…"
+    elif len(excerpt) < len(response):
+        excerpt = excerpt + " …"
+
+    decoding = metadata.get("decoding")
+    if decoding == "greedy":
+        rule = ("This run used greedy decoding: the entry with the highest score is "
+                "selected, with no sampling.")
+    elif decoding:
+        rule = f"This run recorded its selection rule as {decoding!r}."
+    elif logits is not None:
+        rule = ("This run does not record its selection rule, but its stored score vector "
+                "peaks at exactly the token it emitted.")
+    else:
+        rule = ("This run records neither its selection rule nor its score vector; only "
+                "the emitted token is known.")
+
     return {
         "model": capture.metadata.get("model", "an open-weight model"),
         "layer_count": len(capture.layers),
@@ -1630,5 +2027,24 @@ def learn_facts(capture: Any) -> dict[str, Any]:
         "ffn_description": "down(silu(gate(x)) ⊙ up(x))",
         "ffn_interior_note": ("The feed-forward interior width is not recorded in this "
                               "capture: no activation from inside the MLP was retained."),
+
+        # ── The reader's destination and the position they follow ───────────────
+        "prompt_text": repr(str(getattr(capture, "prompt", "") or "")),
+        "response_excerpt": excerpt or "(an empty response)",
+        "first_token_text": repr(emitted[0]) if emitted else "no token",
+        "first_token_id": int(capture.token_ids[0]) if capture.token_ids else 0,
+        "focus_position": focus,
+        "focus_token_text": spelled(focus),
+        "final_position": final,
+        "final_token_text": spelled(final),
+        "focus_is_final": focus == final,
+        # Qwen3 sets the head width independently of hidden_size / heads, so copy that
+        # explains the head split must not assume they agree.
+        "head_width_decoupled": bool(geometry["q_projection_width"]
+                                     and embedding is not None
+                                     and geometry["q_projection_width"] != int(embedding.shape[-1])),
+        "selection_rule_sentence": rule,
+        "trace_known": bool(trace),
+        "decoding_known": bool(decoding),
         **geometry,
     }

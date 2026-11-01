@@ -12,23 +12,28 @@ views import it while it is still importing them.
 from __future__ import annotations
 
 import html
+import math
 import os
+from contextlib import contextmanager
 
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QPoint, QSize, Qt, QVariantAnimation, pyqtSignal
+from PyQt5.QtCore import (
+    QCoreApplication, QEvent, QPoint, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal,
+)
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QAction, QActionGroup, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+    QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from tensor_widgets import exact_scalar
 from tensorscope_content import (
     EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
-    EVIDENCE_UNATTESTED, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE, readable_spelling,
+    EVIDENCE_UNATTESTED, NOTEBOOK_TEXT, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE,
+    readable_spelling,
 )
 
 
@@ -134,6 +139,36 @@ def chip_text(token: str, limit: int = 18) -> str:
     if not text.strip():
         text = '␠' * min(len(text), limit)   # visible stand-in for pure whitespace
     return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
+# ── Rounded numbers for reading ──────────────────────────────────────────────
+# The teaching view shows a value the way a person reads it -- three significant figures,
+# marked with ≈ -- and keeps the exact stored digits one hover away.  These return text and
+# nothing else: the array a value came from is never touched, and the variable panel and
+# the full inspector go on showing `exact_scalar` digits.
+
+def approx(value, digits: int = 3) -> str:
+    """'≈0.252' for 0.251953125.  Integers and non-finite values are shown as they are."""
+    if isinstance(value, (int, np.integer)):
+        return f'{int(value):,}'
+    number = float(value)
+    if not math.isfinite(number):
+        return str(number)
+    if number == 0:
+        return '0'
+    if abs(number) >= 1000:
+        return f'≈{number:,.0f}'
+    return f'≈{number:.{digits}g}'
+
+
+def approx_share(weight) -> str:
+    """An attention weight as a share of one head's mixing weight -- never of anything else.
+
+    Only attention weights may be read as percentages: they are one head's softmax output
+    for one query, so they sum to 1 by construction.  Logits are scores and must not pass
+    through here.
+    """
+    return NOTEBOOK_TEXT['weight_share'].format(percent=f'{float(weight) * 100:.1f}%')
 
 
 def token_labels(capture, generated=False, keys=False):
@@ -288,6 +323,20 @@ class RoleLegend(QWidget):
         return ['colour key'] + list(self._spoken)
 
 
+def badged(badge: QWidget, text: str) -> QWidget:
+    """A badge followed by a sentence that may wrap -- unlike `badge_row`, which would
+    squeeze the sentence into a narrow column beside its trailing stretch."""
+    holder = QWidget()
+    row = QHBoxLayout(holder)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    row.addWidget(badge, 0, Qt.AlignTop)
+    words = label(text, muted=True, small=True)
+    row.addWidget(words, 1)
+    holder.words = words
+    return holder
+
+
 def badge_row(*badges: QWidget) -> QWidget:
     """Lay badges out left to right without letting them stretch."""
     holder = QWidget()
@@ -303,7 +352,7 @@ def badge_row(*badges: QWidget) -> QWidget:
 # ── Visual component: pipeline flow navigator ────────────────────────────────
 
 class PipelineNavigator(QWidget):
-    """Horizontal clickable pipeline showing the stages of the active view.
+    """Vestigial: the shell no longer uses this (see CLAUDE.md). Horizontal clickable pipeline showing the stages of the active view.
 
     The stage list is a constructor argument rather than a class constant: three views
     now present different journeys through the same capture.
@@ -642,7 +691,7 @@ class Disclosure(QWidget):
 # ── Phase badge ───────────────────────────────────────────────────────────────
 
 class PhaseBadge(QLabel):
-    """Coloured badge showing which captured phase is being viewed.
+    """Vestigial: the shell no longer uses this (see CLAUDE.md). Coloured badge showing which captured phase is being viewed.
 
     Known limitation: these two colour pairs are tuned for the dark palette only.
     """
@@ -683,13 +732,21 @@ def token_table(capture):
 
 
 def read_only_table(headings, rows, *, stretch: int | None = None,
-                    highlight: int | None = None, highlight_color: str = '#0e9f6e'):
-    """A small non-editable table.  Used for candidate scores and provenance."""
+                    highlight: int | None = None, highlight_color: str = '#0e9f6e',
+                    tooltips=None):
+    """A small non-editable table.  Used for candidate scores and provenance.
+
+    `tooltips`, when given, is parallel to `rows`: a rounded cell can carry its exact value.
+    """
     table = QTableWidget(len(rows), len(headings))
     table.setHorizontalHeaderLabels(list(headings))
     for row_index, row in enumerate(rows):
         for column, value in enumerate(row):
             item = QTableWidgetItem(str(value))
+            if tooltips is not None and row_index < len(tooltips):
+                tip = tooltips[row_index][column] if column < len(tooltips[row_index]) else ''
+                if tip:
+                    item.setToolTip(tip)
             if row_index == highlight:
                 item.setForeground(QBrush(QColor(highlight_color)))
             table.setItem(row_index, column, item)
@@ -911,10 +968,12 @@ class PredictCheck(QFrame):
 class AnnotatedValueRow(QWidget):
     """A few real values with a label over each and one evidence badge for the row.
 
-    Values are formatted with `exact_scalar`, so a number here reads identically to the
-    same cell in `TensorInspector`.  This widget never slices an array itself: the caller
-    passes exactly the values it means to show, which keeps the sampling decision visible
-    in the screen code rather than hidden in a widget.
+    The caller passes exactly the values it means to show, which keeps the sampling decision
+    visible in the screen code rather than hidden in a widget.  `formatter` decides how a
+    value *reads* -- `approx` in the teaching view, `exact_scalar` in the variable panel --
+    and whatever it is, every box carries the exact stored digits as its tooltip, so rounding
+    for reading never stands between the reader and the real number.  `details` adds one
+    short line under a value, such as its share of a weight row.
     """
 
     MAX_BOXES = 8
@@ -922,35 +981,49 @@ class AnnotatedValueRow(QWidget):
 
     def __init__(self, values, *, labels=None, indices=None, caption: str = '',
                  kind: str = EVIDENCE_OBSERVED, note: str = '', total: int | None = None,
-                 formatter=None, parent=None):
+                 formatter=None, details=None, max_boxes: int | None = None,
+                 columns: int | None = None, parent=None):
         super().__init__(parent)
         everything = list(values)
-        shown = everything[:self.MAX_BOXES]
+        limit = self.MAX_BOXES if max_boxes is None else int(max_boxes)
+        shown = everything[:limit]
         names = list(labels) if labels is not None else [
             f'index {i}' for i in (list(indices) if indices is not None else range(len(shown)))]
+        extra = list(details or [])
         render = formatter or exact_scalar
+        per_row = int(columns or self.COLUMNS)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 2, 0, 2)
         outer.setSpacing(4)
+        # The badge heads the row, beside its caption, so the values themselves line up in
+        # whole rows rather than wrapping around it.
+        heading = QHBoxLayout()
+        heading.setContentsMargins(0, 0, 0, 0)
+        heading.setSpacing(8)
+        heading.addWidget(EvidenceBadge(kind, note), 0, Qt.AlignVCenter)
         if caption:
-            outer.addWidget(label(caption, muted=True, small=True))
+            heading.addWidget(label(caption, muted=True, small=True), 1)
+        else:
+            heading.addStretch(1)
+        outer.addLayout(heading)
         grid_holder = QWidget()
         grid = QGridLayout(grid_holder)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(6)
-        grid.addWidget(EvidenceBadge(kind, note), 0, 0, Qt.AlignLeft | Qt.AlignVCenter)
         for position, value in enumerate(shown):
-            cell = position + 1
-            grid.addWidget(self._box(names[position] if position < len(names) else '', render(value)),
-                           cell // self.COLUMNS, cell % self.COLUMNS)
-        grid.setColumnStretch(self.COLUMNS, 1)
+            grid.addWidget(self._box(names[position] if position < len(names) else '',
+                                     render(value), exact_scalar(value),
+                                     extra[position] if position < len(extra) else ''),
+                           position // per_row, position % per_row)
+        grid.setColumnStretch(per_row, 1)
         outer.addWidget(grid_holder)
         hidden = (total if total is not None else len(everything)) - len(shown)
         if hidden > 0:
-            outer.addWidget(label(f'… {hidden} more in the saved tensor', muted=True, small=True))
+            outer.addWidget(label(f'… {hidden:,} more in the saved tensor', muted=True,
+                                  small=True))
 
-    def _box(self, name: str, text: str) -> QWidget:
+    def _box(self, name: str, text: str, exact: str = '', detail: str = '') -> QWidget:
         box = QFrame()
         box.setObjectName('valueBox')
         inner = QVBoxLayout(box)
@@ -963,6 +1036,11 @@ class AnnotatedValueRow(QWidget):
         value.setWordWrap(False)
         inner.addWidget(heading)
         inner.addWidget(value)
+        if detail:
+            inner.addWidget(label(detail, muted=True, small=True))
+        if exact:
+            box.setToolTip(f'Exact stored value: {exact}')
+            value.setToolTip(box.toolTip())
         return box
 
 
@@ -986,10 +1064,12 @@ class ResponseTextView(QWidget):
 
     selected = pyqtSignal(int)
 
-    def __init__(self, tokens, response: str, *, selected: int = 0, parent=None):
+    def __init__(self, tokens, response: str, *, selected: int = 0, ink: str | None = None,
+                 parent=None):
         super().__init__(parent)
         self._tokens = list(tokens)
         self._response = response or ''
+        self._ink = ink
         self._current = max(0, min(int(selected), max(0, len(self._tokens) - 1)))
         # Outer whitespace is trimmed from a stored response but not from its tokens; that
         # alone is not a disagreement about the text.
@@ -1067,6 +1147,11 @@ class ResponseTextView(QWidget):
             return
         pieces = []
         colour, tint = CHROME['accent'], CHROME['accent_tint']
+        # Explicit, because Qt's rich text does not honour `color: inherit` on an anchor and
+        # falls back to the link colour, which reads as greyed-out text on either palette.
+        # Before the widget is polished its palette is Qt's default, black, so the caller's
+        # theme colour wins whenever it is given.
+        ink = self._ink or self._label.palette().windowText().color().name()
         for index, token in enumerate(self._tokens):
             # Verbatim: these are decoded text, not BPE spellings.  See the class docstring.
             text = html.escape(token).replace('\n', '<br>') or '&nbsp;'
@@ -1074,7 +1159,7 @@ class ResponseTextView(QWidget):
                 # An anchor around nothing but a line break has no width to click.
                 text = '↵' + text
             style = (f"text-decoration: none; border-bottom: 1px dotted {CHROME['muted']}; "
-                     'color: inherit;')
+                     f'color: {ink};')
             if index == self._current:
                 style += f' background: {tint}; border-bottom: 1px solid {colour};'
             pieces.append(f'<a href="t:{index}" style="{style}">{text}</a>')
@@ -1163,7 +1248,7 @@ class StageStack(QStackedWidget):
 
 
 class StageProgress(QWidget):
-    """Where the reader is in whatever list of stages the active view declares.
+    """Vestigial: the shell no longer uses this (see CLAUDE.md). Where the reader is in whatever list of stages the active view declares.
 
     Count-driven, so it needs no knowledge of which view is showing: the pill count comes
     from the view's own NAV and the noun from the view itself.
@@ -1203,6 +1288,225 @@ class StageProgress(QWidget):
         self.setVisible(bool(total))
 
 
+# ── The reading bar's three controls ──────────────────────────────────────────────
+# Where the reader is, a compact contents menu, and (in the shell) Previous/Next.  These
+# replace the pipeline chips, the sidebar list, the breadcrumb and the progress pills, which
+# were four views of the same list competing for the top of the window.
+
+class ChapterProgress(QWidget):
+    """Which chapter the reader is in, and where in the page's sections.
+
+    Not clickable: chapters are a way of reading the page, not a way of moving around it.
+    The pills are one per chapter, so four of them describe thirteen sections without
+    becoming a second navigator.  A page without chapters shows the caption alone.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('chapterProgress')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self._pill_holder = QWidget()
+        self._pill_holder.setAttribute(Qt.WA_TranslucentBackground)
+        self._pill_holder.setStyleSheet('background: transparent;')
+        self._pill_row = QHBoxLayout(self._pill_holder)
+        self._pill_row.setContentsMargins(0, 0, 0, 0)
+        self._pill_row.setSpacing(3)
+        row.addWidget(self._pill_holder)
+        self._caption = label('', small=True)
+        self._caption.setWordWrap(False)
+        row.addWidget(self._caption)
+        row.addStretch(1)
+        self._chapters: list = []
+        self._pills: list[QFrame] = []
+
+    def set_chapters(self, chapters) -> None:
+        """`chapters` is a list of (title, section keys), or None for a plain list."""
+        self._chapters = [(str(title), tuple(keys)) for title, keys in (chapters or [])]
+        clear_layout(self._pill_row)
+        self._pills = []
+        for title, _keys in self._chapters:
+            pill = QFrame()
+            pill.setObjectName('chapterPill')
+            pill.setFixedSize(QSize(26, 5))
+            pill.setToolTip(title)
+            self._pill_row.addWidget(pill)
+            self._pills.append(pill)
+        self._pill_holder.setVisible(bool(self._pills))
+
+    def chapter_of(self, key: str):
+        for index, (_title, keys) in enumerate(self._chapters):
+            if key in keys:
+                return index
+        return None
+
+    def set_position(self, key: str, where: str) -> None:
+        """Mark `key`'s chapter and write `where` -- e.g. "Operation 7 of 12"."""
+        chapter = self.chapter_of(key)
+        reached, ahead = CHROME['accent'], CHROME['ahead']
+        for index, pill in enumerate(self._pills):
+            filled = chapter is not None and index <= chapter
+            pill.setStyleSheet(f'background: {reached if filled else ahead}; '
+                               'border-radius: 2px;')
+        if chapter is not None:
+            self._caption.setText(f'{self._chapters[chapter][0]}  ·  {where}')
+        else:
+            self._caption.setText(where)
+
+    def text(self) -> str:
+        return self._caption.text()
+
+
+class ContentsButton(QToolButton):
+    """Every section of the page, in one menu, grouped under its chapter.
+
+    The detailed navigation lives here rather than in a permanent sidebar.  set_sections
+    is safe to call on every mode switch: QMenu.clear() deletes the actions the menu owns
+    immediately, so no stale entry can survive to navigate to a key the live page lacks.
+    """
+
+    navigate = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('contentsButton')
+        self.setText('Contents')
+        self.setAccessibleName('Contents')
+        self.setToolTip('Jump to any section of this page.')
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._menu = QMenu(self)
+        self.setMenu(self._menu)
+        self._group = None
+        self.actions_by_key: dict = {}
+
+    def set_sections(self, nav, chapters=None) -> None:
+        self._menu.clear()
+        if self._group is not None:
+            self._group.setParent(None)
+            self._group.deleteLater()
+        self._group = QActionGroup(self._menu)
+        self._group.setExclusive(True)
+        self.actions_by_key = {}
+        names = dict(nav)
+        numbers = {key: index + 1 for index, (key, _) in enumerate(nav)}
+        groups = [(title, [key for key in keys if key in names])
+                  for title, keys in (chapters or [])] or [('', [key for key, _ in nav])]
+        for title, keys in groups:
+            if title:
+                self._menu.addSection(title)
+            for key in keys:
+                action = QAction(f'{numbers[key]:02}   {names[key]}', self._menu)
+                action.setCheckable(True)
+                action.triggered.connect(lambda _=False, k=key: self.navigate.emit(k))
+                self._group.addAction(action)
+                self._menu.addAction(action)
+                self.actions_by_key[key] = action
+
+    def set_current(self, key: str) -> None:
+        action = self.actions_by_key.get(key)
+        if action is not None:
+            action.setChecked(True)
+
+    def section_actions(self) -> list:
+        return [action for action in self._menu.actions() if not action.isSeparator()]
+
+
+class PassTimeline(QWidget):
+    """One row per forward pass of the generation loop, and what each one kept.
+
+    Rows are buttons, not a table: a reader clicks a pass to see its decision, and the
+    candidate-table helpers in the tests read tables with a "Token ID" column, which this
+    must never be mistaken for.  Long runs collapse to the first two passes, the selected
+    one and the last, behind a toggle -- the two that kept layer tensors are always shown.
+    """
+
+    selected = pyqtSignal(int)
+    ALWAYS_SHOWN = 2
+
+    def __init__(self, rows, *, show_all_text: str = '', show_fewer_text: str = '',
+                 selected: int = 0, parent=None):
+        super().__init__(parent)
+        self.setObjectName('passTimeline')
+        self._rows = list(rows)
+        self._buttons: list = []
+        self._lines: list = []
+        self._expanded = False
+        self._current = max(0, min(int(selected), max(0, len(self._rows) - 1)))
+        self._show_all = show_all_text or f'Show all {len(self._rows)} passes'
+        self._show_fewer = show_fewer_text or 'Show fewer passes'
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(3)
+        for index, row in enumerate(self._rows):
+            line = QWidget()
+            line.setObjectName('passRow')
+            layout = QHBoxLayout(line)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            button = QPushButton(row['title'])
+            button.setObjectName('passButton')
+            button.setCheckable(True)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setToolTip(row.get('detail', '') or row['title'])
+            button.clicked.connect(lambda _=False, i=index: self._clicked(i))
+            layout.addWidget(button, 1)
+            capabilities = label(row.get('capabilities', ''), muted=True, small=True)
+            capabilities.setWordWrap(False)
+            layout.addWidget(capabilities, 0)
+            if row.get('tier'):
+                layout.addWidget(EvidenceBadge(row['tier']), 0)
+            outer.addWidget(line)
+            self._buttons.append(button)
+            self._lines.append(line)
+        self.toggle_button = QPushButton(self._show_all)
+        self.toggle_button.setObjectName('revealControl')
+        self.toggle_button.clicked.connect(lambda: self.set_expanded(not self._expanded))
+        outer.addWidget(self.toggle_button, 0, Qt.AlignLeft)
+        self._sync()
+
+    def count(self) -> int:
+        return len(self._rows)
+
+    def row(self, index: int) -> dict:
+        return self._rows[index]
+
+    def current(self) -> int:
+        return self._current
+
+    def is_row_shown(self, index: int) -> bool:
+        return not self._lines[index].isHidden()
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = bool(expanded)
+        self._sync()
+
+    def select(self, index: int) -> None:
+        """Move the selection without emitting -- the caller already knows."""
+        if not self._rows:
+            return
+        self._current = max(0, min(int(index), len(self._rows) - 1))
+        self._sync()
+
+    def _clicked(self, index: int) -> None:
+        self.select(index)
+        self.selected.emit(self._current)
+
+    def _sync(self) -> None:
+        last = len(self._rows) - 1
+        for index, (button, line) in enumerate(zip(self._buttons, self._lines)):
+            button.setChecked(index == self._current)
+            shown = (self._expanded or index < self.ALWAYS_SHOWN or index == last
+                     or index == self._current)
+            line.setHidden(not shown)
+        collapsible = len(self._rows) > self.ALWAYS_SHOWN + 2
+        self.toggle_button.setVisible(collapsible)
+        self.toggle_button.setText(self._show_fewer if self._expanded else self._show_all)
+
+
 # ── A long page whose NAV entries are anchors, not replacements ──────────────────
 # The older views replaced the whole screen on every navigation, which is why a reader
 # could never see a calculation accumulate: the step they had just understood was gone.
@@ -1226,7 +1530,7 @@ class Section(QFrame):
     """
 
     def __init__(self, key: str, title: str, lede: str = '', *, number: str = '',
-                 build_body=None, parent=None):
+                 build_body=None, kicker: str = '', preface=None, parent=None):
         super().__init__(parent)
         self.key = key
         self.setObjectName('notebookSection')
@@ -1241,12 +1545,26 @@ class Section(QFrame):
         self._body = QVBoxLayout(self)
         self._body.setContentsMargins(22, 18, 22, 20)
         self._body.setSpacing(10)
+        # A preface sits above everything -- the notebook's destination card -- and a
+        # kicker names the chapter that begins here.  Both scroll with the section, so a
+        # chapter boundary is something the reader passes, not another control.
+        self.preface = preface
+        if preface is not None:
+            self._body.addWidget(preface)
+        self.kicker = None
+        if kicker:
+            self.kicker = label(kicker.upper(), small=True)
+            self.kicker.setObjectName('sectionKicker')
+            self._body.addWidget(self.kicker)
         heading = f'{number}   {title}' if number else title
         self.header = label(heading, title=True)
         self.header.setObjectName('sectionHeader')
         self._body.addWidget(self.header)
+        self.lede = None
         if lede:
-            self._body.addWidget(label(lede, rich=True))
+            self.lede = label(lede, rich=True)
+            self.lede.setObjectName('sectionLede')
+            self._body.addWidget(self.lede)
         self._body_slot = QVBoxLayout()
         self._body_slot.setContentsMargins(0, 0, 0, 0)
         self._body_slot.setSpacing(10)
@@ -1273,8 +1591,8 @@ class Section(QFrame):
         return widget
 
     def anchor(self) -> QWidget:
-        """What to scroll to: the header, so the title lands at the top of the viewport."""
-        return self.header
+        """What to scroll to: the first thing in the section, so it lands at the top."""
+        return self.preface or self.kicker or self.header
 
     # -- the reader's place --------------------------------------------------
 
@@ -1317,10 +1635,9 @@ class Section(QFrame):
 class AnchoredScrollPage(QWidget):
     """A scrolling page the shell's existing navigator drives by scrolling, not swapping.
 
-    The view contract is unchanged -- `NAV`, `stage_keys()`, `current_stage()`, `go_to()`,
-    `stage_changed`, `context_changed` -- so the sidebar list, the pipeline chips, the
-    progress pills and the footer Previous/Next buttons all keep working with no layout
-    code in the shell.  What changes is what `go_to` *means*: it moves the reader to a
+    The view contract -- `NAV`, `stage_keys()`, `current_stage()`, `go_to()`,
+    `stage_changed`, `context_changed` -- is all the shell's contents menu, chapter progress
+    and Previous/Next buttons need, with no layout code in the shell.  What changes is what `go_to` *means*: it moves the reader to a
     section instead of replacing the screen with it.
 
     Ordering inside `go_to` is deliberate.  The state change and its signal happen first
@@ -1385,14 +1702,67 @@ class AnchoredScrollPage(QWidget):
         self._header_slot.addWidget(widget)
         return widget
 
-    def add_side_panel(self, widget: QWidget, *, width: int = 330) -> QWidget:
-        """A panel beside the scrolling page, reader-resizable and collapsible."""
+    def add_side_panel(self, widget: QWidget, *, width: int = 330,
+                       hidden: bool = False) -> QWidget:
+        """A panel beside the scrolling page, reader-resizable and closable.
+
+        `hidden` starts it closed, so a panel with nothing to show yet does not take a
+        quarter of the window; `show_side_panel` opens it when there is something to say.
+        """
         self.split.addWidget(widget)
         self.split.setStretchFactor(self.split.count() - 1, 0)
-        self.split.setCollapsible(self.split.count() - 1, True)
-        widget.setMinimumWidth(200)
+        self.split.setCollapsible(self.split.count() - 1, False)
+        widget.setMinimumWidth(240)
+        self._side_width = width
+        self._side_panel = widget
         self.split.setSizes([900, width])
+        if hidden:
+            widget.hide()
         return widget
+
+    def side_panel_open(self) -> bool:
+        panel = getattr(self, '_side_panel', None)
+        return panel is not None and not panel.isHidden()
+
+    def show_side_panel(self) -> None:
+        panel = getattr(self, '_side_panel', None)
+        if panel is None or not panel.isHidden():
+            return
+        with self.preserve_place():
+            panel.show()
+            total = max(self.split.width(), self._side_width + 400)
+            self.split.setSizes([total - self._side_width, self._side_width])
+
+    def hide_side_panel(self) -> None:
+        panel = getattr(self, '_side_panel', None)
+        if panel is None or panel.isHidden():
+            return
+        with self.preserve_place():
+            panel.hide()
+
+    @contextmanager
+    def preserve_place(self):
+        """Keep the reader on the same line of the same section across a width change.
+
+        Opening or closing the side panel changes the page's width, every section reflows,
+        and the scroll offset that pointed at a line of operation 7 now points somewhere
+        else -- which `_track` would then report as a different section.  So the place is
+        recorded as (section, offset into it), the change happens with `_scrolling` set,
+        the layout is settled synchronously, and the same place is restored.
+        """
+        bar = self.scroll.verticalScrollBar()
+        section = self._sections.get(self._stage_key)
+        offset = bar.value() - section.y() if section is not None else None
+        was = self._scrolling
+        self._scrolling = True
+        try:
+            yield
+        finally:
+            QCoreApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+            self._page.activate()
+            if section is not None and offset is not None:
+                bar.setValue(section.y() + offset)
+            self._scrolling = was
 
     def add_section(self, section: Section) -> Section:
         self._sections[section.key] = section
@@ -1441,15 +1811,44 @@ class AnchoredScrollPage(QWidget):
         target.set_active(True)
         self.stage_changed.emit(key)
         self.context_changed.emit(self.context())
-        # Everything above is final.  What follows is presentation.
+        # Everything above is final.  What follows is presentation.  Sections built just
+        # now have only posted their layout requests, so their offsets are stale until the
+        # requests are delivered; a scroll computed before that lands short.
+        QCoreApplication.sendPostedEvents(None, QEvent.LayoutRequest)
         self._page.activate()
-        self._scrolling = True
-        try:
-            self.scroll.ensureWidgetVisible(target.anchor(), 0, 18)
-        finally:
-            self._scrolling = False
+        self._scroll_to(key)
+        # And once more after the event loop has settled any geometry the build above is
+        # still propagating -- the scroll area learns its new range a turn later than the
+        # page does.  Only if the reader is still on this section and has not moved.
+        expected = self.scroll.verticalScrollBar().value()
+        QTimer.singleShot(0, lambda: self._settle_scroll(key, expected))
         target.setFocus(Qt.OtherFocusReason)
         target.flash()
+
+    def _scroll_to(self, key: str) -> None:
+        """Put a section's first line at the top of the viewport.
+
+        ensureWidgetVisible only makes the anchor *visible*, which going forward meant the
+        new section's title sat at the bottom edge under the end of the previous one.  The
+        anchor is a direct child of the section and the section a direct child of the page,
+        so their offsets add up without mapping through the parent chain at all.
+        """
+        target = self._sections[key]
+        anchor = target.anchor()
+        top = target.y() + (anchor.y() if anchor.parentWidget() is target else 0)
+        self._scrolling = True
+        try:
+            self.scroll.verticalScrollBar().setValue(max(0, top - 12))
+        finally:
+            self._scrolling = False
+
+    def _settle_scroll(self, key: str, expected: int) -> None:
+        try:
+            if (self._stage_key == key
+                    and self.scroll.verticalScrollBar().value() == expected):
+                self._scroll_to(key)
+        except RuntimeError:                    # the page closed before the timer fired
+            pass
 
     def reset_scroll(self) -> None:
         self.scroll.verticalScrollBar().setValue(0)

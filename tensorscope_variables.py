@@ -23,12 +23,16 @@ from __future__ import annotations
 
 import numpy as np
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
-from PyQt5.QtWidgets import QHBoxLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import (
+    QFrame, QHBoxLayout, QPushButton, QScrollArea, QShortcut, QSizePolicy, QToolButton,
+    QVBoxLayout, QWidget,
+)
 
-from tensor_widgets import TensorInspector, exact_scalar
+from tensor_widgets import TensorInspector
 from tensorscope_common import (
-    AnnotatedValueRow, Disclosure, EvidenceBadge, axes_for, badge_row, label, shape_line,
-    token_labels,
+    AnnotatedValueRow, Disclosure, EvidenceBadge, approx, axes_for, badge_row, clear_layout,
+    label, shape_line, token_labels,
 )
 from tensorscope_content import (
     CONCEPTUAL_VARIABLES, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_OBSERVED,
@@ -99,7 +103,11 @@ class VariableRegistry(QObject):
         self.generated = False
         self.layer_index = self.layer_indices[0] if self.layer_indices else 0
         self.head = 0
-        self.position = max(len(capture.prompt_tokens) - 1, 0)
+        # A typed word rather than the final template marker, when one can be identified
+        # reliably; see `default_focus_position`.  The decision section shifts to the final
+        # position explicitly instead of inheriting this one.
+        self.position = int(self.facts.get('focus_position',
+                                           max(len(capture.prompt_tokens) - 1, 0)))
         self._current = ''
 
     # ── Selection context ────────────────────────────────────────────────────
@@ -117,6 +125,10 @@ class VariableRegistry(QObject):
             self.position, changed = int(position), True
         if changed:
             self.context_changed.emit()
+
+    @property
+    def focus_default(self) -> int:
+        return int(self.facts.get('focus_position', 0))
 
     @property
     def phase_name(self) -> str:
@@ -382,27 +394,72 @@ class VariablePanel(QWidget):
     came from, its shape, its axes, a small labelled sample, and only then the complete
     array.  For anything not captured the last two rungs are **not constructed at all** --
     there is no array, so there is no widget that could imply one.
+
+    It opens when a variable is chosen and closes on request, so it never holds a quarter
+    of the window to say "click something".  It also carries the page's colour key, which
+    is where a reader looking at a coloured chip goes to ask what the colour means.
     """
 
+    close_requested = pyqtSignal()
+    raw_requested = pyqtSignal()
+
     def __init__(self, registry: VariableRegistry, *, tokens: dict | None = None,
-                 parent=None):
+                 legend: QWidget | None = None, parent=None):
         super().__init__(parent)
         self.setObjectName('variablePanel')
         self._registry = registry
         self._tokens = tokens or {}
         self._body = QVBoxLayout(self)
-        self._body.setContentsMargins(14, 12, 14, 12)
+        self._body.setContentsMargins(14, 10, 10, 12)
         self._body.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+        header.addWidget(label('VARIABLE', muted=True))
+        header.addStretch(1)
+        self.raw_button = QPushButton('All captured arrays…')
+        self.raw_button.setObjectName('crossPageLink')
+        self.raw_button.setToolTip('Every stored array for every phase and layer, with no '
+                                   'framing at all.')
+        self.raw_button.clicked.connect(self.raw_requested.emit)
+        header.addWidget(self.raw_button)
+        self.close_button = QToolButton()
+        self.close_button.setObjectName('panelClose')
+        self.close_button.setText('✕')
+        self.close_button.setAccessibleName('Close variable panel')
+        self.close_button.setToolTip('Close this panel (Esc)')
+        self.close_button.clicked.connect(self.close_requested.emit)
+        header.addWidget(self.close_button)
+        self._body.addLayout(header)
+        close = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        close.setContext(Qt.WidgetWithChildrenShortcut)
+        close.activated.connect(self.close_requested.emit)
+
+        # Everything below the header scrolls: a variable's ladder can be taller than a
+        # laptop screen, and an unscrollable panel would squeeze every row to fit.
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        inner = QWidget()
+        inner.setObjectName('variablePanelBody')
+        content = QVBoxLayout(inner)
+        content.setContentsMargins(0, 0, 4, 0)
+        content.setSpacing(8)
+        self.legend = legend
+        if legend is not None:
+            content.addWidget(legend)
         self._slot = QVBoxLayout()
         self._slot.setContentsMargins(0, 0, 0, 0)
         self._slot.setSpacing(8)
-        self._body.addWidget(label('VARIABLE', muted=True))
-        self._body.addLayout(self._slot)
-        self._body.addStretch(1)
+        content.addLayout(self._slot)
+        content.addStretch(1)
+        area.setWidget(inner)
+        self._body.addWidget(area, 1)
         registry.selected.connect(self.show_variable)
         registry.context_changed.connect(self._refresh)
         self._current = ''
-        self._show_placeholder()
 
     def current_symbol(self) -> str:
         return self._current
@@ -410,22 +467,11 @@ class VariablePanel(QWidget):
     # -- rendering ------------------------------------------------------------
 
     def _clear(self) -> None:
-        while self._slot.count():
-            item = self._slot.takeAt(0)
-            child = item.widget()
-            if child is not None:
-                child.setParent(None)
-                child.deleteLater()
+        clear_layout(self._slot)
 
     def _add(self, widget: QWidget) -> QWidget:
         self._slot.addWidget(widget)
         return widget
-
-    def _show_placeholder(self) -> None:
-        self._clear()
-        self._add(label('Click any variable — in an equation or in a list — to see '
-                        'what it is, what shape it has in this run, where its numbers came '
-                        'from, and the complete stored array.', muted=True))
 
     def _refresh(self) -> None:
         if self._current:
@@ -460,10 +506,12 @@ class VariablePanel(QWidget):
                             head=self._registry.head)
         if sample is not None:
             values, names, caption, total = sample
+            # Rounded for reading, with the exact stored digits on every box's tooltip and
+            # in the complete array one rung further down.
             self._add(AnnotatedValueRow(
                 list(values), labels=names, caption=caption.upper(),
                 kind=EVIDENCE_OBSERVED, note=resolved.key, total=total,
-                formatter=exact_scalar))
+                formatter=approx, columns=2))
         # `axes_for` and `token_labels` already branch on the key and the array's rank, so
         # the key goes straight through rather than being second-guessed here.
         self._add(Disclosure(

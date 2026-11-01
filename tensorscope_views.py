@@ -6,8 +6,8 @@ re-exported from here so the shell still imports exactly one of our modules.
 
 `RawView` itself is unchanged. It was always the escape hatch -- every stored array,
 reachable in two clicks, with no framing at all -- and that is exactly the role it keeps.
-What changed is how it is reached: through the notebook ribbon's "All captured arrays..."
-button rather than as a mode competing with the pages for the reader's attention.
+What changed is how it is reached: through the "All captured arrays..." button in the
+banner and in the variable panel, rather than as a mode competing with the pages.
 """
 from __future__ import annotations
 

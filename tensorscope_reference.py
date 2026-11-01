@@ -23,7 +23,7 @@ from tensorscope_common import (
     AnchoredScrollPage, Card, Disclosure, EvidenceBadge, Section, badge_row, label,
 )
 from tensorscope_content import (
-    EVIDENCE_CONCEPTUAL, ILLUSTRATIONS, REFERENCE_TOPICS, REFERENCE_TOPIC_INDEX,
+    EVIDENCE_CONCEPTUAL, ILLUSTRATIONS, OPERATION_INDEX, REFERENCE_TOPICS, REFERENCE_TOPIC_INDEX,
     ROW_VECTOR_NOTE, learn_facts,
 )
 from tensorscope_diagrams import (
@@ -56,6 +56,17 @@ def prose(text: str) -> QWidget:
     return label(body.replace('\n\n', '<br><br>').replace('\n', '<br>'), rich=True)
 
 
+def _explains(topic) -> str:
+    """'Explains operation 4' -- so the reader can line a topic up with the worked run."""
+    numbers = sorted(OPERATION_INDEX[key].number for key in topic.operations
+                     if key in OPERATION_INDEX)
+    if not numbers:
+        return ''
+    if len(numbers) == 1:
+        return f'Explains operation {numbers[0]}'
+    return 'Explains operations ' + ', '.join(str(number) for number in numbers)
+
+
 class ReferenceView(AnchoredScrollPage):
     """The illustrated reference, as one scrolling page of anchored topics."""
 
@@ -71,11 +82,12 @@ class ReferenceView(AnchoredScrollPage):
         # registry purely so its symbol glossary uses the notebook's own definitions and
         # cannot drift into a second set of names.
         self.registry = VariableRegistry(capture, self.facts, parent=self)
-        self.add_header(self._preamble())
         for position, topic in enumerate(REFERENCE_TOPICS, start=1):
             self.add_section(Section(
                 topic.key, topic.heading.format(**self.facts),
                 topic.purpose.format(**self.facts), number=f'{position:02}',
+                kicker=_explains(topic),
+                preface=self._preamble() if position == 1 else None,
                 build_body=lambda section, t=topic: self._body(t)))
         self.finish_sections()
         self.go_to(REFERENCE_TOPICS[0].key)
@@ -84,13 +96,19 @@ class ReferenceView(AnchoredScrollPage):
         topic = REFERENCE_TOPIC_INDEX.get(self.current_stage())
         return topic.nav if topic else ''
 
+    def progress_text(self, key: str) -> str:
+        keys = self.stage_keys()
+        return (f'Topic {keys.index(key) + 1} of {len(keys)}' if key in keys else '')
+
     # ── Chrome ───────────────────────────────────────────────────────────────
 
     def _preamble(self) -> QWidget:
+        # The page's one framing sentence, at the top of the first topic rather than in a
+        # band pinned above the page: it needs reading once, not on every screen.
         host = QWidget()
         host.setObjectName('referencePreamble')
         row = QHBoxLayout(host)
-        row.setContentsMargins(22, 10, 22, 10)
+        row.setContentsMargins(0, 0, 0, 4)
         row.addWidget(label(
             'The ideas behind each operation, in the order the model performs them. '
             'Nothing here is a captured value — open "Follow this run" for those.',

@@ -215,6 +215,45 @@ class Diagram(QWidget):
                          radius=2, width=1.6 if picked else 1.0,
                          fill=self.wash(colour, 70 if picked else 22))
 
+    # ── Which rows to draw ───────────────────────────────────────────────────
+
+    @staticmethod
+    def row_window(total: int, budget: int, *marks) -> list:
+        """The real rows a sketch draws, with `None` where a run of rows is skipped.
+
+        Always the first and the last row, every marked row and its neighbours, then
+        rows nearest the top until the budget is spent.  The old rule drew the first few
+        rows and clamped a selection onto the last drawn one, so position 13 of 15 was
+        painted on the row that stood for position 14 and labelled "row 13".  Here a drawn
+        row *is* a real row, and its label is its own index.
+        """
+        total = max(0, int(total))
+        budget = max(3, int(budget))
+        if total <= budget:
+            return list(range(total))
+        keep = {0, total - 1}
+        for mark in marks:
+            if mark is None:
+                continue
+            centre = max(0, min(int(mark), total - 1))
+            keep.update(index for index in (centre - 1, centre, centre + 1)
+                        if 0 <= index < total)
+
+        def slots(rows) -> list:
+            out, previous = [], None
+            for index in sorted(rows):
+                if previous is not None and index != previous + 1:
+                    out.append(None)
+                out.append(index)
+                previous = index
+            return out
+
+        for candidate in range(1, total - 1):
+            if len(slots(keep | {candidate})) > budget:
+                break
+            keep.add(candidate)
+        return slots(keep)
+
     # ── State ────────────────────────────────────────────────────────────────
 
     def set_selected_row(self, index: int | None) -> None:
@@ -321,9 +360,12 @@ class MatrixGrid(Diagram):
 
     # -- geometry -------------------------------------------------------------
     def _drawn(self) -> tuple[int, int, bool, bool]:
-        shown_rows = min(self._rows, self._drawn_rows)
         shown_cols = min(self._cols, self._drawn_cols)
-        return shown_rows, shown_cols, self._rows > shown_rows, self._cols > shown_cols
+        return len(self.drawn_rows()), shown_cols, False, self._cols > shown_cols
+
+    def drawn_rows(self) -> list:
+        """The real row behind each drawn row, `None` for a skipped run."""
+        return self.row_window(self._rows, self._drawn_rows, self._selected_row)
 
     def draw(self, painter: QPainter, rect: QRect) -> None:
         line = self.text_height(8)
@@ -332,7 +374,10 @@ class MatrixGrid(Diagram):
             self.write(painter, header, f'{self._symbol}   [{_number(self._rows)} × '
                                         f'{_number(self._cols)}]',
                        colour=self.role(self._role), points=9, bold=True)
-        side = 74
+        # Wide enough for the axis name and the "row N" marker, whatever the font.
+        metrics = QFontMetrics(self.font_at(8, bold=True))
+        side = max(74, metrics.horizontalAdvance(self._row_axis) + 12,
+                   metrics.horizontalAdvance(f'row {self._rows}') + 12)
         self._grid = QRect(rect.x() + side, rect.y() + line + 4,
                            max(40, rect.width() - side - 4),
                            max(30, rect.height() - 2 * line - 12))
@@ -344,11 +389,13 @@ class MatrixGrid(Diagram):
                    f'{self._col_axis}  →  {_number(self._cols)}', colour=self.muted())
 
         shown_rows, shown_cols, more_rows, more_cols = self._drawn()
+        window = self.drawn_rows()
         colour = self.role(self._role)
         cell_h = self._grid.height() / max(1, shown_rows)
         cell_w = self._grid.width() / max(1, shown_cols)
         for row in range(shown_rows):
-            gap_row = more_rows and row == shown_rows - 2
+            real = window[row]
+            gap_row = real is None
             for col in range(shown_cols):
                 gap_col = more_cols and col == shown_cols - 2
                 box = QRect(int(self._grid.x() + col * cell_w) + 1,
@@ -362,8 +409,7 @@ class MatrixGrid(Diagram):
                         self.write(painter, box, ELLIPSIS, colour=self.muted(),
                                    align=Qt.AlignCenter)
                     continue
-                picked_row = self._selected_row is not None and row == min(
-                    self._selected_row, shown_rows - 1)
+                picked_row = self._selected_row is not None and real == self._selected_row
                 picked_col = self._highlight_col is not None and col == min(
                     self._highlight_col, shown_cols - 1)
                 alpha = 96 if (picked_row and picked_col) else 58 if picked_row else \
@@ -371,9 +417,9 @@ class MatrixGrid(Diagram):
                 self.outline(painter, box, colour if (picked_row or picked_col) else self.faint(),
                              radius=1, width=1.4 if picked_row else 1.0,
                              fill=self.wash(colour, alpha))
-        if self._selected_row is not None:
-            marker = QRect(rect.x(), int(self._grid.y() + min(
-                self._selected_row, shown_rows - 1) * cell_h), side - 8, max(10, int(cell_h)))
+        if self._selected_row is not None and self._selected_row in window:
+            marker = QRect(rect.x(), int(self._grid.y() + window.index(self._selected_row)
+                                         * cell_h), side - 8, max(10, int(cell_h)))
             self.write(painter, marker, f'row {self._selected_row}', colour=self.accent(),
                        points=8, bold=True, align=Qt.AlignRight | Qt.AlignVCenter)
 
@@ -381,9 +427,13 @@ class MatrixGrid(Diagram):
         if not self._clickable or not self._grid.contains(point):
             return False
         shown_rows, shown_cols, _, _ = self._drawn()
+        window = self.drawn_rows()
         col = int((point.x() - self._grid.x()) / (self._grid.width() / max(1, shown_cols)))
         row = int((point.y() - self._grid.y()) / (self._grid.height() / max(1, shown_rows)))
-        self._selected_row = max(0, min(row, shown_rows - 1))
+        real = window[max(0, min(row, shown_rows - 1))]
+        if real is None:                    # the skipped run: nothing real to select
+            return True
+        self._selected_row = real
         self._highlight_col = max(0, min(col, shown_cols - 1))
         self.canvas.update()
         self.cellClicked.emit(self._selected_row, self._highlight_col)
@@ -574,10 +624,14 @@ class HeadSplit(Diagram):
             f'{_number(self._positions)} token positions stay separate rows',
         ]
 
+    def drawn_rows(self) -> list:
+        return self.row_window(self._positions, 5, self._selected_row)
+
     def draw(self, painter: QPainter, rect: QRect) -> None:
         line = self.text_height(8)
-        rows = min(self._positions, 5)
-        band = max(10, (rect.height() - 3 * line - 16) // max(1, rows))
+        window = self.drawn_rows()
+        rows = max(1, len(window))
+        band = max(8, (rect.height() - 3 * line - 16) // max(1, rows))
         column = max(58, (rect.width() - 100) // 3)
         xs = [rect.x(), rect.x() + column + 44, rect.x() + 2 * column + 88]
         colour = self.role(self._role)
@@ -586,8 +640,11 @@ class HeadSplit(Diagram):
             for row in range(rows):
                 top = rect.y() + line + 4 + row * band
                 box = QRect(x, top, column, max(6, band - 3))
-                picked = self._selected_row is not None and row == min(
-                    self._selected_row, rows - 1)
+                if window[row] is None:
+                    self.write(painter, box, ELLIPSIS, colour=self.muted(),
+                               align=Qt.AlignCenter)
+                    continue
+                picked = self._selected_row is not None and window[row] == self._selected_row
                 if stage == 2:
                     groups = min(self._heads, 4)
                     step = column / groups
@@ -619,12 +676,19 @@ class HeadSplit(Diagram):
         self.write(painter, QRect(xs[1] + 6, boundary, column + 44, line),
                    'reshape only — no arithmetic', colour=self.muted(), points=8,
                    align=Qt.AlignCenter)
+        if self._selected_row is not None and self._selected_row in window:
+            top = rect.y() + line + 4 + window.index(self._selected_row) * band
+            self.write(painter, QRect(xs[2] + column + 4, top, 64, max(6, band - 3)),
+                       f'row {self._selected_row}', colour=self.accent(), points=7,
+                       bold=True)
         self.write(painter, QRect(rect.x(), rect.bottom() - line, rect.width(), line),
                    f'{_number(self._positions)} token positions stay separate rows '
                    'through both stages', colour=self.muted())
 
     def describe(self) -> list[str]:
-        return self._stage_labels() + super().describe()
+        followed = ([f'row {self._selected_row}'] if self._selected_row is not None
+                    and self._selected_row in self.drawn_rows() else [])
+        return self._stage_labels() + followed + super().describe()
 
 
 class KVShare(Diagram):
@@ -632,15 +696,24 @@ class KVShare(Diagram):
 
     BODY_HEIGHT = 120
 
-    def __init__(self, kv_heads: int, query_heads: int, *, tokens=None, caption: str = '',
-                 parent=None):
+    def __init__(self, kv_heads: int, query_heads: int, *, highlight_query_head=None,
+                 tokens=None, caption: str = '', parent=None):
         super().__init__(tokens=tokens, caption=caption, parent=parent)
         self._kv, self._queries = max(1, int(kv_heads)), max(1, int(query_heads))
+        self._head = (None if highlight_query_head is None
+                      else max(0, min(int(highlight_query_head), self._queries - 1)))
+
+    def _group(self) -> int:
+        return max(1, self._queries // self._kv)
 
     def _group_text(self) -> str:
         return (f'{_count(self._kv, "key/value head")} → '
                 f'{_count(self._queries, "query head")} '
-                f'({self._queries // self._kv} query heads share each one)')
+                f'({self._group()} query heads share each one)')
+
+    def _reads_text(self) -> str:
+        return (f'query head {self._head} reads key/value head {self._head // self._group()}'
+                if self._head is not None else '')
 
     def draw(self, painter: QPainter, rect: QRect) -> None:
         line = self.text_height(8)
@@ -654,32 +727,48 @@ class KVShare(Diagram):
                    colour=self.role('q'), points=9, bold=True, align=Qt.AlignRight)
         kv_step = left.height() / shown_kv
         q_step = right.height() / shown_q
+        # The drawn boxes stand for evenly spaced real heads, so the highlighted pair is
+        # the drawn query box nearest the real head and the box of the head it reads; the
+        # exact numbers are written underneath rather than left to the picture.
+        hot_q = (None if self._head is None
+                 else min(shown_q - 1, self._head * shown_q // self._queries))
+        hot_kv = (None if self._head is None
+                  else min(shown_kv - 1, (self._head // self._group()) * shown_kv // self._kv))
         for index in range(shown_kv):
             box = QRect(left.x(), int(left.y() + index * kv_step) + 1, left.width(),
                         max(6, int(kv_step) - 3))
-            self.outline(painter, box, self.role('k'), radius=2,
-                         fill=self.wash(self.role('k'), 40))
+            hot = index == hot_kv
+            self.outline(painter, box, self.accent() if hot else self.role('k'), radius=2,
+                         width=1.6 if hot else 1.0,
+                         fill=self.wash(self.role('k'), 90 if hot else 40))
         for index in range(shown_q):
             box = QRect(right.x(), int(right.y() + index * q_step) + 1, right.width(),
                         max(5, int(q_step) - 3))
-            self.outline(painter, box, self.role('q'), radius=2,
-                         fill=self.wash(self.role('q'), 34))
+            hot = index == hot_q
+            self.outline(painter, box, self.accent() if hot else self.role('q'), radius=2,
+                         width=1.6 if hot else 1.0,
+                         fill=self.wash(self.role('q'), 90 if hot else 34))
         painter.save()
-        painter.setPen(QPen(self.muted(), 1.0))
         per_group = max(1, shown_q // shown_kv)
         for index in range(shown_q):
             source = min(index // per_group, shown_kv - 1)
+            hot = index == hot_q
+            painter.setPen(QPen(self.accent() if hot else self.muted(), 1.8 if hot else 1.0))
             y1 = left.y() + source * kv_step + kv_step / 2
             y2 = right.y() + index * q_step + q_step / 2
             painter.drawLine(QRectF(left.right() + 2, y1, 0, 0).topLeft(),
                              QRectF(right.x() - 2, y2, 0, 0).topLeft())
         painter.restore()
+        bottom = 'copied, not recomputed'
+        if self._head is not None:
+            bottom = f'{self._reads_text()}  ·  {bottom}'
         self.write(painter, QRect(rect.x(), rect.bottom() - line, rect.width(), line),
-                   'copied, not recomputed', colour=self.muted(), align=Qt.AlignCenter)
+                   bottom, colour=self.muted(), align=Qt.AlignCenter)
 
     def describe(self) -> list[str]:
-        return ['K / V heads', 'Q heads', self._group_text(), 'copied, not recomputed'] \
-            + super().describe()
+        reads = [self._reads_text()] if self._head is not None else []
+        return ['K / V heads', 'Q heads', self._group_text()] + reads \
+            + ['copied, not recomputed'] + super().describe()
 
 
 class QKCompare(Diagram):
@@ -926,17 +1015,37 @@ class SoftmaxBars(Diagram):
 
     def __init__(self, scores, weights, *, labels=None, masked_indices=(),
                  selected: int | None = None, drawn: int = DRAWN_CELLS,
+                 indices=None, sublabels=None,
                  tokens=None, caption: str = '', parent=None):
         super().__init__(tokens=tokens, caption=caption, parent=parent)
         self._scores = np.asarray(scores).reshape(-1)
         self._weights = np.asarray(weights).reshape(-1)
-        self._labels = list(labels or [])
         self._masked = set(int(index) for index in masked_indices)
         self._selected_row = selected
         self._drawn = drawn
+        size = int(min(self._scores.size, self._weights.size))
+        # `indices` are the real key positions to draw, chosen by the caller -- the ones
+        # that carry the weight, say -- and drawn in position order.  Without them, the
+        # first `drawn` keys, as before.
+        if indices is None:
+            self._indices = list(range(min(drawn, size)))
+        else:
+            self._indices = sorted({int(i) for i in indices if 0 <= int(i) < size})
+        # `labels` / `sublabels` are per real key position (index into the full row).
+        self._labels = list(labels or [])
+        self._sublabels = list(sublabels or [])
 
     def _shown(self) -> int:
-        return int(min(self._drawn, self._scores.size, self._weights.size))
+        return len(self._indices)
+
+    def _label_for(self, real: int) -> str:
+        return str(self._labels[real]) if real < len(self._labels) else str(real)
+
+    def _sublabel_for(self, real: int) -> str:
+        return str(self._sublabels[real]) if real < len(self._sublabels) else ''
+
+    def drawn_keys(self) -> list:
+        return list(self._indices)
 
     def _rows(self) -> list[str]:
         return ['captured scores · already scaled and masked',
@@ -954,12 +1063,14 @@ class SoftmaxBars(Diagram):
         # range would flatten every real score into one pixel.  They are still drawn and
         # still labelled -- excluded from the *scale* only, exactly as the attention table
         # model does.
-        visible = np.array([value for index, value in enumerate(finite[:shown])
-                            if index not in self._masked]) if finite.size else finite
+        visible = np.array([float(self._scores[index]) for index in self._indices
+                            if index not in self._masked
+                            and np.isfinite(self._scores[index])]) if finite.size else finite
         low = float(visible.min()) if visible.size else 0.0
         high = float(visible.max()) if visible.size else 1.0
         span = (high - low) or 1.0
-        weight_high = float(self._weights[:shown].max()) if self._weights.size else 1.0
+        weight_high = (float(max(self._weights[index] for index in self._indices))
+                       if self._indices else 1.0)
         weight_high = weight_high or 1.0
 
         for band, (name, colour) in enumerate(
@@ -968,16 +1079,17 @@ class SoftmaxBars(Diagram):
             self.write(painter, QRect(rect.x(), top, rect.width(), line), name,
                        colour=colour, points=8, bold=True)
             plot = QRect(rect.x(), top + line + 1, rect.width(),
-                         max(18, rect.height() // 2 - 2 * line - 4))
+                         max(18, rect.height() // 2 - 2 * line - 4 - (line if band else 0)))
             for index in range(shown):
-                value = float(self._scores[index] if band == 0 else self._weights[index])
+                real = self._indices[index]
+                value = float(self._scores[real] if band == 0 else self._weights[real])
                 fraction = ((value - low) / span) if band == 0 else (value / weight_high)
                 fraction = max(0.03, min(1.0, fraction))
                 height = max(3, int(plot.height() * fraction))
                 bar = QRect(int(rect.x() + index * column) + 2, plot.bottom() - height,
                             max(4, int(column) - 4), height)
-                masked = index in self._masked
-                picked = self._selected_row is not None and index == self._selected_row
+                masked = real in self._masked
+                picked = self._selected_row is not None and real == self._selected_row
                 self.outline(painter, bar, colour if not masked else self.faint(), radius=1,
                              width=1.4 if picked else 1.0,
                              fill=self.wash(self.accent() if picked else colour,
@@ -992,17 +1104,24 @@ class SoftmaxBars(Diagram):
                                           max(14, int(column)), line),
                            f'{value:.3g}', colour=self.muted(), points=7,
                            align=Qt.AlignCenter)
-        if self._labels:
-            for index in range(shown):
-                text = str(self._labels[index]) if index < len(self._labels) else ''
-                self.write(painter, QRect(int(rect.x() + index * column),
-                                          rect.bottom() - line, max(14, int(column)), line),
-                           text[:6], colour=self.muted(), points=7, align=Qt.AlignCenter)
+        has_sub = any(self._sublabel_for(real) for real in self._indices)
+        for index in range(shown):
+            real = self._indices[index]
+            cell = QRect(int(rect.x() + index * column),
+                         rect.bottom() - (2 * line if has_sub else line),
+                         max(14, int(column)), line)
+            self.write(painter, cell, self._label_for(real)[:6], colour=self.muted(),
+                       points=7, align=Qt.AlignCenter)
+            if has_sub:
+                self.write(painter, cell.translated(0, line), self._sublabel_for(real)[:7],
+                           colour=self.ink(), points=7, align=Qt.AlignCenter)
 
     def describe(self) -> list[str]:
         shown = self._shown()
+        spelled = [text for text in (self._sublabel_for(real) for real in self._indices)
+                   if text.strip()]
         return self._rows() + [f'{shown} of {self._scores.size} key positions drawn'] \
-            + super().describe()
+            + spelled + super().describe()
 
 
 class AttentionGrid(Diagram):
@@ -1034,7 +1153,8 @@ class AttentionGrid(Diagram):
         self.write(painter, QRect(rect.x(), rect.y(), rect.width(), line),
                    self._shape_text(), colour=self.role('weights'), points=9, bold=True)
         rows, cols = self._matrix.shape
-        shown_r, shown_c = min(rows, 24), min(cols, 32)
+        window = self.row_window(rows, 24, self._selected_row)
+        shown_r, shown_c = len(window), min(cols, 32)
         grid = QRect(rect.x() + 40, rect.y() + line + 2, max(40, rect.width() - 44),
                      max(24, rect.height() - 2 * line - 8))
         cell_w, cell_h = grid.width() / shown_c, grid.height() / shown_r
@@ -1044,15 +1164,17 @@ class AttentionGrid(Diagram):
         span = (high - low) or 1.0
         base = self.role('weights')
         for row in range(shown_r):
+            if window[row] is None:
+                continue
             for col in range(shown_c):
-                value = float(self._matrix[row, col])
+                value = float(self._matrix[window[row], col])
                 strength = 0.0 if not np.isfinite(value) else (value - low) / span
                 box = QRect(int(grid.x() + col * cell_w), int(grid.y() + row * cell_h),
                             max(2, int(cell_w)), max(2, int(cell_h)))
                 painter.fillRect(box, self.wash(base, int(18 + 210 * max(0.0, min(1.0, strength)))))
         self.outline(painter, grid, self.faint(), radius=2)
-        if self._selected_row is not None and shown_r:
-            top = int(grid.y() + min(self._selected_row, shown_r - 1) * cell_h)
+        if self._selected_row is not None and self._selected_row in window:
+            top = int(grid.y() + window.index(self._selected_row) * cell_h)
             self.outline(painter, QRect(grid.x(), top, grid.width(), max(3, int(cell_h))),
                          self.accent(), radius=1, width=1.4)
         self.write(painter, QRect(rect.x(), grid.y(), 34, grid.height()), 'query',
@@ -1076,12 +1198,15 @@ class ResidualBypass(Diagram):
 
     BODY_HEIGHT = 140
 
-    def __init__(self, branches, *, trunk_symbols=('X',), tokens=None, caption: str = '',
-                 parent=None):
+    def __init__(self, branches, *, trunk_symbols=('X',), active: int | None = None,
+                 tokens=None, caption: str = '', parent=None):
         super().__init__(tokens=tokens, caption=caption, parent=parent)
         # branches: a sequence of (branch_label, output_symbol, result_symbol)
         self._branches = [tuple(item) for item in branches]
         self._trunk = list(trunk_symbols)
+        # The branch the surrounding operation is about.  The other stays drawn, faded, so
+        # the reader sees where this step sits in the whole layer.
+        self._active = active
 
     def _lines(self) -> list[str]:
         out = []
@@ -1105,8 +1230,11 @@ class ResidualBypass(Diagram):
             x = rect.x() + 18 + index * column
             box = QRect(x, rect.y() + line + 6, column - 56, max(22, trunk_y - rect.y() - 3 * line))
             colour = self.role('output' if index == 0 else 'norm')
-            self.outline(painter, box, colour, radius=4, width=1.3,
-                         fill=self.wash(colour, 26))
+            if self._active is not None and index != self._active:
+                colour = self.faint()
+            hot = self._active is not None and index == self._active
+            self.outline(painter, box, colour, radius=4, width=2.0 if hot else 1.3,
+                         fill=self.wash(colour, 60 if hot else 26))
             self.write(painter, box, branch, colour=colour, points=8, align=Qt.AlignCenter)
             # the bypass arc: leaves the trunk before the branch, rejoins at the add
             arc = QPainterPath()
@@ -1224,11 +1352,24 @@ class VocabularyProjection(Diagram):
     BODY_HEIGHT = 158
 
     def __init__(self, hidden: int, vocab: int, *, positions: int, final_position: int,
-                 marked: int = 0, tokens=None, caption: str = '', parent=None):
+                 marked: int = 0, focus_position: int | None = None, tokens=None,
+                 caption: str = '', parent=None):
         super().__init__(tokens=tokens, caption=caption, parent=parent)
         self._hidden, self._vocab = int(hidden), int(vocab)
         self._positions, self._final = int(positions), int(final_position)
         self._marked = int(marked)
+        # The position the reader has been following.  When it is not the final one the
+        # picture says so: that row was computed too, and it is not the row that chose.
+        self._focus = None if focus_position is None else int(focus_position)
+
+    def drawn_rows(self) -> list:
+        return self.row_window(self._positions, 7, self._focus, self._final)
+
+    def _followed_text(self) -> str:
+        if self._focus is None or self._focus == self._final:
+            return ''
+        return f'you followed position {self._focus}; it did not choose'
+
 
     def _scores_label(self) -> str:
         return (f'{_number(self._vocab)} scores, one per vocabulary entry' if self._vocab
@@ -1236,36 +1377,50 @@ class VocabularyProjection(Diagram):
 
     def _lines(self) -> list[str]:
         marked = [f'{_number(self._marked)} of them were recorded by name'] if self._marked else []
+        followed = [self._followed_text()] if self._followed_text() else []
         return [f"{_count(self._positions, 'token position')}",
                 f'only position {self._final} chose the next token',
-                self._scores_label()] + marked
+                self._scores_label()] + marked + followed
 
     def draw(self, painter: QPainter, rect: QRect) -> None:
         line = self.text_height(8)
-        shown = min(self._positions, 7)
+        window = self.drawn_rows() or [0]
+        shown = len(window)
         column = 96
-        rows = QRect(rect.x(), rect.y() + line, column, rect.height() - 2 * line - 4)
+        rows = QRect(rect.x() + 30, rect.y() + line, column, rect.height() - 2 * line - 4)
         step = rows.height() / shown
-        final_row = shown - 1
+        final_row = window.index(self._final) if self._final in window else shown - 1
         for index in range(shown):
             box = QRect(rows.x(), int(rows.y() + index * step) + 1, column,
                         max(5, int(step) - 3))
+            real = window[index]
+            if real is None:
+                self.write(painter, box, ELLIPSIS, colour=self.muted(), align=Qt.AlignCenter)
+                continue
+            self.write(painter, QRect(rect.x(), box.y(), 26, box.height()), str(real),
+                       colour=self.muted(), points=7, align=Qt.AlignRight | Qt.AlignVCenter)
             if index == final_row:
                 self.outline(painter, box, self.accent(), radius=2, width=1.4,
                              fill=self.wash(self.accent(), 90))
+            elif self._focus is not None and real == self._focus:
+                self.outline(painter, box, self.ink(), radius=2, width=1.2, dashed=True,
+                             fill=self.wash(self.muted(), 30))
             else:
                 self.outline(painter, box, self.faint(), radius=2,
                              fill=self.wash(self.muted(), 16))
-        self.write(painter, QRect(rows.x(), rect.y(), column, line),
+        self.write(painter, QRect(rows.x(), rect.y(), column + 40, line),
                    _count(self._positions, 'position'), colour=self.muted())
         mid = int(rows.y() + final_row * step + step / 2)
         self.arrow(painter, rows.right() + 4, mid, rows.right() + 40, self.accent())
         bar = QRect(rows.right() + 48, mid - 9, max(50, rect.right() - rows.right() - 52), 18)
         self.outline(painter, bar, self.role('scores'), radius=2, width=1.3,
                      fill=self.wash(self.role('scores'), 70))
-        self.write(painter, QRect(bar.x(), bar.bottom() + 2, bar.width(), line),
-                   f'{_number(self._vocab)} scores' if self._vocab
-                   else 'score count not recorded', colour=self.muted())
+        under = (f'{_number(self._vocab)} scores' if self._vocab
+                 else 'score count not recorded')
+        if self._marked:
+            under += f'  ·  {_number(self._marked)} of them were recorded by name'
+        self.write(painter, QRect(bar.x(), bar.bottom() + 2, bar.width(), line), under,
+                   colour=self.muted())
         self.write(painter, QRect(bar.x(), bar.y() - line - 2, bar.width(), line),
                    f'position {self._final} only', colour=self.accent(), points=8, bold=True)
         if self._marked:
@@ -1273,9 +1428,9 @@ class VocabularyProjection(Diagram):
             self.outline(painter, QRect(bar.x(), bar.y(), width, bar.height()),
                          self.accent(), radius=2, width=1.4,
                          fill=self.wash(self.accent(), 120))
-            self.write(painter, QRect(bar.x(), rect.bottom() - line, bar.width(), line),
-                       f'{_number(self._marked)} of them were recorded by name',
-                       colour=self.accent(), points=7)
+        if self._followed_text():
+            self.write(painter, QRect(rect.x(), rect.bottom() - line, column + 30, line),
+                       f'dashed: position {self._focus}', colour=self.muted(), points=7)
 
     def describe(self) -> list[str]:
         return self._lines() + super().describe()
@@ -1427,11 +1582,112 @@ class StoppingLoop(Diagram):
             'the stopping entry won', 'not appended'] + super().describe()
 
 
+class DecisionChain(Diagram):
+    """From the final row to a token: captured steps solid, discarded steps dashed.
+
+    Numberless on purpose.  The point is which links of the chain a capture holds -- the
+    final layer output and the logits -- and which it does not: the final normalization,
+    the vocabulary projection's weights.  The text says it as well as the line style.
+    """
+
+    BODY_HEIGHT = 92
+
+    def __init__(self, stages, *, tokens=None, caption: str = '', parent=None):
+        super().__init__(tokens=tokens, caption=caption, parent=parent)
+        # stages: a sequence of (label, captured: bool)
+        self._stages = [(str(text), bool(kept)) for text, kept in stages]
+
+    def draw(self, painter: QPainter, rect: QRect) -> None:
+        line = self.text_height(8)
+        count = max(1, len(self._stages))
+        gap = 16
+        width = max(58, (rect.width() - gap * (count - 1)) // count)
+        top = rect.y() + 4
+        height = max(28, rect.height() - line - 14)
+        for index, (text, kept) in enumerate(self._stages):
+            box = QRect(rect.x() + index * (width + gap), top, width, height)
+            colour = self.role('scores') if kept else self.muted()
+            self.outline(painter, box, colour, radius=4, width=1.3, dashed=not kept,
+                         fill=self.wash(colour, 40 if kept else 0))
+            self.write(painter, box.adjusted(4, 2, -4, -2), text, colour=self.ink() if kept
+                       else self.muted(), points=7, align=Qt.AlignCenter | Qt.TextWordWrap)
+            if index < count - 1:
+                self.arrow(painter, box.right() + 2, top + height // 2,
+                           box.right() + gap - 2, self.muted())
+        self.write(painter, QRect(rect.x(), rect.bottom() - line, rect.width(), line),
+                   'solid: captured  ·  dashed: happened in the model, not kept',
+                   colour=self.muted())
+
+    def describe(self) -> list[str]:
+        return ([text for text, _ in self._stages]
+                + ['solid: captured  ·  dashed: happened in the model, not kept']
+                + super().describe())
+
+
+class PositionScope(Diagram):
+    """What attention reads versus what the feed-forward network reads.
+
+    Two panels of the same five rows.  On the left, arrows run from earlier rows into the
+    followed row: attention gathers across positions.  On the right each row is processed
+    in its own box with nothing crossing between rows.
+    """
+
+    BODY_HEIGHT = 124
+    ROWS = 5
+
+    def draw(self, painter: QPainter, rect: QRect) -> None:
+        line = self.text_height(8)
+        half = (rect.width() - 24) // 2
+        rows = self.ROWS
+        top = rect.y() + line + 4
+        step = max(10, (rect.height() - 2 * line - 12) // rows)
+        focus = rows - 2
+        panels = (('attention: reads across positions', self.role('weights')),
+                  ('feed-forward: one position at a time', self.role('norm')))
+        for panel, (title, colour) in enumerate(panels):
+            x = rect.x() + panel * (half + 24)
+            self.write(painter, QRect(x, rect.y(), half, line), title, colour=colour,
+                       points=8, bold=True)
+            bar_w = max(40, half // 2)
+            for row in range(rows):
+                y = top + row * step
+                box = QRect(x + 20, y, bar_w, max(6, step - 4))
+                hot = row == focus
+                self.outline(painter, box, colour if hot else self.faint(), radius=2,
+                             width=1.5 if hot else 1.0,
+                             fill=self.wash(colour, 70 if hot else 18))
+                if panel == 1 and row <= focus:
+                    loop = QRect(box.right() + 6, y, 18, max(6, step - 4))
+                    self.outline(painter, loop, colour, radius=3, width=1.0,
+                                 fill=self.wash(colour, 30 if hot else 10))
+            if panel == 0:
+                painter.save()
+                target_y = top + focus * step + (step - 4) / 2
+                for row in range(focus):
+                    painter.setPen(QPen(colour, 1.1))
+                    source_y = top + row * step + (step - 4) / 2
+                    path = QPainterPath()
+                    path.moveTo(x + 20 + bar_w + 2, source_y)
+                    path.cubicTo(x + 20 + bar_w + 34, source_y, x + 20 + bar_w + 34,
+                                 target_y, x + 20 + bar_w + 2, target_y)
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawPath(path)
+                painter.restore()
+        self.write(painter, QRect(rect.x(), rect.bottom() - line, rect.width(), line),
+                   'the highlighted row is one position; later rows are never read',
+                   colour=self.muted())
+
+    def describe(self) -> list[str]:
+        return ['attention: reads across positions', 'feed-forward: one position at a time',
+                'the highlighted row is one position; later rows are never read'] \
+            + super().describe()
+
+
 # Every concrete diagram, for the gallery below and for the test that paints all of them.
 DIAGRAMS = (VectorStrip, MatrixGrid, EmbeddingLookupRow, MatMulShapes, HeadSplit, KVShare,
             QKCompare, CausalMaskTriangle, SoftmaxFlow, SoftmaxBars, AttentionGrid,
             ResidualBypass, GatedFFNPath, VocabularyProjection, LayerStack,
-            TrainingVsInference, StoppingLoop)
+            TrainingVsInference, StoppingLoop, DecisionChain, PositionScope)
 
 
 def gallery(tokens: dict | None = None) -> list[Diagram]:
@@ -1453,15 +1709,17 @@ def gallery(tokens: dict | None = None) -> list[Diagram]:
         MatMulShapes((15, 2560), (4096, 2560), (15, 4096), left_symbol='X_norm',
                      right_symbol='W_Qᵀ', out_symbol='Q_raw', tokens=tokens,
                      caption='The shared 2,560 is why this is defined.'),
-        HeadSplit(2560, 4096, 32, 128, 15, highlight_head=1, highlight_row=2, tokens=tokens,
+        HeadSplit(2560, 4096, 32, 128, 15, highlight_head=1, highlight_row=4, tokens=tokens,
                   caption='Projection computes; reshaping only regroups.'),
-        KVShare(8, 32, tokens=tokens, caption='Grouped-query attention.'),
+        KVShare(8, 32, highlight_query_head=5, tokens=tokens,
+                caption='Grouped-query attention.'),
         QKCompare(128, query_pos=14, key_pos=4, query_label='ĊĊ', key_label='Ġcolor',
                   tokens=tokens, caption='One query against one key.'),
         CausalMaskTriangle(15, 15, selected_query=3, clickable=True, tokens=tokens,
                            caption='Each query may read itself and earlier positions.'),
         SoftmaxFlow(tokens=tokens, caption='Deliberately numberless.'),
         SoftmaxBars(scores, weights, labels=[str(i) for i in range(9)],
+                    sublabels=['<|im', 'user', '\\n', 'fav', ' color', '?', '<|im', '', ''],
                     masked_indices=(7, 8), selected=3, tokens=tokens,
                     caption='Captured scores above, captured weights below.'),
         AttentionGrid(matrix, selected_query=3, tokens=tokens,
@@ -1472,10 +1730,16 @@ def gallery(tokens: dict | None = None) -> list[Diagram]:
         GatedFFNPath(2560, None, tokens=tokens,
                      caption='Qwen3 gates its feed-forward path.'),
         VocabularyProjection(2560, 151936, positions=15, final_position=14, marked=10,
-                             tokens=tokens, caption='Only the final row was stored.'),
+                             focus_position=4, tokens=tokens,
+                             caption='Only the final row was stored.'),
         LayerStack(36, 17, tokens=tokens, caption='One of thirty-six.'),
         TrainingVsInference(tokens=tokens, caption='Weights are written once, then read.'),
         StoppingLoop(tokens=tokens, caption='One loop, one exit.'),
+        DecisionChain([('final row of X_final', True), ('final RMSNorm', False),
+                       ('× W_Uᵀ', False), ('logits', True), ('argmax', True),
+                       ('token', True)], tokens=tokens,
+                      caption='Captured links solid, discarded links dashed.'),
+        PositionScope(tokens=tokens, caption='Across positions, then within one.'),
     ]
 
 

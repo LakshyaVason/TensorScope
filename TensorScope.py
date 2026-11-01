@@ -2255,6 +2255,66 @@ def self_test() -> None:
         for option in check["options"]:           # options reach a button unformatted too
             option.format(**filled)
 
+    # ── The notebook's teaching structure ────────────────────────────────────
+    # Four chapters over the thirteen anchors, in page order, titled exactly as promised.
+    from tensorscope_content import (
+        CHAPTERS, NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, WHAT_WE_KNOW, default_focus_position,
+        what_we_know,
+    )
+    assert [chapter.title for chapter in CHAPTERS] == [
+        "Represent the input", "Exchange information", "Refine the representation",
+        "Select a token"], [chapter.title for chapter in CHAPTERS]
+    assert [key for chapter in CHAPTERS for key in chapter.sections] == \
+        OPERATION_ORDER + [CONTINUATION.key]
+    # Every operation teaches in the same order, and every slot of it formats for a full
+    # and a legacy run.  A lede is one purpose statement, not a paragraph.
+    for subject in (capture, legacy):
+        subject_facts = learn_facts(subject)
+        for operation in NOTEBOOK_OPERATIONS + [CONTINUATION]:
+            filled = {**subject_facts, **{field: 0 for field in operation.fields}}
+            for field in ("heading", "lede", "formula", "takeaway", "note", "action"):
+                getattr(operation, field).format(**filled)
+            assert len(operation.lede) <= 260, (operation.key, len(operation.lede))
+        for key, text in NOTEBOOK_TEXT.items():
+            assert text.strip(), key
+            text.format(**{**subject_facts,
+                           **{field: 0 for field in NOTEBOOK_TEXT_FIELDS.get(key, ())}})
+    assert set(NOTEBOOK_TEXT_FIELDS) <= set(NOTEBOOK_TEXT), \
+        set(NOTEBOOK_TEXT_FIELDS) - set(NOTEBOOK_TEXT)
+    for operation in NOTEBOOK_OPERATIONS:
+        assert operation.takeaway.strip() and operation.action.strip(), operation.key
+        assert operation.inputs and operation.outputs, operation.key
+        # The spec's own sentence, at the step where the confusion arises.
+    assert OPERATION_INDEX["scores"].note == (
+        "These attention weights control how information is mixed within this head. "
+        "They are not next-token probabilities.")
+
+    # The followed position: the last typed word, never a template marker or a question
+    # mark, and a plain fallback whenever the typed text cannot be lined up.
+    focus_prompt = ["<|im_start|>", "user", "Ċ", "favorite", "Ġcolor", "?", "<|im_end|>",
+                    "Ċ", "<|im_start|>", "assistant", "Ċ"]
+    assert default_focus_position("favorite color?", focus_prompt) == 4
+    assert default_focus_position("?", ["<|im_start|>", "?", "<|im_end|>"]) == 1
+    assert default_focus_position("not in there", focus_prompt) == len(focus_prompt) - 1
+    assert default_focus_position("", []) == 0
+    # PROMPT_SPAN_UNKNOWN's branch: the bands do not resolve, so the facts say so and the
+    # focus is the last position rather than a guess.
+    unaligned_prompt = capture.prompt
+    try:
+        capture.prompt = "text the stored spellings do not contain"
+        assert learn_facts(capture)["prompt_span_known"] is False
+        assert learn_facts(capture)["focus_position"] == len(capture.prompt_tokens) - 1
+    finally:
+        capture.prompt = unaligned_prompt
+
+    # What the capture establishes, filtered by what this run actually holds.  A schema-2
+    # run has no score vector and no recorded rule, so it must not be told it has both.
+    legacy_lines = what_we_know(learn_facts(legacy))
+    assert not any("vocabulary score vector" in line for line in legacy_lines), legacy_lines
+    assert not any("greedy" in line for line in legacy_lines), legacy_lines
+    assert len(what_we_know(learn_facts(capture))) < len(WHAT_WE_KNOW) or \
+        learn_facts(capture)["decoding_known"]
+
     for note in (STRUCTURE_NOT_TIMING_NOTE, DISPLAY_CALC_NOTE, PROMPT_SPAN_UNKNOWN,
                  SYMBOLIC_WEIGHTS_NOTE, CACHED_KV_NOTE, BATCH_AXIS_NOTE,
                  ROW_VECTOR_NOTE, SHAPE_IS_NOT_CONTENTS, LEARNED_VALUES_NOT_SAVED,
@@ -2297,7 +2357,8 @@ def self_test() -> None:
                       "kv_projection_width", "position_count", "batch_size",
                       "cached_key_count", "remaining_layer_count", "continuation_count",
                       "candidate_top_k", "hidden_size", "layer_count",
-                      "prompt_token_count", "generated_count", "vocab_size_raw"):
+                      "prompt_token_count", "generated_count", "vocab_size_raw",
+                      "focus_position", "final_position", "first_token_id"):
             assert isinstance(measured[field], int), (field, measured[field])
         for field in ("attention_scale_text", "vocab_size_phrase", "typed_token_summary",
                       "hidden_size_text", "head_dim_text", "query_head_count_text",
@@ -2306,9 +2367,13 @@ def self_test() -> None:
                       "continuation_summary", "decoding_rule", "candidate_source_phrase",
                       "stop_reason_text", "stop_token_id_text", "stop_token_spelling",
                       "stop_token_logit_text", "ffn_description", "ffn_interior_note",
-                      "model", "vocab_size"):
+                      "model", "vocab_size", "prompt_text", "response_excerpt",
+                      "first_token_text", "focus_token_text", "final_token_text",
+                      "selection_rule_sentence"):
             assert str(measured[field]).strip(), field
-        for field in ("prompt_span_known", "vocab_size_known", "stop_token_known"):
+        for field in ("prompt_span_known", "vocab_size_known", "stop_token_known",
+                      "focus_is_final", "head_width_decoupled", "trace_known",
+                      "decoding_known"):
             assert isinstance(measured[field], bool), field
     assert learn_facts(capture)["prompt_span_known"] is True
 

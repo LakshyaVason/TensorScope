@@ -95,34 +95,39 @@ Check that your card is covered:
 Then, in the window:
 
 1. **Model** — leave the default (`Qwen/Qwen3-4B`) or type another Hugging Face model id.
-2. Click **Load model.** The first run downloads the weights, so expect a wait; the status
+2. Click **Load**. The first run downloads the weights, so expect a wait; the status
    line reports progress and finishes with the layer count, hidden size and device.
 3. Type a question into **Prompt** (e.g. *What is the capital of France?*).
-4. Click **Run Model.** The answer streams into **Model answer**, the run is saved, and a
+4. Click **Run Capture.** The answer streams into **Response**, the run is saved, and a
    **Computation Recap** window opens with the captured tensors. It is a separate window,
    so you can leave it open and run another prompt beside it.
 5. The recap has two pages.
 
-   **Follow this run** is where it opens: one scrollable worked calculation that goes from
-   the tokens the model received to the token it selected, in the order the model did it.
-   Twelve operations, then the rest of the answer. **Next operation** at the bottom moves
-   you through them and nothing above you disappears, so you can always scroll back to a
-   value you met earlier.
+   **Follow this run** is where it opens. It starts with where it is going — your prompt,
+   the start of the model's actual answer, and the first token of it — and then works the
+   calculation that chose that token, in four chapters: *Represent the input*, *Exchange
+   information*, *Refine the representation*, *Select a token*. Each of the twelve
+   operations reads the same way: its purpose in a sentence, the formula, what went in and
+   what came out, a picture, a few real values, and how the result is used next. It
+   follows one prompt position (the last word you typed) through every step, then hands
+   over explicitly to the final position, whose row actually chose the token. Nothing above
+   you disappears as you go, so you can always scroll back to a value you met earlier.
 
-   Every named variable is clickable — in a formula or in the list under it. Clicking one
-   fills the panel on the right with what it is, its shape in this run, where its numbers
-   came from, a few real values, and the complete stored array one click further on. A
+   Every named variable is clickable. Clicking one opens a panel with what it is, its
+   shape in this run, where its numbers came from, a few values (rounded for reading; hover
+   for the exact stored number), and the complete stored array one click further on. A
    variable the model computed but this capture did not keep says so instead, and shows you
    what *was* captured in its place. Nothing is ever reconstructed to fill a gap.
 
    **Understand the calculation** is the reference: twelve topics, each with the purpose,
-   the formula, a picture and an optional longer explanation. Every operation has an
-   **Explain this operation →** button pointing at the topic behind it, and every topic has
-   a **Follow this in the run →** button pointing back.
+   the formula, a picture and an optional longer explanation, each labelled with the
+   operation it explains. Every operation has an **Explain this operation →** button, and
+   every topic a **Follow this in the run →** button back.
 
-   The ribbon at the top keeps the prompt, the captured phase, the layer and the selected
-   token in view, and its **All captured arrays…** button opens every stored tensor with no
-   framing at all.
+   The bar at the top keeps the prompt, your chapter, the position being followed,
+   **Contents** and **Previous / Next** in view (Alt+← / Alt+→ work too). **All captured
+   arrays…** opens every stored tensor with no framing at all, and **Details…** shows what
+   TensorScope verified for the run.
 6. **Saved Runs** lists every past capture; select one and click **Open Recap** to
    reopen it. The stored tensors are the original values, at their original dtype.
    To browse a database from somewhere else, click **Choose Database…** (also on the

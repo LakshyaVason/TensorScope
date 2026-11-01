@@ -3,59 +3,63 @@
 `ComputationRecap` owns the window, the palette, the banner, the provenance evidence and
 the navigation between two pages:
 
+* **Follow this run** (`NotebookView`) — the default, and listed first.  One scrolling
+  worked calculation over this capture, from the prompt to the selected token and the
+  continuation, in four chapters.
 * **Understand the calculation** (`ReferenceView`) — twelve illustrated topics: purpose,
   formula, symbols, picture, and an optional deeper explanation.
-* **Follow this run** (`NotebookView`) — the default.  One scrolling worked calculation
-  over this capture, from the prompt to the selected token and the continuation.
 
-Every captured array stays reachable through the notebook ribbon's "All captured
-arrays..." button, which opens `RawView` in a modeless `RawTensorDialog`.  That is
-deliberately not a third row in `MODES`: see the comment there.
+Two bands of chrome, and the rest of the window is the page:
 
-The shell knows nothing about tensors.  Each page exposes the same small contract — a
-`NAV` list of `(section key, label)`, a `go_to(key)`, a `current_stage()`, and the
-`stage_changed` / `context_changed` signals — and the shell drives its navigator,
-sidebar, breadcrumb, progress pills and footer from those alone.  The pages themselves
-live in `tensorscope_notebook` and `tensorscope_reference`, re-exported through
-`tensorscope_views`; the widgets they are built from live in `tensorscope_common`.
+* the **banner** — which run, the mode toggle, "validated" with its evidence a click
+  away, and every captured array a click away;
+* the **reading bar** — the prompt, where the reader is (chapter and operation), the
+  page's own toolbar control (the notebook's Following control), a Contents menu, and
+  Previous / Next.
+
+That replaced a pipeline of thirteen chips, a sidebar list of the same thirteen, a
+breadcrumb, progress pills, a footer and a pinned ribbon of pickers -- six bands and five
+ways of navigating one list.  The pickers now appear inside the operation that explains
+them.
+
+The shell knows nothing about tensors.  Each page exposes a small contract — a `NAV` list
+of `(section key, label)`, `go_to(key)`, `current_stage()`, `stage_keys()`, the
+`stage_changed` / `context_changed` signals, and optionally `CHAPTERS`, `progress_text(key)`
+and `toolbar_widget()` — and the shell drives its controls from those alone.  It imports
+`tensorscope_common` and `tensorscope_views` and nothing else of ours.
 """
 from __future__ import annotations
 
 import json
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtGui import QFontMetrics, QKeySequence
 from PyQt5.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QShortcut, QSplitter,
-    QVBoxLayout, QWidget,
+    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QShortcut,
+    QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from tensorscope_common import (
-    COLORS, Card, Disclosure, PipelineNavigator, StageProgress, StageStack,
-    clear_layout, label,
+    COLORS, Card, ChapterProgress, ContentsButton, Disclosure, StageStack, chip_text, label,
 )
 from tensorscope_views import NotebookView, RawTensorDialog, ReferenceView
 
 
-# (key, sidebar/mode label, one-line purpose, view class).  Two pages, in the order the
-# reader is meant to think of them: the reference is page one and the worked run is page
-# two, and they use the same order and the same notation as each other.
+# (key, mode label, one-line purpose, view class).  The worked run first, because it is
+# the page a reader arriving at a finished capture wants and the one that opens; the
+# reference second, for when a step stops making sense.  Both use the same order and the
+# same notation.
 #
-# Every captured array is still reachable, through the notebook ribbon's
-# "All captured arrays..." button, which opens `RawTensorDialog`.  It is deliberately not
-# a third row here: a mode in this list competes with the pages for the reader's
-# attention, and the whole point of the redesign was to stop offering four readings of one
-# run instead of one that accumulates.
+# Every captured array is still reachable, through the banner's "All captured arrays..."
+# button, which opens `RawTensorDialog`.  It is deliberately not a third row here: a mode
+# in this list competes with the pages for the reader's attention.
 MODES = [
-    ('understand', 'Understand the calculation',
-     'Purpose, formula and a picture for each operation', ReferenceView),
     ('run', 'Follow this run',
      'One worked calculation, prompt to selected token', NotebookView),
+    ('understand', 'Understand the calculation',
+     'Purpose, formula and a picture for each operation', ReferenceView),
 ]
 
-# Which page opens first.  Not MODES[0]: the reference is page one by numbering, but a
-# reader arriving at a finished capture wants the run, and comes back here when a step
-# stops making sense.
 DEFAULT_MODE = 'run'
 
 MODE_INDEX = {key: (name, purpose, view) for key, name, purpose, view in MODES}
@@ -94,9 +98,12 @@ class ComputationRecap(QDialog):
         self._raw_dialog = None
         self._mode = None
         self._context = ''
+        self._details_dialog = None
+        self._toolbars: dict[str, QWidget] = {}
         self.setWindowTitle('TensorScope — Computation Recap')
-        self.resize(1300, 900)
-        self.setMinimumSize(900, 640)
+        # Designed at laptop size: the page gets the window, the chrome gets two rows.
+        self.resize(1366, 768)
+        self.setMinimumSize(1024, 640)
 
         colors = dict(DEFAULT_COLORS)
         colors.update(tokens or {})
@@ -121,66 +128,11 @@ class ComputationRecap(QDialog):
                 border-radius: 4px;
             }}
 
-            /* Pipeline navigator chips */
-            QPushButton#pipelineChip {{
-                border: 1px solid {colors['border']};
-                border-radius: 16px;
-                padding: 4px 12px;
-                background: {colors['card_bg']};
-                color: {colors['text_secondary']};
-                font-size: 12px;
-            }}
-            QPushButton#pipelineChip:hover {{
-                border-color: {colors['accent']};
-                color: {colors['text_primary']};
-            }}
-            QPushButton#pipelineChip:checked {{
-                background: {colors['accent']};
-                border-color: {colors['accent']};
-                color: #ffffff;
-                font-weight: 700;
-            }}
-            #pipelineArrow {{ color: {colors['text_muted']}; font-size: 14px; padding: 0 4px; }}
-
-            /* Layer step sidebar buttons */
-            QPushButton#layerStepBtn {{
-                text-align: left;
-                border: none;
-                border-radius: 5px;
-                padding: 6px 8px;
-                background: transparent;
-                color: {colors['text_secondary']};
-                font-size: 12px;
-            }}
-            QPushButton#layerStepBtn:hover {{
-                background: {colors['nav_active_bg']};
-                color: {colors['text_primary']};
-            }}
-            QPushButton#layerStepBtn:checked {{
-                background: {colors['nav_active_bg']};
-                color: {colors['text_primary']};
-                font-weight: 600;
-                border-left: 3px solid {colors['accent']};
-            }}
-            #stepSidebarHeader {{ font-size: 10px; letter-spacing: 0.06em; padding-bottom: 4px; }}
-
             /* Section rule */
             QFrame#sectionRule {{
                 background: {colors['border']};
                 max-height: 1px; min-height: 1px;
                 border: none; margin: 6px 0;
-            }}
-
-            /* Nav left panel */
-            #navItem {{
-                text-align: left; border: none; border-radius: 6px;
-                padding: 6px 10px; background: transparent;
-                color: {colors['text_secondary']};
-            }}
-            #navItem:hover {{ background: {colors['nav_active_bg']}; color: {colors['text_primary']}; }}
-            #navItem:checked {{
-                background: {colors['nav_active_bg']};
-                color: {colors['text_primary']}; font-weight: 600;
             }}
 
             /* Table styling */
@@ -248,12 +200,92 @@ class ComputationRecap(QDialog):
             }}
             #recapBannerSub {{ color: {colors['text_secondary']}; font-size: 11px; }}
 
-            /* Pipeline container */
-            #pipelineBar {{
+            /* The reading bar: prompt, progress, toolbar, contents, previous/next */
+            #readingBar {{
                 background: {colors['card_bg']};
                 border-bottom: 1px solid {colors['border']};
-                padding: 8px 20px;
             }}
+            #promptChip {{
+                color: {colors['text_primary']}; font-size: 12px; font-weight: 600;
+                padding: 3px 10px; border: 1px solid {colors['border']}; border-radius: 12px;
+            }}
+            QToolButton#contentsButton, QToolButton#focusChip {{
+                border: 1px solid {colors['border']}; border-radius: 6px;
+                padding: 5px 10px; background: transparent;
+                color: {colors['text_primary']}; font-size: 12px;
+            }}
+            QToolButton#contentsButton:hover, QToolButton#focusChip:hover,
+            QToolButton#contentsButton:focus, QToolButton#focusChip:focus {{
+                border-color: {colors['accent']};
+            }}
+            QPushButton#modeButton {{
+                border: 1px solid {colors['border']}; border-radius: 6px;
+                padding: 4px 12px; background: transparent;
+                color: {colors['text_secondary']}; font-size: 12px; text-align: center;
+            }}
+            QPushButton#modeButton:checked {{
+                background: {colors['nav_active_bg']}; color: {colors['text_primary']};
+                border-color: {colors['accent']}; font-weight: 600;
+            }}
+            QPushButton#stepButton {{
+                border: 1px solid {colors['border']}; border-radius: 6px;
+                padding: 5px 12px; background: transparent;
+                color: {colors['text_primary']}; font-size: 12px;
+            }}
+            QPushButton#stepButton:hover, QPushButton#stepButton:focus {{
+                border-color: {colors['accent']};
+            }}
+            QPushButton#stepButton:disabled {{ color: {colors['text_muted']}; }}
+
+            /* Teaching structure inside an operation */
+            #sectionKicker {{
+                color: {colors['accent']}; font-size: 11px; font-weight: 700;
+                letter-spacing: 0.08em;
+            }}
+            #sectionLede {{ font-size: 14px; }}
+            QFrame#destinationCard {{
+                background: {colors['bg']};
+                border: 1px solid {colors['border']};
+                border-left: 3px solid {colors['accent']};
+                border-radius: 8px;
+            }}
+            #destinationPrompt {{ font-size: 16px; font-weight: 700; }}
+            #destinationAnswer {{ font-size: 14px; }}
+            QWidget#ioRow {{
+                background: {colors['bg']};
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+            }}
+            #ioTag {{ font-size: 10px; font-weight: 700; letter-spacing: 0.08em; }}
+            #ioAction {{ font-size: 12px; font-style: italic; }}
+            #ioPlain {{ font-family: Consolas, 'Courier New', monospace; font-size: 12px; }}
+            #teachingNote {{
+                padding: 8px 12px;
+                border-left: 3px solid {colors['text_secondary']};
+                background: {colors['bg']};
+                border-radius: 4px; font-size: 12px;
+            }}
+            #takeawayLine {{
+                padding: 6px 0 2px 0; font-size: 12px; font-weight: 600;
+                color: {colors['text_primary']};
+            }}
+            #focusShift {{
+                padding: 10px 12px; font-size: 13px;
+                border: 1px solid {colors['accent']}; border-radius: 6px;
+            }}
+            QPushButton#passButton {{
+                text-align: left; border: 1px solid {colors['border']}; border-radius: 5px;
+                padding: 4px 10px; background: transparent;
+                color: {colors['text_primary']}; font-size: 12px;
+            }}
+            QPushButton#passButton:checked {{
+                border-color: {colors['accent']}; background: {colors['nav_active_bg']};
+            }}
+            QToolButton#panelClose {{
+                border: none; padding: 2px 6px; color: {colors['text_secondary']};
+                font-size: 13px;
+            }}
+            QToolButton#panelClose:hover {{ color: {colors['text_primary']}; }}
 
             /* Token chips.  An ID selector, so it beats the generic checkable rule
                above rather than inheriting its left-aligned padding. */
@@ -331,9 +363,6 @@ class ComputationRecap(QDialog):
                 font-size: 16px;
                 padding: 0 2px;
             }}
-
-            /* Mode purpose line under each mode button */
-            #modePurpose {{ color: {colors['text_muted']}; font-size: 10px; padding-left: 10px; }}
 
             /* ── The two scrolling pages ──────────────────────────────────── */
 
@@ -445,39 +474,24 @@ class ComputationRecap(QDialog):
                 border-color: {colors['accent']};
                 background: {colors['nav_active_bg']};
             }}
-            #referencePreamble, #contextRibbon {{
-                background: {colors['bg']};
-                border-bottom: 1px solid {colors['border']};
-            }}
-            /* The colour key sits directly under the ribbon, so it carries the bottom
-               border and the ribbon above it does not draw one between the two. */
-            #contextRibbon {{ border-bottom: none; }}
             #roleLegend {{
-                background: {colors['bg']};
                 border-bottom: 1px solid {colors['border']};
+                padding-bottom: 4px;
             }}
         ''')
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._banner(run_id))
-
-        pipeline_bar = QWidget()
-        pipeline_bar.setObjectName('pipelineBar')
-        pipeline_layout = QHBoxLayout(pipeline_bar)
-        pipeline_layout.setContentsMargins(20, 8, 20, 8)
-        self.pipeline_nav = PipelineNavigator([], self._nav_to, colors)
-        pipeline_layout.addWidget(self.pipeline_nav, 1)
-        self.progress = StageProgress()
-        pipeline_layout.addWidget(self.progress)
-        root.addWidget(pipeline_bar)
-
-        split = QSplitter(Qt.Horizontal)
-        root.addWidget(split, 1)
-        split.addWidget(self._sidebar())
-        split.addWidget(self._content())
-        split.setSizes([235, 1065])
+        self.banner = self._banner(run_id)
+        root.addWidget(self.banner)
+        self.reading_bar = self._reading_bar()
+        root.addWidget(self.reading_bar)
+        # The shell does not own a scroll area.  A page that scrolls as one long document
+        # controls its own scrollbar -- it navigates by moving the reader to a section.
+        # Views that do not scroll themselves get wrapped in `_host`.
+        self.stack = StageStack()
+        root.addWidget(self.stack, 1)
 
         for sequence, amount in (('Alt+Right', 1), ('Alt+Left', -1)):
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -491,90 +505,88 @@ class ComputationRecap(QDialog):
         host = QWidget()
         host.setObjectName('recapBanner')
         row = QHBoxLayout(host)
-        row.setContentsMargins(24, 10, 24, 10)
+        row.setContentsMargins(16, 6, 16, 6)
+        row.setSpacing(8)
         title = QLabel(
             f'{"Saved run #" + str(run_id) if run_id is not None else "Current capture"}  ·  '
-            f'{self.capture.metadata.get("model", "Model ID unavailable")}  ·  '
-            f'Real PyTorch capture')
+            f'{self.capture.metadata.get("model", "Model ID unavailable")}')
         title.setObjectName('recapBanner')
-        row.addWidget(title)
-        row.addStretch(1)
-        verified = QLabel('✓ Validated  ·  Stock-eager match attested')
-        verified.setStyleSheet('color: #16a34a; font-size: 11px;')
-        row.addWidget(verified)
-        return host
-
-    def _sidebar(self) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName('sidebar')
-        panel.setMinimumWidth(200)
-        panel.setMaximumWidth(250)
-        nav = QVBoxLayout(panel)
-        nav.setContentsMargins(12, 18, 12, 18)
-        nav.setSpacing(4)
-
-        nav.addWidget(label('MODE', muted=True))
+        title.setToolTip(title.text())
+        title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        title.setMinimumWidth(120)
+        row.addWidget(title, 1)
         self._mode_buttons: dict[str, QPushButton] = {}
         for key, name, purpose, _ in MODES:
             button = QPushButton(name)
-            button.setObjectName('navItem')
+            button.setObjectName('modeButton')
             button.setCheckable(True)
+            button.setToolTip(purpose)
+            button.setAccessibleName(name)
             button.clicked.connect(lambda _, k=key: self._show_mode(k))
-            nav.addWidget(button)
-            caption = QLabel(purpose)
-            caption.setObjectName('modePurpose')
-            caption.setWordWrap(True)
-            nav.addWidget(caption)
+            # Room for the bold checked state, which is wider than the hint it was sized by.
+            bold = button.font()
+            bold.setBold(True)
+            button.setMinimumWidth(QFontMetrics(bold).horizontalAdvance(name) + 34)
+            row.addWidget(button)
             self._mode_buttons[key] = button
+        verified = QLabel('✓ Validated capture')
+        verified.setStyleSheet(
+            f'color: {self._colors.get("success", "#16a34a")}; font-size: 12px; '
+            'font-weight: 600;')
+        verified.setToolTip('This run passed every verification gate when it was captured, '
+                            'and RunCapture.validate() passed when it was opened.')
+        row.addWidget(verified)
+        details = QPushButton('Details…')
+        details.setObjectName('crossPageLink')
+        details.setToolTip('What TensorScope verified for this run, and every saved field.')
+        details.clicked.connect(self.open_details)
+        row.addWidget(details)
+        self.details_button = details
+        raw = QPushButton('All captured arrays…')
+        raw.setObjectName('crossPageLink')
+        raw.setToolTip('Every stored array for every phase and layer, with no framing.')
+        raw.clicked.connect(self.open_raw_tensors)
+        row.addWidget(raw)
+        self.raw_button = raw
+        return host
 
-        nav.addSpacing(14)
-        self._stage_header = label('STAGES', muted=True)
-        nav.addWidget(self._stage_header)
-        self._stage_box = QVBoxLayout()
-        self._stage_box.setContentsMargins(0, 0, 0, 0)
-        self._stage_box.setSpacing(2)
-        self._stage_buttons: dict[str, QPushButton] = {}
-        nav.addLayout(self._stage_box)
-
-        nav.addStretch(1)
-        nav.addWidget(label(
-            f'{len(self.capture.layers)} layers · '
-            f'{len(self.capture.prompt_tokens)} prompt tokens\n'
-            f'Weight dtype: {self.capture.metadata.get("weight_dtype", "not recorded")}\n'
-            f'Stored dtype: {self.capture.embedding.dtype}',
-            muted=True))
-        return panel
-
-    def _content(self) -> QWidget:
-        colors = self._colors
+    def _reading_bar(self) -> QWidget:
         host = QWidget()
-        layout = QVBoxLayout(host)
-        layout.setContentsMargins(20, 12, 20, 12)
-        layout.setSpacing(8)
-
-        self.breadcrumb = label('')
-        self.breadcrumb.setStyleSheet(
-            f'color: {colors["text_secondary"]}; font-size: 12px;')
-        layout.addWidget(self.breadcrumb)
-        layout.addWidget(Disclosure('Capture provenance & verification', self._provenance))
-
-        # The shell no longer owns a scroll area.  A page that scrolls as one long
-        # document has to control its own scrollbar — it navigates by moving the reader to
-        # a section, which is the opposite of the scroll-to-top this used to force on every
-        # stage change.  Views that do not scroll themselves get wrapped in `_host`.
-        self.stack = StageStack()
-        layout.addWidget(self.stack, 1)
-
-        footer = QHBoxLayout()
+        host.setObjectName('readingBar')
+        row = QHBoxLayout(host)
+        row.setContentsMargins(16, 6, 16, 6)
+        row.setSpacing(8)
+        prompt = QLabel(f'“{chip_text(self.capture.prompt, 40)}”')
+        prompt.setObjectName('promptChip')
+        prompt.setToolTip(self.capture.prompt)
+        prompt.setTextFormat(Qt.PlainText)
+        prompt.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        prompt.setMinimumWidth(60)
+        row.addWidget(prompt)
+        self.progress = ChapterProgress()
+        self.progress.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.progress.setMinimumWidth(140)
+        row.addWidget(self.progress, 1)
+        # The page's own control -- the notebook's Following chip -- goes here, so the
+        # thread the page follows is always on screen.  Each page's widget is added once
+        # and shown only while its page is.
+        self._toolbar_row = QHBoxLayout()
+        self._toolbar_row.setContentsMargins(0, 0, 0, 0)
+        self._toolbar_row.setSpacing(0)
+        row.addLayout(self._toolbar_row)
+        self.contents = ContentsButton()
+        self.contents.navigate.connect(self._nav_to)
+        row.addWidget(self.contents)
         self.previous_stage = QPushButton('← Previous')
         self.next_stage = QPushButton('Next →')
-        self.next_stage.setObjectName('primary')
+        for button in (self.previous_stage, self.next_stage):
+            button.setObjectName('stepButton')
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.previous_stage.clicked.connect(lambda: self._advance(-1))
         self.next_stage.clicked.connect(lambda: self._advance(1))
-        footer.addWidget(self.previous_stage)
-        footer.addStretch(1)
-        footer.addWidget(self.next_stage)
-        layout.addLayout(footer)
+        row.addWidget(self.previous_stage)
+        row.addWidget(self.next_stage)
         return host
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -589,6 +601,12 @@ class ComputationRecap(QDialog):
             jump = getattr(view, 'jump_requested', None)
             if jump is not None:
                 jump.connect(self._jump_to)
+            make_toolbar = getattr(view, 'toolbar_widget', None)
+            if make_toolbar is not None:
+                toolbar = make_toolbar()
+                if toolbar is not None:
+                    self._toolbar_row.addWidget(toolbar)
+                    self._toolbars[key] = toolbar
             self._views[key] = view
             self._hosts[key] = self._host(view)
             self.stack.addWidget(self._hosts[key])
@@ -629,6 +647,23 @@ class ComputationRecap(QDialog):
         if isinstance(host, QScrollArea):
             host.verticalScrollBar().setValue(0)
 
+    def open_details(self) -> QWidget:
+        """The provenance evidence, in its own window: read once, not on every screen."""
+        if self._details_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle('Evidence for this run')
+            dialog.resize(720, 620)
+            layout = QVBoxLayout(dialog)
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.NoFrame)
+            area.setWidget(self._provenance())
+            layout.addWidget(area)
+            self._details_dialog = dialog
+        self._details_dialog.show()
+        self._details_dialog.raise_()
+        return self._details_dialog
+
     def open_raw_tensors(self) -> QWidget:
         """Every captured array, as a secondary control rather than a competing mode."""
         if self._raw_dialog is None:
@@ -664,37 +699,23 @@ class ComputationRecap(QDialog):
         self.stack.setCurrentWidget(self._hosts[key])
         for existing, button in self._mode_buttons.items():
             button.setChecked(existing == key)
+        for existing, toolbar in self._toolbars.items():
+            toolbar.setVisible(existing == key)
 
         stages = list(view.NAV)
-        self._rebuild_stage_buttons(stages)
-        self.pipeline_nav.set_stages(stages)
-        self.pipeline_nav.setVisible(bool(stages))
-        self._stage_header.setVisible(bool(stages))
-        self.previous_stage.setVisible(bool(stages))
-        self.next_stage.setVisible(bool(stages))
+        self.contents.set_sections(stages, getattr(view, 'CHAPTERS', None))
+        self.progress.set_chapters(getattr(view, 'CHAPTERS', None))
+        for control in (self.contents, self.progress, self.previous_stage, self.next_stage):
+            control.setVisible(bool(stages))
         self.previous_stage.setText(getattr(view, 'PREVIOUS_LABEL', '← Previous'))
         self.next_stage.setText(getattr(view, 'NEXT_LABEL', 'Next →'))
         if stages:
             self._stage_changed(view.current_stage())
         else:
-            # A stageless view built before the shell connected still has a position.
             announce = getattr(view, 'announce', None)
             if announce is not None:
                 announce()
-            else:
-                self._refresh_breadcrumb('')
             self._reset_scroll()
-
-    def _rebuild_stage_buttons(self, stages) -> None:
-        clear_layout(self._stage_box)   # not takeAt/deleteLater -- see clear_layout
-        self._stage_buttons.clear()
-        for position, (key, name) in enumerate(stages):
-            button = QPushButton(f'{position + 1:02}  {name}')
-            button.setObjectName('navItem')
-            button.setCheckable(True)
-            button.clicked.connect(lambda _, k=key: self._nav_to(k))
-            self._stage_box.addWidget(button)
-            self._stage_buttons[key] = button
 
     def _nav_to(self, key: str) -> None:
         # Guarded because this is a slot, and `go_to` raises KeyError for a key its page
@@ -706,38 +727,38 @@ class ComputationRecap(QDialog):
             self.view.go_to(key)
 
     def _advance(self, amount: int) -> None:
-        keys = list(self._stage_buttons)
-        if not keys:
+        keys = self.view.stage_keys()
+        current = self.view.current_stage()
+        if not keys or current not in keys:
             return
-        position = keys.index(self.view.current_stage()) + amount
+        position = keys.index(current) + amount
         if 0 <= position < len(keys):
             self._nav_to(keys[position])
 
     def _stage_changed(self, key: str) -> None:
-        for existing, button in self._stage_buttons.items():
-            button.setChecked(existing == key)
-        self.pipeline_nav.set_current(key)
-        keys = list(self._stage_buttons)
+        keys = self.view.stage_keys()
+        self.contents.set_current(key)
         if key in keys:
             position = keys.index(key)
+            names = dict(self.view.NAV)
             self.previous_stage.setEnabled(position > 0)
             self.next_stage.setEnabled(position < len(keys) - 1)
-            self.progress.set_position(position, len(keys), getattr(self.view, 'NOUN', 'Stage'))
-        self._refresh_breadcrumb(key)
+            self.previous_stage.setToolTip(
+                f'{names[keys[position - 1]]}  (Alt+Left)' if position > 0 else '')
+            self.next_stage.setToolTip(
+                f'{names[keys[position + 1]]}  (Alt+Right)' if position < len(keys) - 1
+                else '')
+            where = getattr(self.view, 'progress_text', None)
+            self.progress.set_position(
+                key, where(key) if where is not None else
+                f'{getattr(self.view, "NOUN", "Section")} {position + 1} of {len(keys)}')
         self._reset_scroll()
 
     def _context_changed(self, context: str) -> None:
+        # The reader's selection, kept for the progress indicator's tooltip.  The page's
+        # own Following control is where it is shown.
         self._context = context
-        self._refresh_breadcrumb(self.view.current_stage())
-
-    def _refresh_breadcrumb(self, stage_key: str) -> None:
-        trail = [MODE_INDEX[self._mode][0]]
-        stage_titles = dict(self.view.NAV)
-        if stage_key in stage_titles:
-            trail.append(stage_titles[stage_key])
-        if self._context:
-            trail.append(self._context)
-        self.breadcrumb.setText('  /  '.join(trail))
+        self.progress.setToolTip(context)
 
     # ── Evidence ──────────────────────────────────────────────────────────────
 
