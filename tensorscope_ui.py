@@ -1,17 +1,22 @@
 """The shell that hosts the reader-facing views of one capture.
 
 `ComputationRecap` owns the window, the palette, the banner, the provenance evidence and
-the navigation between four modes:
+the navigation between two pages:
 
-* **Lesson** (`LessonView`) — the default.  Eight screens, one real calculation each.
-* **Understand** (`LearnView`) — five questions about what the model did with this prompt.
-* **Internals** (`InternalsView`) — the same capture ordered by architecture.
-* **Raw tensors** (`RawView`) — every captured array, with no framing at all.
+* **Understand the calculation** (`ReferenceView`) — twelve illustrated topics: purpose,
+  formula, symbols, picture, and an optional deeper explanation.
+* **Follow this run** (`NotebookView`) — the default.  One scrolling worked calculation
+  over this capture, from the prompt to the selected token and the continuation.
 
-It knows nothing about tensors.  Each view exposes the same three things — a `NAV` list
-of `(stage key, label)`, a `go_to(key)`, and the `stage_changed` / `context_changed`
-signals — and the shell drives its navigator, breadcrumb and footer from those alone, so
-adding a mode does not touch this file's layout code.  The views themselves live in
+Every captured array stays reachable through the notebook ribbon's "All captured
+arrays..." button, which opens `RawView` in a modeless `RawTensorDialog`.  That is
+deliberately not a third row in `MODES`: see the comment there.
+
+The shell knows nothing about tensors.  Each page exposes the same small contract — a
+`NAV` list of `(section key, label)`, a `go_to(key)`, a `current_stage()`, and the
+`stage_changed` / `context_changed` signals — and the shell drives its navigator,
+sidebar, breadcrumb, progress pills and footer from those alone.  The pages themselves
+live in `tensorscope_notebook` and `tensorscope_reference`, re-exported through
 `tensorscope_views`; the widgets they are built from live in `tensorscope_common`.
 """
 from __future__ import annotations
@@ -26,7 +31,8 @@ from PyQt5.QtWidgets import (
 )
 
 from tensorscope_common import (
-    Card, Disclosure, PipelineNavigator, StageProgress, StageStack, label,
+    COLORS, Card, Disclosure, PipelineNavigator, StageProgress, StageStack,
+    clear_layout, label,
 )
 from tensorscope_views import NotebookView, RawTensorDialog, ReferenceView
 
@@ -60,6 +66,17 @@ DEFAULT_COLORS = {
     'accent': '#60a5fa', 'bg': '#111114',
     'text_muted': '#636370', 'nav_active_bg': '#202028',
 }
+
+
+def _role_chip_rules() -> str:
+    """One stylesheet rule per semantic role, read from the diagrams' own palette.
+
+    `COLORS` is the single source of these hues, so a chip and the picture beside it can
+    never disagree about what colour Q is.
+    """
+    return '\n'.join(
+        f'QPushButton#variableChip[role="{role}"] {{ border-left-color: {hue}; }}'
+        for role, hue in COLORS.items())
 
 
 class ComputationRecap(QDialog):
@@ -350,10 +367,15 @@ class ComputationRecap(QDialog):
             }}
 
             /* A clickable variable.  The provenance is in the text; the colour only
-               agrees with the diagrams. */
+               agrees with the diagrams.  VariableChip.refresh sets a dynamic `role`
+               property and re-polishes, and the rules below are what make that visible:
+               one colour bar down the left edge, so the hue never touches the text's
+               contrast and a reader who cannot tell the hues apart still reads
+               "Captured" or "Learned". */
             QPushButton#variableChip {{
                 text-align: left;
                 border: 1px solid {colors['border']};
+                border-left-width: 3px;
                 border-radius: 6px;
                 padding: 5px 10px;
                 background: transparent;
@@ -361,6 +383,7 @@ class ComputationRecap(QDialog):
                 font-family: Consolas, 'Courier New', monospace;
                 font-size: 12px;
             }}
+            {_role_chip_rules()}
             QPushButton#variableChip:hover {{
                 border-color: {colors['accent']};
                 background: {colors['nav_active_bg']};
@@ -423,6 +446,13 @@ class ComputationRecap(QDialog):
                 background: {colors['nav_active_bg']};
             }}
             #referencePreamble, #contextRibbon {{
+                background: {colors['bg']};
+                border-bottom: 1px solid {colors['border']};
+            }}
+            /* The colour key sits directly under the ribbon, so it carries the bottom
+               border and the ribbon above it does not draw one between the two. */
+            #contextRibbon {{ border-bottom: none; }}
+            #roleLegend {{
                 background: {colors['bg']};
                 border-bottom: 1px solid {colors['border']};
             }}
@@ -656,10 +686,7 @@ class ComputationRecap(QDialog):
             self._reset_scroll()
 
     def _rebuild_stage_buttons(self, stages) -> None:
-        while self._stage_box.count():
-            item = self._stage_box.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+        clear_layout(self._stage_box)   # not takeAt/deleteLater -- see clear_layout
         self._stage_buttons.clear()
         for position, (key, name) in enumerate(stages):
             button = QPushButton(f'{position + 1:02}  {name}')
@@ -670,7 +697,13 @@ class ComputationRecap(QDialog):
             self._stage_buttons[key] = button
 
     def _nav_to(self, key: str) -> None:
-        self.view.go_to(key)
+        # Guarded because this is a slot, and `go_to` raises KeyError for a key its page
+        # does not own.  An exception escaping a slot makes PyQt call abort(): the process
+        # dies with no traceback and an exit code indistinguishable from a native crash,
+        # which is how a plain KeyError here reads to a user as "Segmentation fault".
+        # A control left over from the other page should do nothing, not kill the app.
+        if key in self.view.stage_keys():
+            self.view.go_to(key)
 
     def _advance(self, amount: int) -> None:
         keys = list(self._stage_buttons)

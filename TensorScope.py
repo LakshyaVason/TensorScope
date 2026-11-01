@@ -26,6 +26,7 @@ are needed, because one is not sufficient:
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import html
 import io
 import json
@@ -50,7 +51,9 @@ APP_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("MPLCONFIGDIR", str(APP_DIR / ".matplotlib"))
 
 import numpy as np
-from PyQt5.QtCore import QLineF, QPointF, QRectF, QSize, QThread, Qt, pyqtSignal
+from PyQt5.QtCore import (
+    QLineF, QObject, QPointF, QRectF, QSize, QThread, QTimer, Qt, pyqtSignal, pyqtSlot,
+)
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
@@ -71,6 +74,24 @@ if getattr(sys, "frozen", False):
         DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
 else:
     DB_PATH = APP_DIR / "tensorscope_runs.sqlite3"
+
+# Opened by the __main__ block when the GUI starts, and never closed: faulthandler keeps
+# the raw file descriptor, so closing the Python object would leave it writing to a dead
+# one.  Stays None for every other entry point (--self-test, test_recap.py,
+# verify_capture.py), which must not drop a log file beside the run database.
+_CRASH_LOG: Any = None
+
+
+def _crash_note(message: str) -> None:
+    """Record a line in the crash log, if one is open.  Never raises."""
+    if _CRASH_LOG is None:
+        return
+    try:
+        _CRASH_LOG.write(f"{dt.datetime.now(dt.timezone.utc).isoformat()} {message}\n")
+        _CRASH_LOG.flush()
+    except Exception:
+        pass
+
 
 # Bumped to 4 for per-token decision telemetry (the generation_steps table).  Nothing
 # reads this number to decide behaviour: the real discriminator for a pre-telemetry run
@@ -687,6 +708,42 @@ class CaptureAttention:
         return attn_output, weights
 
 
+_MODEL_STACK_READY = False
+
+
+def preimport_model_stack() -> None:
+    """Import torch and transformers **on the calling thread**.
+
+    This must be called on the GUI thread before any worker thread touches torch.
+
+    The process's first `import torch` on a secondary thread -- while the Qt event loop
+    pumps Windows messages and numpy/OpenBLAS, Qt5 and matplotlib have already loaded
+    their DLLs -- killed the process with an access violation inside
+    torch/_strobelight/compile_time_profiler.py.  There was no Python exception, so the
+    worker's `except` never fired and the user saw only "Segmentation fault".  It is a
+    race, not a certainty: observed once in twelve runs, and on the coldest start, where
+    the import spends longest reading and compiling bytecode.  That is exactly why it
+    needs a rule rather than a retry -- a green run proves nothing here.
+
+    Nothing here is imported at module scope.  Browse-only mode must still open saved
+    runs on a machine with no torch installed (see the find_spec probe in __main__), and
+    test_recap.ForbidModelImports fails the recap tests if this module imports torch.
+    """
+    global _MODEL_STACK_READY
+    if _MODEL_STACK_READY:
+        return
+    import torch                                                   # noqa: F401
+    import transformers                                            # noqa: F401
+    import transformers.modeling_utils                             # noqa: F401
+    import transformers.masking_utils                              # noqa: F401
+    # transformers 5.x is a _LazyModule, so importing the package alone leaves the auto
+    # classes -- and transitively the `tokenizers` Rust extension, safetensors,
+    # huggingface_hub and regex -- for whoever first touches the names.  Touch them here
+    # so that chain also loads on this thread.
+    from transformers import AutoModelForCausalLM, AutoTokenizer    # noqa: F401
+    _MODEL_STACK_READY = True
+
+
 class ModelCapture:
     """Loads a local Hugging Face model and captures its exact intermediate tensors.
 
@@ -705,6 +762,9 @@ class ModelCapture:
         self._embedding_scratch: dict[str, Any] = {}
         self._per_layer: dict[int, dict] = {}
         self._capturing = False
+        # Retained so unload() can remove them.  Without this the hook closures, which
+        # capture `self`, keep the model alive through a reference cycle -- see unload().
+        self._hooks: list = []
 
     @property
     def loaded(self) -> bool:
@@ -727,7 +787,11 @@ class ModelCapture:
             if progress:
                 progress(message)
 
-        announce("Importing torch...")
+        # These are sys.modules lookups, not real imports: preimport_model_stack() has
+        # already run on the GUI thread.  Doing the process's first `import torch` here,
+        # on a worker thread, is what crashed the application with an access violation --
+        # read preimport_model_stack()'s docstring before moving it back.  The statements
+        # stay so that a headless caller (verify_capture.py, a REPL) still works.
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -749,6 +813,50 @@ class ModelCapture:
         announce("Installing capture hooks...")
         self._install()
         announce(f"Ready — {self.describe()}")
+
+    def unload(self) -> None:
+        """Release the model and every reference that pins it.
+
+        Must run on the thread that owns the CUDA allocations -- see ModelWorker, which
+        is why loading, generating and unloading all happen on one thread.
+
+        Re-loading without this leaks the previous model for the process lifetime.  The
+        forward-hook closures installed by _install() capture `self`, so
+        model -> module._forward_hooks -> closure -> self -> model is a reference cycle,
+        and nothing in this application ever ran a cycle collection; two Qwen3-4B copies
+        do not fit on a 16 GB card.  Removing the retained handles breaks the cycle, so
+        the weights die on refcount zero rather than waiting for the garbage collector.
+
+        What this deliberately does *not* do is unregister the attention backend.  The
+        invariant _register_implementation protects is that the name is present in the
+        class-wide _global_mapping whenever a capture runs, and _install() re-registers
+        and re-asserts that on every load.  Clearing `attention.sink` below leaves the
+        retained CaptureAttention holding no tensors at all, and GeneralInterface.register
+        replaces the value under the same key, so the next load drops the old object as a
+        side effect.  Do not "finish the job" by deleting the key: nothing unverified may
+        ever be left sitting in that registry.
+        """
+        if self.attention is not None:
+            self.attention.sink = None   # drops the last _per_layer dict of CUDA tensors
+        for handle in self._hooks:
+            try:
+                handle.remove()
+            except Exception:
+                pass                     # a half-installed capture must still tear down
+        self._hooks.clear()
+        self._scratch.clear()
+        self._embedding_scratch.clear()
+        self._per_layer.clear()
+        self._capturing = False
+        self.model = None
+        self.tokenizer = None
+        self.attention = None
+        gc.collect()
+        # sys.modules rather than `import torch`: unloading a capture that never loaded
+        # (browse-only mode) must not drag torch into the process.
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _registry(module_path: str, name: str):
@@ -817,16 +925,18 @@ class ModelCapture:
             if self._capturing:
                 self._embedding_scratch["embedding"] = first_tensor(output).detach()
 
-        self.model.model.embed_tokens.register_forward_hook(embed_hook)
+        self._hooks.append(self.model.model.embed_tokens.register_forward_hook(embed_hook))
 
         for index, layer in enumerate(layers):
             self._per_layer[index] = {}
-            layer.input_layernorm.register_forward_hook(record(index, "normalized_input"))
-            layer.self_attn.q_proj.register_forward_hook(record(index, "q"))
-            layer.self_attn.k_proj.register_forward_hook(record(index, "k"))
-            layer.self_attn.v_proj.register_forward_hook(record(index, "v"))
-            layer.self_attn.o_proj.register_forward_hook(record(index, "attention_output"))
-            layer.register_forward_hook(record(index, "layer_output"))
+            self._hooks.append(layer.input_layernorm.register_forward_hook(
+                record(index, "normalized_input")))
+            self._hooks.append(layer.self_attn.q_proj.register_forward_hook(record(index, "q")))
+            self._hooks.append(layer.self_attn.k_proj.register_forward_hook(record(index, "k")))
+            self._hooks.append(layer.self_attn.v_proj.register_forward_hook(record(index, "v")))
+            self._hooks.append(layer.self_attn.o_proj.register_forward_hook(
+                record(index, "attention_output")))
+            self._hooks.append(layer.register_forward_hook(record(index, "layer_output")))
 
             def bind(layer_index):
                 def pre_hook(_module, _args, _kwargs):
@@ -834,7 +944,8 @@ class ModelCapture:
                     self.attention.sink = self._per_layer[layer_index] if self._capturing else None
                     return None
                 return pre_hook
-            layer.self_attn.register_forward_pre_hook(bind(index), with_kwargs=True)
+            self._hooks.append(
+                layer.self_attn.register_forward_pre_hook(bind(index), with_kwargs=True))
 
     def _drain(self) -> tuple[dict[int, LayerCapture], np.ndarray]:
         """Convert one forward pass worth of captures to host arrays and reset."""
@@ -1238,52 +1349,80 @@ class RunDatabase:
         return capture
 
 
-class LoadWorker(QThread):
-    """Import torch and load model weights off the Qt event loop."""
+class ModelWorker(QObject):
+    """Owns every torch and CUDA call for the process lifetime, on one thread.
+
+    There used to be two one-shot QThreads here, a LoadWorker and a GenerationWorker.
+    That arrangement had two defects, both of which crash natively rather than raising:
+
+    1. The LoadWorker performed the process's first `import torch`, on a secondary
+       thread, which is what killed the application with an access violation.  The
+       import now happens on the GUI thread in preimport_model_stack(); read its
+       docstring before moving anything back here.  transformers was imported there
+       too, and is warmed the same way.
+    2. The CUDA context was created on the LoadWorker, that thread then *exited*, and
+       every later kernel ran on a different thread.  Formally legal -- a CUDA primary
+       context is per-process -- but a known crash source on Windows.  One long-lived
+       thread for load, generate and unload retires it.
+
+    Nothing here may be called directly from the GUI thread: a direct Python call runs
+    on the *caller's* thread and silently undoes the whole point.  Every entry point is
+    a slot reached only through a queued signal.  The connections are made in __init__,
+    on the GUI thread and before moveToThread, so Qt.AutoConnection resolves to
+    Qt.QueuedConnection once this object lives on the worker thread.
+    """
+
+    # Requests, emitted from the GUI thread.  Signal emission is thread-safe.
+    load_requested = pyqtSignal(str)
+    run_requested = pyqtSignal(str, int)
+    unload_requested = pyqtSignal()
+    # Results.
     progress = pyqtSignal(str)
     loaded = pyqtSignal(str)
-    failed = pyqtSignal(str)
-    warning = pyqtSignal(str)
-
-    def __init__(self, capture_model: ModelCapture) -> None:
-        super().__init__()
-        self.capture_model = capture_model
-
-    def run(self) -> None:
-        try:
-            # Importing torch is slow, so the VRAM check lives here rather than on the GUI
-            # thread; the window no longer imports torch at all before it appears.
-            import torch
-            if torch.cuda.is_available():
-                total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-                if total_gb < 8.0:
-                    self.warning.emit(
-                        f"Your GPU has ~{total_gb:.1f} GB VRAM.\n"
-                        "Qwen3-4B needs ~7.6 GB peak (bf16).  "
-                        "Consider Qwen/Qwen2.5-0.5B-Instruct instead.")
-            self.capture_model.load(self.progress.emit)
-            self.loaded.emit(self.capture_model.describe())
-        except Exception as exc:
-            self.failed.emit(f"{exc}\n\n{traceback.format_exc(limit=2)}")
-
-
-class GenerationWorker(QThread):
-    """Keep blocking local inference and capture outside Qt's event loop."""
+    load_failed = pyqtSignal(str)
     text_received = pyqtSignal(str)
     finished_capture = pyqtSignal(object)
-    failed = pyqtSignal(str)
+    run_failed = pyqtSignal(str)
 
-    def __init__(self, capture_model: ModelCapture, prompt: str, max_new_tokens: int = 128) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.capture_model, self.prompt, self.max_new_tokens = capture_model, prompt, max_new_tokens
+        self.capture_model: ModelCapture | None = None
+        self.load_requested.connect(self._load)
+        self.run_requested.connect(self._run)
+        self.unload_requested.connect(self._unload)
 
-    def run(self) -> None:
+    @pyqtSlot(str)
+    def _load(self, model_id: str) -> None:
         try:
-            capture = self.capture_model.generate(
-                self.prompt, self.max_new_tokens, self.text_received.emit)
-            self.finished_capture.emit(capture)
-        except Exception as exc:  # worker must pass readable errors to Qt, not crash its thread
-            self.failed.emit(f"{exc}\n\n{traceback.format_exc(limit=2)}")
+            self._unload()          # free the previous model before allocating another
+            self.capture_model = ModelCapture(model_id)
+            self.capture_model.load(self.progress.emit)
+            self.loaded.emit(self.capture_model.describe())
+        except BaseException as exc:
+            # BaseException, not Exception: anything escaping a slot invoked from a
+            # QThread's event loop makes PyQt abort the process with no traceback, which
+            # in a windowed build is indistinguishable from the native crash this class
+            # exists to avoid.
+            self.load_failed.emit(f"{exc}\n\n{traceback.format_exc(limit=3)}")
+
+    @pyqtSlot(str, int)
+    def _run(self, prompt: str, max_new_tokens: int) -> None:
+        try:
+            if self.capture_model is None or not self.capture_model.loaded:
+                raise CaptureProtocolError("No model is loaded.")
+            self.finished_capture.emit(self.capture_model.generate(
+                prompt, max_new_tokens, self.text_received.emit))
+        except BaseException as exc:  # pass readable errors to Qt, never crash the thread
+            self.run_failed.emit(f"{exc}\n\n{traceback.format_exc(limit=3)}")
+
+    @pyqtSlot()
+    def _unload(self) -> None:
+        if self.capture_model is not None:
+            try:
+                self.capture_model.unload()
+            except BaseException:
+                pass                # teardown must never be the thing that kills the app
+            self.capture_model = None
 
 
 # The read-only recap is separated from the protected capture and persistence code.
@@ -1349,9 +1488,18 @@ class TensorScopeMainWindow(QMainWindow):
     def __init__(self, start_in_browse: bool = False, db_path: Path | None = None) -> None:
         super().__init__()
         self.database = RunDatabase(db_path or DB_PATH)
-        self.capture_model = ModelCapture(os.getenv("TENSORSCOPE_MODEL", DEFAULT_MODEL_ID))
-        self.worker: GenerationWorker | None = None
-        self.loader: LoadWorker | None = None
+        # The ModelCapture itself now lives on the worker thread, which owns every torch
+        # call.  The window keeps only what it needs to label the UI.
+        self._model_id_default = os.getenv("TENSORSCOPE_MODEL", DEFAULT_MODEL_ID)
+        self._wanted_model_id = self._model_id_default
+        self._model_loaded = False
+        self.model_thread: QThread | None = None
+        self.model_worker: ModelWorker | None = None
+        # The worker thread is always running, so isRunning() cannot say whether a
+        # request is outstanding.  This flag does: "load", "run", or None.  Disabled
+        # buttons are not a sufficient guard, because every QMessageBox in this file
+        # spins a nested event loop during which a queued click can still arrive.
+        self._busy: str | None = None
         self._open_recaps: list[ComputationRecap] = []
 
         self.setWindowTitle("TensorScope")
@@ -1574,7 +1722,7 @@ class TensorScopeMainWindow(QMainWindow):
         mdl_row = QHBoxLayout()
         mdl_lbl = QLabel("Model ID"); mdl_lbl.setObjectName("rowLabel"); mdl_row.addWidget(mdl_lbl)
         mdl_row.addStretch(1)
-        self.model_id = QLineEdit(self.capture_model.model_id)
+        self.model_id = QLineEdit(self._model_id_default)
         self.model_id.setMinimumWidth(200); self.model_id.setMaximumWidth(300)
         mdl_row.addWidget(self.model_id)
         self.load_button = QPushButton("Load"); mdl_row.addWidget(self.load_button)
@@ -1615,6 +1763,14 @@ class TensorScopeMainWindow(QMainWindow):
         )
         about_body.setWordWrap(True); about_body.setObjectName("rowValue")
         about_cl.addWidget(about_body)
+        # A native crash bypasses every error dialog, so the one useful thing to tell a
+        # user reporting one is where the dump landed.  Selectable, so they can copy it.
+        if _CRASH_LOG is not None:
+            about_cl.addWidget(_divider())
+            crash_row = QLabel(f"Crash log: {getattr(_CRASH_LOG, 'name', 'enabled')}")
+            crash_row.setWordWrap(True); crash_row.setObjectName("rowValue")
+            crash_row.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            about_cl.addWidget(crash_row)
         about_l.addWidget(about_card); about_l.addStretch(1)
         self.screens.addWidget(about_scr)  # index 3
 
@@ -1724,30 +1880,112 @@ class TensorScopeMainWindow(QMainWindow):
         self.live_model_status.setStyleSheet(f"color:{col};font-size:12px;")
         self._goto_settings_btn.setVisible(not loaded)
 
+    def _ensure_model_thread(self) -> None:
+        """Create the one torch-owning thread, once, AFTER preimport_model_stack() ran.
+
+        Lazy on purpose: browse-only mode starts no thread at all and the window still
+        appears immediately.
+        """
+        if self.model_thread is not None:
+            return
+        self.model_thread = QThread(self)       # parented, so Qt keeps it alive
+        self.model_worker = ModelWorker()       # must have NO parent: moveToThread
+        self.model_worker.moveToThread(self.model_thread)
+        self.model_worker.progress.connect(lambda msg: self._say(msg, TOKENS["accent"]))
+        self.model_worker.loaded.connect(self.model_ready)
+        self.model_worker.load_failed.connect(self.load_failed)
+        self.model_worker.text_received.connect(self.output.insertPlainText)
+        self.model_worker.finished_capture.connect(self.persist_and_show)
+        self.model_worker.run_failed.connect(self.run_failed)
+        self.model_thread.start()
+
+    def _vram_is_sufficient(self) -> bool:
+        """Warn before loading rather than during it.  False means the user backed out.
+
+        This used to run on the loader thread, only because that was where torch got
+        imported.  Asking here is strictly better: the old modal appeared *while* the
+        loader was already pulling weights in, so the answer could not affect anything.
+        """
+        import torch                             # already in sys.modules by now
+        if not torch.cuda.is_available():
+            return True
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        if total_gb >= 8.0:
+            return True
+        return QMessageBox.warning(
+            self, "VRAM warning",
+            f"Your GPU has ~{total_gb:.1f} GB VRAM.\n"
+            "Qwen3-4B needs ~7.6 GB peak (bf16).  "
+            "Consider Qwen/Qwen2.5-0.5B-Instruct instead.\n\nLoad anyway?",
+            QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Ok
+
     def load_model(self) -> None:
         wanted = self.model_id.text().strip()
         if not wanted:
             QMessageBox.information(self, "Model required", "Enter a Hugging Face model id.")
             return
-        self.capture_model = ModelCapture(wanted)
+        if self._busy:
+            return
+        self._busy = "load"
         self.load_button.setEnabled(False)
         self.run_button.setEnabled(False)
+        self._say("Importing PyTorch — this takes 10–30 seconds the first time…",
+                  TOKENS["accent"])
+        self._set_live_model_label("Importing PyTorch…")
+        self.setWindowTitle("TensorScope — importing PyTorch…")
+        # repaint() paints synchronously without re-entering event delivery.  Do NOT use
+        # processEvents() here: it can deliver a second Load click, or a close event, in
+        # the middle of the blocking import below.
+        self.load_status.repaint()
+        self.status.repaint()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        # One turn of the event loop, so the label above is definitely on screen before
+        # the import blocks this thread.  A zero timer fires only once no window-system
+        # events remain, i.e. after the pending paint.
+        QTimer.singleShot(0, lambda model_id=wanted: self._start_load(model_id))
+
+    def _start_load(self, model_id: str) -> None:
+        """Import the model stack on THIS (the GUI) thread, then hand off to the worker.
+
+        The import must not move onto the worker thread; see preimport_model_stack().
+        """
+        try:
+            preimport_model_stack()
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            self.setWindowTitle("TensorScope")
+            self._busy = None
+            self.load_failed(f"PyTorch could not be imported.\n\n{exc}\n\n"
+                             f"{traceback.format_exc(limit=3)}")
+            return
+        QApplication.restoreOverrideCursor()
+        self.setWindowTitle("TensorScope")
+
+        if not self._vram_is_sufficient():
+            self._busy = None
+            self.load_button.setEnabled(True)
+            self._say("Load cancelled.", TOKENS["text_muted"])
+            self._set_live_model_label("No model loaded")
+            return
+
+        self._wanted_model_id = model_id
+        self._model_loaded = False
         self._say("Loading model…", TOKENS["accent"])
         self._set_live_model_label("Loading…")
-        self.loader = LoadWorker(self.capture_model)
-        self.loader.progress.connect(lambda msg: self._say(msg, TOKENS["accent"]))
-        self.loader.loaded.connect(self.model_ready)
-        self.loader.failed.connect(self.load_failed)
-        self.loader.warning.connect(lambda text: QMessageBox.warning(self, "VRAM warning", text))
-        self.loader.start()
+        self._ensure_model_thread()
+        self.model_worker.load_requested.emit(model_id)
 
     def model_ready(self, description: str) -> None:
+        self._busy = None
+        self._model_loaded = True
         self.load_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self._say(f"Ready — {description}", TOKENS["success"])
-        self._set_live_model_label(self.capture_model.model_id, loaded=True)
+        self._set_live_model_label(self._wanted_model_id, loaded=True)
 
     def load_failed(self, message: str) -> None:
+        self._busy = None
+        self._model_loaded = False
         self.load_button.setEnabled(True)
         self._say("Model could not be loaded.", "#dc2626")
         self._set_live_model_label("Load failed")
@@ -1758,18 +1996,17 @@ class TensorScopeMainWindow(QMainWindow):
         if not prompt_text:
             QMessageBox.information(self, "Prompt required", "Enter a prompt before running.")
             return
-        if not self.capture_model.loaded:
+        if not self._model_loaded:
             QMessageBox.information(self, "Model required", "Load a model in Settings first.")
             return
+        if self._busy:
+            return
+        self._busy = "run"
         self.output.clear()
         self._out_card.setVisible(True)
         self.run_button.setEnabled(False)
         self._say("Running the forward pass and capturing tensors…", TOKENS["accent"])
-        self.worker = GenerationWorker(self.capture_model, prompt_text)
-        self.worker.text_received.connect(self.output.insertPlainText)
-        self.worker.finished_capture.connect(self.persist_and_show)
-        self.worker.failed.connect(self.run_failed)
-        self.worker.start()
+        self.model_worker.run_requested.emit(prompt_text, 128)
 
     def persist_and_show(self, capture: RunCapture) -> None:
         try:
@@ -1786,12 +2023,39 @@ class TensorScopeMainWindow(QMainWindow):
             self._say("Generation completed but the capture could not be saved.", "#dc2626")
             QMessageBox.critical(self, "Database error", str(exc))
         finally:
+            self._busy = None
             self.run_button.setEnabled(True)
 
     def run_failed(self, message: str) -> None:
+        self._busy = None
         self.run_button.setEnabled(True)
         self._say("Run failed: an exact capture was not available.", "#dc2626")
         QMessageBox.critical(self, "Capture failed", message)
+
+    def closeEvent(self, event) -> None:
+        """Stop the torch thread before Qt tears the window down underneath it."""
+        if self._busy and QMessageBox.question(
+                self, "Still working",
+                "A model load or capture is still running. Quit anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            event.ignore()
+            return
+        for recap in list(self._open_recaps):
+            recap.close()
+        if self.model_thread is not None:
+            # Both are posted to the worker's event loop and run in order, so the unload
+            # completes before the loop exits and the model is freed on the thread that
+            # allocated it.
+            self.model_worker.unload_requested.emit()
+            self.model_thread.quit()
+            if not self.model_thread.wait(20_000):
+                # A load or generate already inside CUDA cannot be interrupted, and
+                # terminate() would leave driver state undefined -- a worse crash than
+                # none.  Leave without running interpreter shutdown instead, so no
+                # destructor races a live worker.
+                _crash_note("worker thread did not stop within 20s; exiting hard")
+                os._exit(0)
+        super().closeEvent(event)
 
 
 
@@ -1892,6 +2156,15 @@ def self_test() -> None:
         REQUIRED_LAYER_TENSORS - set(TENSOR_SYMBOLS)
     assert all(symbol.strip() for symbol in TENSOR_SYMBOLS.values())
     assert all(role.strip() for role in VARIABLE_ROLES.values())
+
+    # The colour key names roles; tensorscope_common.COLORS holds the hues.  A legend
+    # entry for a role with no colour would print a name beside nothing, and a role the
+    # diagrams use but the legend omits would be an unexplained hue on the page.
+    from tensorscope_common import COLORS as _ROLE_COLORS
+    from tensorscope_content import ROLE_LEGEND
+    assert {role for role, _ in ROLE_LEGEND} == set(_ROLE_COLORS), \
+        {role for role, _ in ROLE_LEGEND} ^ set(_ROLE_COLORS)
+    assert all(name.strip() for _, name in ROLE_LEGEND)
 
     # Conceptual variables are described, never shown as data, so the one thing that must
     # hold is that every one of them has a description and a provenance the badge knows.
@@ -2076,6 +2349,57 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         self_test()
     else:
+        # A native crash (access violation) bypasses every `except` in this file, so the
+        # only way to learn where it happened is a faulthandler dump.  It has to go to a
+        # file, not stderr: build/tensorscope.spec sets console=False, so sys.stderr is
+        # None in a packaged build and a bare enable() would write nowhere.  all_threads
+        # is the part that matters -- the fault is usually on a worker thread.
+        import faulthandler
+        _crash_target = os.getenv("TENSORSCOPE_CRASH_LOG", "")
+        if _crash_target.lower() not in {"0", "off", "none"}:
+            try:
+                _crash_path = (Path(_crash_target) if _crash_target
+                               else DB_PATH.parent / "tensorscope-crash.log")
+                _CRASH_LOG = open(_crash_path, "a", buffering=1,
+                                  encoding="utf-8", errors="replace")
+                _CRASH_LOG.write(
+                    f"\n=== TensorScope {dt.datetime.now(dt.timezone.utc).isoformat()} "
+                    f"pid={os.getpid()} frozen={getattr(sys, 'frozen', False)} ===\n"
+                    "# `code 0x8001010d` (RPC_E_CANTCALLOUT_ININPUTSYNCCALL) is benign Qt\n"
+                    "# COM noise: faulthandler reports it as a first-chance exception and\n"
+                    "# it appears on every launch, including browse-only runs that never\n"
+                    "# import torch.  The entry worth reading is `access violation`.\n")
+                faulthandler.enable(file=_CRASH_LOG, all_threads=True)
+            except OSError:
+                _CRASH_LOG = None  # a read-only install directory must never block launch
+
+        def _log_unhandled(kind, value, tb) -> None:
+            """Write down an exception that escaped a slot, before PyQt kills us.
+
+            faulthandler does not cover this case.  PyQt responds to an unhandled
+            exception raised inside a slot by calling Qt's abort() -- not a signal, so
+            faulthandler never sees it -- and the process dies with no traceback and an
+            exit code a user cannot tell apart from a native crash.  A plain KeyError in
+            a navigation slot therefore reads to them as "Segmentation fault".
+
+            sys.excepthook runs first, and is the only chance to record what it was.
+            """
+            if _CRASH_LOG is not None:
+                try:
+                    _CRASH_LOG.write(
+                        f"\n--- unhandled exception "
+                        f"{dt.datetime.now(dt.timezone.utc).isoformat()} ---\n")
+                    traceback.print_exception(kind, value, tb, file=_CRASH_LOG)
+                    _CRASH_LOG.flush()
+                except Exception:
+                    pass
+            try:
+                sys.__excepthook__(kind, value, tb)
+            except Exception:
+                pass            # stderr is None in a windowed build; the log has it
+
+        sys.excepthook = _log_unhandled
+
         demo_mode = "--demo" in sys.argv
         if not demo_mode:
             # find_spec answers "is torch installed?" without the multi-second import.

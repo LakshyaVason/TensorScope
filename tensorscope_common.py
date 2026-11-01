@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
 from tensor_widgets import exact_scalar
 from tensorscope_content import (
     EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
-    EVIDENCE_UNATTESTED, STRUCTURE_NOT_TIMING_NOTE, readable_spelling,
+    EVIDENCE_UNATTESTED, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE, readable_spelling,
 )
 
 
@@ -66,6 +66,27 @@ CHROME = {
 
 
 # ── Label helpers ────────────────────────────────────────────────────────────
+
+def clear_layout(layout) -> None:
+    """Empty a layout and take its widgets off screen *now*.
+
+    `takeAt` only removes the layout item: the widget keeps its parent, its geometry and
+    its visibility, and `deleteLater` does not change that until the event loop gets round
+    to the deferred delete.  In between, the old widgets are still painted over the new
+    ones, still found by `findChildren`, and still clickable -- and clicking a stale
+    navigator chip calls `go_to` with a key the current page does not have, which raises
+    inside a slot, which makes PyQt abort the process with no traceback at all.
+
+    `setParent(None)` is what actually retires them, so this helper exists rather than the
+    `takeAt`/`deleteLater` pair that is easy to write and subtly wrong.
+    """
+    while layout.count():
+        item = layout.takeAt(0)
+        widget = item.widget() if item is not None else None
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+
 
 def label(text, *, rich=False, muted=False, title=False, small=False):
     result = QLabel(text)
@@ -149,13 +170,7 @@ def replace_in(layout, widget) -> None:
     rather than mutating labels in place keeps every builder a pure function of the
     current selection, which is what makes them safe to call from the tests.
     """
-    while layout.count():
-        item = layout.takeAt(0)
-        child = item.widget()
-        if child is not None:
-            # Bind first: setParent(None) can leave the item's widget() returning None.
-            child.setParent(None)
-            child.deleteLater()
+    clear_layout(layout)
     if widget is not None:
         layout.addWidget(widget)
 
@@ -223,6 +238,56 @@ class EvidenceBadge(QLabel):
         self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
 
 
+class RoleLegend(QWidget):
+    """What the semantic colours mean, once, for a whole page.
+
+    Every coloured element on a page already carries its own text label, so this is
+    redundancy rather than a key the reader must consult.  It exists because the hues are
+    *stable* across the page -- Q is the same blue in operation 5 and in operation 7 --
+    and a reader who notices that deserves to be told what the stability means.
+
+    Reads ROLE_LEGEND for the names and COLORS for the hues, so it cannot disagree with
+    the diagrams or the variable chips about what colour a role is.
+    """
+
+    def __init__(self, roles=ROLE_LEGEND, tokens=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName('roleLegend')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(22, 2, 22, 6)
+        row.setSpacing(0)
+        muted = (tokens or {}).get('text_muted', CHROME['muted'])
+
+        spoken = [name for role, name in roles if role in COLORS]
+        # One wrapping rich-text label rather than a row of swatch-and-caption pairs: a
+        # pinned strip must be able to narrow to the window, and eight pairs laid out side
+        # by side have a minimum width of their own that would force the page to scroll
+        # sideways at laptop size.  This reflows to a second line instead.
+        swatches = '&nbsp;&nbsp;&nbsp;'.join(
+            f'<span style="color:{COLORS[role]}">&#9632;</span>&nbsp;'
+            f'{html.escape(name)}'
+            for role, name in roles if role in COLORS)
+        strip = label(f'<span style="color:{muted}">colour key&nbsp;&nbsp;</span>'
+                      f'<span style="color:{muted}">{swatches}</span>',
+                      rich=True, small=True)
+        strip.setWordWrap(True)
+        row.addWidget(strip, 1)
+        # Two lines is the ceiling.  This strip is pinned above the page, so every pixel
+        # it takes is a pixel the reader cannot read the operation in; it may reflow at a
+        # narrow window but it may never grow into a paragraph.
+        self.setMaximumHeight(2 * self.fontMetrics().lineSpacing() + 12)
+
+        self._spoken = spoken
+        self.setAccessibleName('Colour key: ' + ', '.join(spoken))
+        strip.setAccessibleName(self.accessibleName())
+        self.setToolTip('These hues mean the same thing in every picture on this page. '
+                        'Every coloured element is also labelled in words.')
+
+    def describe(self) -> list[str]:
+        """The text this widget puts on screen, for the tests that forbid colour-only."""
+        return ['colour key'] + list(self._spoken)
+
+
 def badge_row(*badges: QWidget) -> QWidget:
     """Lay badges out left to right without letting them stretch."""
     holder = QWidget()
@@ -255,10 +320,7 @@ class PipelineNavigator(QWidget):
         self.set_stages(stages)
 
     def set_stages(self, stages) -> None:
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+        clear_layout(self._layout)      # not takeAt/deleteLater -- see clear_layout
         self._buttons.clear()
         for position, (key, name) in enumerate(stages):
             if position > 0:
@@ -331,10 +393,7 @@ class TokenChipStrip(QWidget):
 
     def _show_page(self, page: int) -> None:
         self._page = max(0, min(page, self._pages() - 1))
-        while self._grid.count():
-            item = self._grid.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+        clear_layout(self._grid)        # not takeAt/deleteLater -- see clear_layout
         self._buttons.clear()
         start = self._page * self.PAGE
         for index in range(start, min(start + self.PAGE, len(self._tokens))):
@@ -1404,16 +1463,35 @@ class AnchoredScrollPage(QWidget):
         for position in range(low, high + 1):
             self._sections[self._order[position]].ensure_built()
 
-    def _on_scrolled(self, value: int) -> None:
+    def _on_scrolled(self, _value: int) -> None:
         """Keep the navigator in step with free scrolling.
 
         Guarded against the scroll `go_to` performs itself: without the flag this re-emits
         `stage_changed` for whatever happens to be at the top mid-animation, and a shell
-        handler that scrolled in response would oscillate.
+        handler that scrolled in response would oscillate.  The same flag also makes this
+        non-re-entrant, which matters because `ensure_built` below grows the page and so
+        can change the scrollbar's range while we are still reading it.
         """
         if self._scrolling or not self._order:
             return
-        viewport_top = self.scroll.viewport().mapTo(self.scroll.widget(), QPoint(0, 0)).y()
+        page = self.scroll.widget()
+        if page is None:
+            return
+        self._scrolling = True
+        try:
+            self._track(page)
+        finally:
+            self._scrolling = False
+
+    def _track(self, page: QWidget) -> None:
+        # The viewport's top, in the page's own coordinates.  `mapFrom`, never `mapTo`:
+        # the page is a *child* of the viewport, and QWidget.mapTo walks the parent chain
+        # upwards, so viewport.mapTo(page, ...) never finds the page, runs off the top of
+        # the hierarchy and dereferences null.  That was a hard access violation on the
+        # first free scroll of either page -- no Python traceback, just "Segmentation
+        # fault" -- and `go_to` hid it, because it sets _scrolling around its own scroll,
+        # so navigating never took this path and nor did any test.
+        viewport_top = page.mapFrom(self.scroll.viewport(), QPoint(0, 0)).y()
         reached = self._order[0]
         for key in self._order:
             section = self._sections[key]

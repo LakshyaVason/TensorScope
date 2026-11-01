@@ -768,12 +768,34 @@ class CausalMaskTriangle(Diagram):
         return ('blocked positions have a large negative number added to their score, '
                 'not necessarily minus infinity')
 
+    # The grid draws at most DRAWN_ROWS rows and DRAWN_CELLS + 4 columns, so for any real
+    # run it is a sample of the matrix rather than the whole of it.  Drawing and clicking
+    # therefore need the same drawn <-> real mapping, in both directions: `_selected_row`
+    # and `_selected_key` are always REAL positions, because that is what the caller
+    # passes in and what `cellClicked` consumers index captured tensors with.
+
+    def _drawn_counts(self) -> tuple[int, int]:
+        return min(self._queries, DRAWN_ROWS), min(self._keys, DRAWN_CELLS + 4)
+
+    @staticmethod
+    def _to_real(index: int, shown: int, total: int) -> int:
+        """The real position that drawn row/column `index` stands for."""
+        if shown <= 1:
+            return max(0, total - 1)
+        return round(index * (total - 1) / (shown - 1))
+
+    @staticmethod
+    def _to_drawn(position: int, shown: int, total: int) -> int:
+        """The drawn row/column standing for real `position` -- the inverse of _to_real."""
+        if shown <= 1 or total <= 1:
+            return 0
+        return max(0, min(shown - 1, round(position * (shown - 1) / (total - 1))))
+
     def draw(self, painter: QPainter, rect: QRect) -> None:
         line = self.text_height(8)
         self.write(painter, QRect(rect.x(), rect.y(), rect.width(), line),
                    self._shape_text(), colour=self.role('scores'), points=9, bold=True)
-        shown_q = min(self._queries, DRAWN_ROWS)
-        shown_k = min(self._keys, DRAWN_CELLS + 4)
+        shown_q, shown_k = self._drawn_counts()
         self._grid = QRect(rect.x() + 58, rect.y() + line + 4,
                            max(60, rect.width() - 62), max(28, rect.height() - 3 * line - 12))
         cell_w = self._grid.width() / shown_k
@@ -781,12 +803,14 @@ class CausalMaskTriangle(Diagram):
         allowed, blocked = self.role('weights'), self.muted()
         # Map a drawn cell back to a real position, so the triangle edge is where the real
         # causal boundary is rather than where the drawn grid's diagonal happens to fall.
+        picked_row = (None if self._selected_row is None
+                      else self._to_drawn(self._selected_row, shown_q, self._queries))
+        picked_col = (None if self._selected_key is None
+                      else self._to_drawn(self._selected_key, shown_k, self._keys))
         for row in range(shown_q):
-            real_q = round(row * (self._queries - 1) / max(1, shown_q - 1)) \
-                if shown_q > 1 else self._queries - 1
+            real_q = self._to_real(row, shown_q, self._queries)
             for col in range(shown_k):
-                real_k = round(col * (self._keys - 1) / max(1, shown_k - 1)) \
-                    if shown_k > 1 else 0
+                real_k = self._to_real(col, shown_k, self._keys)
                 box = QRect(int(self._grid.x() + col * cell_w) + 1,
                             int(self._grid.y() + row * cell_h) + 1,
                             max(3, int(cell_w) - 2), max(3, int(cell_h) - 2))
@@ -794,11 +818,12 @@ class CausalMaskTriangle(Diagram):
                 # read every key; otherwise a query may read keys up to its own index.
                 may_read = real_k <= real_q + self._cached
                 colour = allowed if may_read else blocked
-                picked = self._selected_row is not None and row == min(
-                    self._selected_row, shown_q - 1)
+                picked = picked_row is not None and row == picked_row
+                cell = picked and picked_col is not None and col == picked_col
                 self.outline(painter, box, colour if may_read else self.faint(), radius=1,
-                             width=1.3 if picked else 1.0,
-                             fill=self.wash(colour, 70 if (may_read and picked) else
+                             width=1.8 if cell else 1.3 if picked else 1.0,
+                             fill=self.wash(colour, 110 if (may_read and cell) else
+                                            70 if (may_read and picked) else
                                             40 if may_read else 0))
                 if not may_read:
                     painter.save()
@@ -824,12 +849,16 @@ class CausalMaskTriangle(Diagram):
     def handle_click(self, point) -> bool:
         if not self._clickable or not self._grid.contains(point):
             return False
-        shown_q = min(self._queries, DRAWN_ROWS)
-        shown_k = min(self._keys, DRAWN_CELLS + 4)
+        shown_q, shown_k = self._drawn_counts()
         row = int((point.y() - self._grid.y()) / (self._grid.height() / shown_q))
         col = int((point.x() - self._grid.x()) / (self._grid.width() / shown_k))
-        self._selected_row = max(0, min(row, shown_q - 1))
-        self._selected_key = max(0, min(col, shown_k - 1))
+        # Convert to real positions before storing or emitting.  Emitting the drawn index
+        # pointed every click at a lower position than the one under the cursor as soon as
+        # the matrix was larger than the drawn grid -- which is every real run.
+        self._selected_row = self._to_real(max(0, min(row, shown_q - 1)),
+                                           shown_q, self._queries)
+        self._selected_key = self._to_real(max(0, min(col, shown_k - 1)),
+                                           shown_k, self._keys)
         self.canvas.update()
         self.cellClicked.emit(self._selected_row, self._selected_key)
         return True

@@ -41,17 +41,17 @@ import TensorScope as app
 import tensorscope_diagrams as diagrams
 from tensor_widgets import AttentionExplorer, TensorInspector, TensorTableModel, exact_scalar
 from tensorscope_common import (
-    AnnotatedValueRow, Disclosure, EvidenceBadge, PredictCheck, ResponseTextView,
-    StepReveal,
+    COLORS, AnnotatedValueRow, Disclosure, EvidenceBadge, PredictCheck,
+    ResponseTextView, StepReveal,
 )
 from tensorscope_content import (
     CONCEPTUAL_VARIABLES, CONTINUATION, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
     EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE, NOTEBOOK_CHECKS, NOTEBOOK_OPERATIONS,
     PROVENANCE_ABSENT, PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED,
-    REFERENCE_TOPICS, TELEMETRY_UNAVAILABLE, VARIABLE_ROLES, learn_facts,
+    REFERENCE_TOPICS, ROLE_LEGEND, TELEMETRY_UNAVAILABLE, VARIABLE_ROLES, learn_facts,
 )
 from tensorscope_diagrams import CausalMaskTriangle, Diagram
-from tensorscope_ui import DEFAULT_MODE, MODES, ComputationRecap
+from tensorscope_ui import DEFAULT_MODE, MODE_INDEX, MODES, ComputationRecap
 from tensorscope_variables import (
     EquationRow, VariableChip, VariablePanel, VariableRegistry,
 )
@@ -375,6 +375,46 @@ class SavedCaptureTests(unittest.TestCase):
         return (ReferenceView(capture, tokens=app.TOKENS),
                 NotebookView(capture, tokens=app.TOKENS))
 
+    def test_free_scrolling_tracks_the_section_at_the_top(self):
+        """Scroll both pages by hand, which `go_to` never does.
+
+        This is the test that was missing.  `go_to` sets `_scrolling` around its own
+        scroll, so `_on_scrolled` returned immediately and no test ever ran its body --
+        while a reader's very first wheel turn did.  The handler mapped the viewport into
+        the page with `mapTo`, which walks the parent chain *upwards*; the page is a child
+        of the viewport, so the walk ran off the top of the hierarchy and dereferenced
+        null.  Viewing a saved run and scrolling killed the process every time.
+
+        A recurrence crashes the interpreter rather than failing an assertion, so this
+        test going bang *is* the signal -- there is no way to catch an access violation.
+        """
+        capture = next(iter(self.captures.values()))
+        for page in self.pages(capture):
+            with self.subTest(page=type(page).__name__):
+                page.resize(1130, 820)
+                page.show()                      # unshown, the scroll area has no range
+                for key, _ in page.NAV:          # final positions need built bodies
+                    page.go_to(key)
+                self.application.processEvents()
+                bar = page.scroll.verticalScrollBar()
+                self.assertGreater(bar.maximum(), 0, 'the page does not scroll at all')
+
+                # Put each section's top at the viewport top and ask what the page thinks
+                # the reader is looking at.
+                for key, _ in page.NAV:
+                    top = page.section(key).y()
+                    bar.setValue(top)
+                    if bar.value() == top:       # reachable: not clamped at the bottom
+                        self.assertEqual(page.current_stage(), key)
+
+                # And a continuous sweep, the way a wheel delivers it.
+                step = max(1, bar.maximum() // 60)
+                for value in range(0, bar.maximum() + 1, step):
+                    bar.setValue(value)
+                bar.setValue(0)
+                self.assertEqual(page.current_stage(), page.NAV[0][0])
+            page.deleteLater()
+
     def test_every_section_of_both_pages_builds_without_mutating_the_capture(self):
         """Walk every section of both pages, over every saved run.
 
@@ -550,6 +590,30 @@ class SavedCaptureTests(unittest.TestCase):
                     self.assertIn(f'{int(recorded):,}', shown)
                     self.assertNotIn(int(recorded), capture.token_ids)
             notebook.deleteLater()
+
+    def test_every_colour_a_chip_can_carry_is_named_in_the_colour_key(self):
+        """Colour is never the only carrier, and the key must cover what is on the page.
+
+        The chips' `role` property and the diagrams' palette both come from COLORS; the
+        key names those roles.  A chip tinted a hue the key does not explain would be a
+        meaning carried by colour alone.
+        """
+        capture = next(iter(self.captures.values()))
+        notebook = NotebookView(capture, tokens=app.TOKENS)
+        for key, _ in notebook.NAV:          # bodies build on first arrival
+            notebook.go_to(key)
+        open_every_disclosure(notebook)
+        chips = notebook.findChildren(VariableChip)
+        self.assertTrue(chips, 'the page built no variable chips at all')
+        named = set(notebook.legend.describe())
+        roles_on_screen = {chip.property('role') for chip in chips} - {None, ''}
+        self.assertTrue(roles_on_screen, 'no chip carried a role property')
+        for role in roles_on_screen:
+            self.assertIn(role, COLORS, f'chip role {role!r} has no colour')
+            name = dict(ROLE_LEGEND).get(role)
+            self.assertIsNotNone(name, f'chip role {role!r} is absent from the colour key')
+            self.assertIn(name, named)
+        notebook.deleteLater()
 
     def test_the_generated_phase_attention_is_rectangular(self):
         """One query against the cached prompt keys plus itself, never a square."""
@@ -734,6 +798,45 @@ class SavedCaptureTests(unittest.TestCase):
         recap.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.assertEqual(before, capture_digest(capture))
+
+    def test_switching_modes_retires_the_old_controls_instead_of_piling_them_up(self):
+        """A control from the page you left must not survive, visible and clickable.
+
+        `takeAt` + `deleteLater` looked like it emptied the navigator and did not: the
+        widget kept its parent, its geometry and its visibility until the event loop got
+        round to the deferred delete, so the chips accumulated 13 -> 25 -> 38 across two
+        mode switches. Clicking one called `go_to` with a key the live page does not own,
+        which raises inside a slot, which makes PyQt abort the process with no traceback
+        at all -- the user sees "Segmentation fault".
+        """
+        run_id, capture = next(iter(self.captures.items()))
+        recap = ComputationRecap(capture, run_id=run_id, tokens=app.TOKENS)
+
+        def chips():
+            return [b for b in recap.findChildren(QPushButton)
+                    if b.objectName() == 'pipelineChip']
+
+        for _ in range(3):
+            for mode, _name, _purpose, _cls in MODES:
+                recap._show_mode(mode)
+                live = {key for key, _ in recap.view.NAV}
+                # No deferred-delete pump: the point is that they are gone *now*.
+                self.assertEqual(len(chips()), len(live))
+                self.assertEqual(set(recap._stage_buttons), live)
+                for chip in chips():
+                    self.assertTrue(chip.isVisible() or not recap.isVisible())
+
+        # And a navigation slot handed a key from the other page does nothing, rather
+        # than raising out of a slot.
+        recap._show_mode('run')
+        reference_keys = {key for key, _ in MODE_INDEX['understand'][2].NAV}
+        run_keys = {key for key, _ in MODE_INDEX['run'][2].NAV}
+        foreign = next(iter(reference_keys - run_keys))
+        before = recap.view.current_stage()
+        recap._nav_to(foreign)
+        self.assertEqual(recap.view.current_stage(), before)
+        recap.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
     def test_the_pages_link_to_each_other(self):
         run_id, capture = next(iter(self.captures.items()))
@@ -996,6 +1099,33 @@ class DiagramTests(unittest.TestCase):
                     Qt.LeftButton, Qt.NoModifier))
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(widget.selected_row(), seen[0][0])
+
+    def test_a_mask_click_reports_the_real_position_not_the_drawn_cell(self):
+        """The grid draws 8 of 15 query rows, and `pick` indexes captured tensors.
+
+        Emitting the drawn row index pointed every click below the cursor: the bottom
+        row of a 15-query mask is query 14, not query 7.
+        """
+        mask = diagrams.CausalMaskTriangle(15, 15, clickable=True, tokens=app._TOKENS_DARK)
+        mask.resize(420, 220)
+        mask.grab()                                # lays the grid out
+        seen = []
+        mask.cellClicked.connect(lambda row, col: seen.append((row, col)))
+        grid = mask._grid
+        # Click the last drawn row and the last drawn column.
+        mask.canvas.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, QPoint(grid.right() - 1, grid.bottom() - 1),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        self.assertEqual(seen, [(14, 14)])
+        self.assertEqual(mask.selected_row(), 14)
+        # And the first cell is still position zero.
+        mask.canvas.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, QPoint(grid.x() + 1, grid.y() + 1),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        self.assertEqual(seen[-1], (0, 0))
+        # Every emitted pair must be addressable in a 15x15 captured matrix.
+        for row, col in seen:
+            self.assertTrue(0 <= row < 15 and 0 <= col < 15, (row, col))
 
     def test_a_strip_never_labels_its_drawn_cells_as_the_real_count(self):
         """2,560 features drawn as a dozen cells must still say 2,560."""

@@ -10,7 +10,12 @@ depends on:
   * RunCapture.validate() accepts the result
   * RunDatabase round-trips every tensor bit-exactly
 
-Run:  ./.venv/Scripts/python.exe verify_capture.py [model_id]
+Run:  ./.venv/Scripts/python.exe verify_capture.py [model_id] [--reload]
+
+`--reload` additionally loads the model twice in one process, checking that
+`ModelCapture.unload()` really gives the VRAM back and that the gates still pass after
+the attention backend has been re-registered over itself.  It is opt-in because it
+doubles the run.
 """
 
 from __future__ import annotations
@@ -34,8 +39,60 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"   # small: verifies mechanism cheap
 PROMPT = "What is the capital of France?"
 
 
+def check_the_three_gates(capture, label: str) -> None:
+    """The gates RunCapture.validate() enforces, re-asserted by name.
+
+    Factored out so the --reload pass can prove they still hold on a second model loaded
+    into the same process -- the only place `.register()` replacing an existing key, and
+    the _global_mapping assertion firing twice, are ever exercised.
+    """
+    assert capture.metadata["capture_source"] == "pytorch-forward-hooks", label
+    assert capture.metadata["faithful_to_upstream_eager"] is True, label
+    expected = len(capture.layers) + len(capture.generated_layers)
+    assert capture.metadata["attention_calls_verified"] >= expected, label
+    assert capture.metadata["logits_max_abs_diff_vs_stock_eager"] == 0.0, label
+    capture.validate()
+    print(f"{label}: all three gates hold "
+          f"({expected} captured attention calls re-verified against upstream)")
+
+
+def check_reload(model_id: str) -> None:
+    """Load, unload, and load again -- then prove the gates still pass.
+
+    `ModelCapture.unload()` exists because re-loading used to leak the previous model for
+    the process lifetime: the forward-hook closures capture the ModelCapture, so the
+    model was held by a reference cycle nothing collected, and two 4B models do not fit
+    on a 16 GB card.  Allocated bytes, not reserved: the caching allocator keeps reserved
+    high on purpose, so reserved would never show the drop.
+    """
+    print(f"\n--- reload: {model_id} twice in one process ---")
+    first = ModelCapture(model_id)
+    first.load(lambda message: print(f"  {message}"))
+    check_the_three_gates(first.generate(PROMPT, max_new_tokens=8, on_text=lambda _t: None),
+                          "first load")
+    loaded_bytes = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+
+    first.unload()
+    freed_bytes = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    if torch.cuda.is_available():
+        print(f"allocated after unload: {freed_bytes / 2 ** 30:.2f} GiB "
+              f"(was {loaded_bytes / 2 ** 30:.2f} GiB)")
+        # The weights are the bulk of it; anything above a tenth of what was held means
+        # something is still pinning the model.
+        assert freed_bytes < max(loaded_bytes * 0.1, 64 * 2 ** 20), \
+            f"unload() freed only {(loaded_bytes - freed_bytes) / 2 ** 30:.2f} GiB"
+
+    second = ModelCapture(model_id)
+    second.load(lambda message: print(f"  {message}"))
+    check_the_three_gates(second.generate(PROMPT, max_new_tokens=8, on_text=lambda _t: None),
+                          "second load")
+    second.unload()
+    print("reload verified: re-registration is clean and the gates still pass")
+
+
 def main() -> int:
-    model_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
+    arguments = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
+    model_id = arguments[0] if arguments else DEFAULT_MODEL
 
     print(f"torch {torch.__version__}  cuda={torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -151,6 +208,12 @@ def main() -> int:
 
     if torch.cuda.is_available():
         print(f"\npeak VRAM: {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GiB")
+
+    # Opt-in, because it loads the model twice and would double the Qwen3-4B run.
+    if "--reload" in sys.argv:
+        capture_model.unload()
+        check_reload(model_id)
+
     print("\nVERIFICATION PASSED")
     return 0
 

@@ -492,6 +492,23 @@ TENSOR_SYMBOLS = {
 }
 
 
+# What each semantic colour stands for, in the order the computation reaches it.  The
+# hues themselves live in tensorscope_common.COLORS, which both the diagrams and the
+# variable chips read, so there is exactly one mapping from role to colour and this table
+# only names it.  The legend is redundancy, never a substitute: every coloured element on
+# a page still carries its own text label.
+ROLE_LEGEND = (
+    ("q", "Q queries"),
+    ("k", "K keys"),
+    ("v", "V values"),
+    ("scores", "S scores"),
+    ("weights", "A weights"),
+    ("output", "O output"),
+    ("norm", "normalized"),
+    ("layer", "layer in/out"),
+)
+
+
 # What each captured array is *for*, in one sentence, in the reader's terms.  Deliberately
 # shorter than TENSOR_EXPLANATIONS: this is what the variable panel shows at a glance,
 # above the shape and the sample, with the full paragraph a click further on.

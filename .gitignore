@@ -11,3 +11,6 @@ __pycache__/
 
 # Captured runs — these hold real tensor blobs and grow quickly
 *.sqlite3
+
+# faulthandler crash dumps (see "Torch and threads" in CLAUDE.md)
+tensorscope-crash.log

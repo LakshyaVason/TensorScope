@@ -42,9 +42,11 @@ python -m venv .venv                                        # see requirements.t
 ./.venv/Scripts/python.exe TensorScope.py                   # launch the GUI
 ./.venv/Scripts/python.exe TensorScope.py --self-test        # torch-free: copy, parity, display helpers
 ./.venv/Scripts/python.exe test_recap.py                    # the recap, over the real saved runs
+./.venv/Scripts/python.exe test_threading.py                # where torch is imported, and on which thread
 ./.venv/Scripts/python.exe tensorscope_diagrams.py          # the diagram gallery, both themes
 ./.venv/Scripts/python.exe verify_capture.py                # real model, real capture, full assertions
 ./.venv/Scripts/python.exe verify_capture.py Qwen/Qwen3-4B  # verify the default model too
+./.venv/Scripts/python.exe verify_capture.py --reload       # load twice: unload() frees VRAM, gates still pass
 ```
 
 `verify_capture.py` defaults to `Qwen/Qwen2.5-0.5B-Instruct` because it exercises the
@@ -52,11 +54,18 @@ mechanism cheaply. Run it against `Qwen/Qwen3-4B` as well before trusting a chan
 adds QK-norm and a head_dim decoupled from `hidden_size / num_heads`, which has caught
 shape assumptions that the 0.5B model does not.
 
-`test_recap.py` is the one to run after any UI change: 36 tests over every saved run, no
+`test_recap.py` is the one to run after any UI change: 38 tests over every saved run, no
 torch, no GPU, about two and a half minutes. It takes an optional database path first, then
 test names — `test_recap.py SavedCaptureTests.test_token_span_selection_matches_the_recorded_candidates`
 runs one. (It only treats the first argument as a database when it looks like one, so
 passing a bare test name works.)
+
+`test_threading.py` is separate from it on purpose, and `test_recap.py` must never import
+it. The recap suite's hard property is that the recap reads with no model library present
+at all — it installs a meta path finder that fails the run the moment `torch` or
+`transformers` is imported. The threading tests need the opposite: *stub* torch and
+transformers modules in `sys.modules`, so they can watch which thread calls into them.
+Twelve tests, a second, no GPU.
 
 The diagram gallery is a visual check, not a test: it lays every QPainter widget out in both
 token sets so they can be eyeballed without loading a model or opening a capture.
@@ -218,9 +227,11 @@ attention matrices retained). An 8B model in bf16 (~16.4 GB) does not fit 15.9 G
 
 ## Client architecture notes
 
-- `ModelCapture` does the loading and capture. `LoadWorker` and `GenerationWorker`
-  (`QThread`) keep both off the Qt event loop and marshal progress/text/results/errors
-  back via signals.
+- `ModelCapture` does the loading and capture. One `ModelWorker` (a `QObject` moved onto
+  a single long-lived `QThread`) keeps all of it off the Qt event loop and marshals
+  progress/text/results/errors back via signals. See "Torch and threads" below before
+  changing anything about it — both halves of that arrangement exist to stop a native
+  crash, and the application appears to work without either.
 - `RunDatabase` (SQLite, `tensorscope_runs.sqlite3`) stores runs + tensors.
   Generated-token tensors are stored under a `first_generated_token:` name prefix and the
   embedding at `layer_index = -1`; `load()` reverses this convention. `final_logits` also
@@ -236,6 +247,114 @@ attention matrices retained). An 8B model in bf16 (~16.4 GB) does not fit 15.9 G
   preview, ≤96×96 heatmap) and return *views*, so they must never be written through and
   must never replace persisted data. Both are now vestigial — see
   "Vestigial after the two-page redesign" at the end of this file.
+
+### Crashes: the three that looked identical, and the rules that stop them
+
+Pressing **Run Capture** used to kill the process with a Windows access violation — Git
+Bash prints it as `Segmentation fault`. There is no Python traceback, so the
+`except` handlers in the worker never see it, and the GUI prints nothing to the console,
+so the last thing on screen is tqdm's `Loading weights: 100%` regardless of where it
+actually died.
+
+What the diagnosis found: driving `ModelCapture.load()` → `.generate()` → `validate()`
+headlessly on the main thread works every time, but the same stack driven through the
+real window crashed with the faulting thread **inside the process's first `import torch`,
+running on a worker `QThread`** (`torch/_strobelight/compile_time_profiler.py`, under
+`importlib._bootstrap`) while the Qt event loop pumped Windows messages. It is a race,
+not a certainty — observed once in twelve runs, on the coldest start, where the import
+spends longest reading and compiling bytecode. **A green run proves nothing here**, which
+is why the two rules below are rules rather than something to re-measure.
+
+One red herring, recorded so nobody chases it twice: faulthandler also reports
+`code 0x8001010d` (`RPC_E_CANTCALLOUT_ININPUTSYNCCALL`) on every launch. It looks like a
+smoking gun and is not — it appears in `--demo` browse-only runs that never import torch
+at all, on the main thread, at `application.exec_()`. It is a benign first-chance Qt/COM
+exception. The crash-log banner says so, because the entry worth reading is
+`access violation`.
+
+Two rules follow, and both are tested in `test_threading.py`:
+
+1. **`preimport_model_stack()` runs on the GUI thread**, from `_start_load`, before any
+   worker is started. It is *not* a module-scope import: browse-only mode must still open
+   saved runs on a machine with no torch installed (the `find_spec("torch")` probe in
+   `__main__`), and `test_recap.ForbidModelImports` fails the moment `TensorScope`
+   imports torch at module scope. It warms `torch`, `transformers`,
+   `transformers.modeling_utils`, `transformers.masking_utils` **and** the auto classes —
+   transformers 5.x is a `_LazyModule`, so importing the package alone would leave the
+   `tokenizers` Rust extension and friends for whoever first touched the names, i.e. the
+   worker. The cost is a bounded one-off GUI freeze while the import blocks, labelled in
+   the status line and the title bar. That is the trade; do not move the import back onto
+   a worker to make the window feel faster.
+2. **One thread owns every torch call for the session.** The old `LoadWorker` created the
+   CUDA context and then *exited*, leaving every later kernel to run on `GenerationWorker`
+   — formally legal, since a CUDA primary context is per-process, but a known Windows
+   crash source, and it best explains a fault arriving *after* the weights finished
+   loading. `ModelWorker` does load, generate and unload on one thread. Nothing on it may
+   be called directly from the GUI thread: a direct Python call runs on the caller's
+   thread and silently undoes the whole point, so every entry point is a slot reached
+   only through a queued signal. Its handlers catch `BaseException`, not `Exception` —
+   anything escaping a slot invoked from a QThread's event loop makes PyQt abort the
+   process with no traceback, which is indistinguishable from the crash above.
+
+Supporting pieces:
+
+- **`faulthandler` writes to `tensorscope-crash.log`** beside the run database, enabled
+  first thing in `__main__`'s GUI branch with `all_threads=True`. It must be a file and
+  not stderr: `build/tensorscope.spec` sets `console=False`, so `sys.stderr` is `None` in
+  a packaged build. `TENSORSCOPE_CRASH_LOG` overrides the path, or disables it with `0`.
+  It is deliberately not at module scope — `test_recap.py`, `verify_capture.py` and
+  `--self-test` all import `TensorScope`, and none of them should drop a log file next to
+  the hashed database fixture. It earned its keep immediately: it is what identified the
+  `_on_scrolled` crash above, from two lines in a user's log.
+- **`sys.excepthook` writes to the same file, and faulthandler does not cover what it
+  catches.** PyQt responds to an unhandled Python exception raised *inside a slot* by
+  calling Qt's `abort()`. That is not a signal, so faulthandler never sees it, and the
+  process dies with no traceback and an exit code a user cannot tell apart from a native
+  fault — **a plain `KeyError` in a navigation slot reads to them as
+  "Segmentation fault"**. Measured: with the default hook, exit 127 and not one line of
+  output; with a hook installed, the traceback is recorded *and the application survives*.
+  So the hook is both the diagnostic and the containment. It does not hide integrity
+  failures: `validate()` is called inside `ComputationRecap.__init__`, which both
+  `persist_and_show` and `_open_selected_run` already wrap in `try/except` with a dialog,
+  so a capture that cannot prove itself still refuses loudly.
+- **`clear_layout` (`tensorscope_common`) is the only sanctioned way to empty a layout.**
+  `takeAt` removes the layout *item*; the widget keeps its parent, its geometry and its
+  visibility, and `deleteLater` changes none of that until the event loop reaches the
+  deferred delete. Until then the old widgets are painted over the new ones, returned by
+  `findChildren`, and **clickable** — and clicking a stale navigator chip calls `go_to`
+  with a key the current page does not have, which raises inside a slot, which is the
+  abort above. `PipelineNavigator.set_stages` and the shell's `_rebuild_stage_buttons` had
+  exactly that bug: the pipeline chips accumulated 13 → 25 → 38 across two mode switches,
+  all still reporting `isVisible()`. `replace_in` already had the right idiom
+  (`setParent(None)` first, binding the widget before the reparent, because
+  `setParent(None)` can leave `item.widget()` returning `None`); all four call sites now
+  share it. `_nav_to` is additionally guarded with `key in self.view.stage_keys()`,
+  because a slot should not raise whatever reaches it.
+- **`closeEvent` stops the thread** before Qt tears the window down under it, and
+  `self._busy` (`"load"` / `"run"` / `None`) is the in-flight guard. `isRunning()` cannot
+  serve: the thread is always running. Disabled buttons cannot serve either, because
+  every `QMessageBox` in the file spins a nested event loop during which a queued click
+  can still arrive. Closing mid-generation blocks for about five seconds on a 4B model
+  while the current `generate()` finishes, and that is the intended behaviour: a
+  `terminate()` on a thread inside CUDA leaves driver state undefined, which is a worse
+  crash than none. Only if the 20-second `wait` expires does it `os._exit(0)`, so no
+  destructor races a live worker.
+- **`ModelCapture.unload()` is what makes a second load survivable.** `_install()` now
+  retains every `register_forward_hook` handle, because the hook closures capture the
+  `ModelCapture`, so `model → _forward_hooks → closure → self → model` is a cycle that
+  nothing in this application collected; two Qwen3-4B copies do not fit on a 16 GB card.
+  Removing the handles frees the weights on refcount zero. Measured with
+  `verify_capture.py --reload`: allocated goes 7.55 GiB → 0.01 GiB for Qwen3-4B and
+  0.94 GiB → 0.01 GiB for the 0.5B model, and the three gates still pass on the second
+  load. Measure `memory_allocated()`, never `memory_reserved()` — the caching allocator
+  keeps reserved high by design, so reserved would never show the drop.
+  It deliberately **does not unregister the attention backend.** The invariant
+  `_register_implementation` protects is that the name is in the class-wide
+  `_global_mapping` whenever a capture runs, and `_install()` re-registers and re-asserts
+  on every load. Clearing `attention.sink` leaves the retained `CaptureAttention` holding
+  no tensors, and `GeneralInterface.register` replaces the value under the same key, so
+  the next load drops the old object anyway. Do not "finish the job" by deleting the key:
+  nothing unverified may ever be left sitting in that registry.
 
 ### The recap is ten modules, and the layering is the point
 
@@ -307,6 +426,20 @@ Three details are load-bearing:
   `ensureWidgetVisible` and the flash are presentation afterwards. So tests assert
   `current_stage()` and never a pixel offset. `_on_scrolled` keeps the navigator in step
   with free scrolling and is guarded by `_scrolling` against the scroll `go_to` performs.
+  That guard also made a crash invisible for a whole branch, so it is worth knowing how:
+  **because `go_to` sets `_scrolling` around its own scroll, `_on_scrolled`'s body never
+  ran during navigation — and navigation is all the tests did.** A reader's first wheel
+  turn ran it, and it mapped the viewport into the page with
+  `viewport.mapTo(scroll.widget(), …)`. The page is a **child** of the viewport, and
+  `QWidget.mapTo` walks the parent chain *upwards*, so the walk never found the page, ran
+  off the top of the hierarchy and dereferenced null. Opening a saved run and scrolling
+  killed the process every single time, with no Python traceback — just
+  `Segmentation fault`. The body now lives in `_track`, uses `page.mapFrom(viewport, …)`
+  (the direction that is actually valid), and sets `_scrolling` around itself so that
+  `ensure_built` growing the page mid-scroll cannot re-enter it.
+  `test_free_scrolling_tracks_the_section_at_the_top` scrolls both pages by hand, which is
+  the only thing that exercises any of this; a recurrence takes the interpreter down
+  rather than failing an assertion, because an access violation cannot be caught.
 - A section's header and lede are built up front (cheap text); its **body** builds on first
   arrival. Operation 11's per-layer group is a `Disclosure` of `Disclosure`s, so a 36-layer
   model builds one layer's widgets when a reader opens one layer — which is why
@@ -345,9 +478,10 @@ batch axis can never be dropped quietly. One helper, used everywhere.
 ### Copy never lives inline in a widget
 
 `TENSOR_LABELS`, `TENSOR_EXPLANATIONS`, `EXTRA_TENSOR_LABELS`/`EXTRA_TENSOR_EXPLANATIONS`,
-`TENSOR_SYMBOLS`, `VARIABLE_ROLES`, `CONCEPTUAL_VARIABLES`, `REFERENCE_TOPICS`,
-`NOTEBOOK_OPERATIONS`, `CONTINUATION`, `NOTEBOOK_CHECKS`, `ILLUSTRATIONS`, `STOP_REASONS`,
-`WHAT_WE_KNOW` and `WHAT_WE_CANNOT_CONCLUDE` are all in `tensorscope_content`.
+`TENSOR_SYMBOLS`, `VARIABLE_ROLES`, `ROLE_LEGEND`, `CONCEPTUAL_VARIABLES`,
+`REFERENCE_TOPICS`, `NOTEBOOK_OPERATIONS`, `CONTINUATION`, `NOTEBOOK_CHECKS`,
+`ILLUSTRATIONS`, `STOP_REASONS`, `WHAT_WE_KNOW` and `WHAT_WE_CANNOT_CONCLUDE` are all in
+`tensorscope_content`.
 `--self-test` formats every one of them against `learn_facts()` for a full *and* a legacy
 fixture, so a line naming a field that function does not supply fails the test instead of
 raising `KeyError` in front of a reader.

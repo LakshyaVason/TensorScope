@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
 )
 
 from tensorscope_common import (
-    AnchoredScrollPage, PhaseBadge, Section, chip_text, label,
+    AnchoredScrollPage, PhaseBadge, RoleLegend, Section, chip_text, label,
 )
 from tensorscope_content import (
     CONTINUATION, NOTEBOOK_OPERATIONS, OPERATION_INDEX, learn_facts,
@@ -60,6 +60,9 @@ class NotebookView(AnchoredScrollPage):
             capture, self.facts, self.registry, tokens=tokens, state=self.state)
 
         self.add_header(self._ribbon())
+        # A second pinned strip, because the hues are stable for the whole page and a
+        # legend that scrolled away would only be readable next to one operation.
+        self.legend = self.add_header(RoleLegend(tokens=tokens))
         for operation in SECTIONS:
             number = f'{operation.number:02}' if operation.number else '—'
             self.add_section(Section(
