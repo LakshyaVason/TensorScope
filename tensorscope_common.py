@@ -43,9 +43,41 @@ from tensorscope_content import (
 OFFSCREEN = os.environ.get('QT_QPA_PLATFORM', '') == 'offscreen'
 
 
-COLORS = {'q': '#60a5fa', 'k': '#c084fc', 'v': '#34d399',
+COLORS = {'q': '#60a5fa', 'k': '#f472b6', 'v': '#34d399',
           'scores': '#fbbf24', 'weights': '#22d3ee', 'output': '#fb923c',
           'norm': '#a78bfa', 'layer': '#94a3b8'}
+
+# The same roles, one step darker, for the light palette.  The dark-palette hues sit
+# between 1.6:1 and 2.6:1 against white, which is too faint for a label drawn in them;
+# these clear 3:1.  K is pink rather than purple in both, because blue and purple collapse
+# into one hue under deuteranopia (OKLab delta-E 1.3) and Q and K are drawn side by side
+# in the comparison picture.  Blue against pink stays apart (delta-E 10.9 dark, 18.7
+# light).  Every coloured element is labelled in words as well, so the hue is never the
+# only copy of a meaning.
+COLORS_LIGHT = {'q': '#2563eb', 'k': '#db2777', 'v': '#059669',
+                'scores': '#b45309', 'weights': '#0e7490', 'output': '#c2410c',
+                'norm': '#7c3aed', 'layer': '#64748b'}
+
+
+def is_light(tokens: dict | None) -> bool:
+    """Whether a token set describes the light palette, judged from its page colour."""
+    background = (tokens or {}).get('bg')
+    if not background:
+        return False
+    colour = QColor(background)
+    return colour.isValid() and colour.lightness() >= 128
+
+
+def role_colors(tokens: dict | None = None) -> dict:
+    """The role hues for the palette `tokens` describes.  Same keys in both."""
+    return COLORS_LIGHT if is_light(tokens) else COLORS
+
+
+# The reading column.  Prose wider than this runs past 110 characters a line at the body
+# size, and a diagram stretched across a 1,366-pixel window turns a 15 x 15 grid into
+# bars.  Pages centre their sections in a column of this width and let the margins grow.
+COLUMN_WIDTH = 940
+PROSE_WIDTH = 760
 
 # One hue per evidence tier, chosen to stay legible on both light and dark palettes
 # (the tint is an alpha wash over whatever the card background happens to be).
@@ -103,6 +135,57 @@ def label(text, *, rich=False, muted=False, title=False, small=False):
     return result
 
 
+class MeasureLabel(QLabel):
+    """A word-wrapped label held to a reading measure.
+
+    `QLabel.heightForWidth` ignores the label's own maximum width, so a layout that offers
+    a capped label 900 pixels is told the height of 900-pixel lines, then lays the label
+    out at its 760-pixel cap -- more lines than the height it reserved -- and the page
+    squeezes something else to make room.  Measuring at the width the label will really
+    have keeps the reservation honest.
+    """
+
+    def heightForWidth(self, width: int) -> int:            # noqa: N802 - Qt name
+        return super().heightForWidth(min(int(width), self.maximumWidth()))
+
+
+def measure_label(text: str, *, width: int = 0, rich: bool = False) -> QLabel:
+    """`label` for prose, capped at `width` (default: the page's prose measure)."""
+    result = MeasureLabel(text)
+    result.setTextFormat(Qt.RichText if rich else Qt.PlainText)
+    result.setWordWrap(True)
+    result.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    result.setObjectName('journeyText')
+    result.setMaximumWidth(int(width or PROSE_WIDTH))
+    return result
+
+
+def formula_block(text: str) -> QLabel:
+    """A formula on its own lines, in the page's mathematical face.
+
+    The copy separates the equations of one formula with runs of spaces
+    ("S = s·(Q Kᵀ) + M      A = softmax(S)").  Rendered as rich text those runs collapse
+    to one space and the equations run together into one false equation, so each becomes
+    its own line here, as plain text.
+    """
+    import re
+    lines = [part.strip() for part in re.split(r' {4,}', str(text)) if part.strip()]
+    result = QLabel('\n'.join(lines))
+    result.setTextFormat(Qt.PlainText)
+    result.setWordWrap(True)
+    result.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    result.setObjectName('formulaBlock')
+    result.setAccessibleName('Formula: ' + '; '.join(lines))
+    return result
+
+
+def part_label(text: str) -> QLabel:
+    """A small heading for one part of a section -- 'The operation', 'The symbols'."""
+    result = label(text.upper(), small=True)
+    result.setObjectName('partLabel')
+    return result
+
+
 def shape(array):
     return '[' + ' × '.join(str(d) for d in array.shape) + ']'
 
@@ -156,6 +239,10 @@ def approx(value, digits: int = 3) -> str:
         return str(number)
     if number == 0:
         return '0'
+    if abs(number) >= 1e6:
+        # A masked score is a large negative additive constant (about -3.4e38 in bf16);
+        # written out in full it is a 39-digit string that pushes its box off the panel.
+        return f'≈{number:.{digits}g}'
     if abs(number) >= 1000:
         return f'≈{number:,.0f}'
     return f'≈{number:.{digits}g}'
@@ -293,24 +380,26 @@ class RoleLegend(QWidget):
         row.setSpacing(0)
         muted = (tokens or {}).get('text_muted', CHROME['muted'])
 
-        spoken = [name for role, name in roles if role in COLORS]
+        hues = role_colors(tokens)
+        spoken = [name for role, name in roles if role in hues]
         # One wrapping rich-text label rather than a row of swatch-and-caption pairs: a
         # pinned strip must be able to narrow to the window, and eight pairs laid out side
         # by side have a minimum width of their own that would force the page to scroll
         # sideways at laptop size.  This reflows to a second line instead.
         swatches = '&nbsp;&nbsp;&nbsp;'.join(
-            f'<span style="color:{COLORS[role]}">&#9632;</span>&nbsp;'
+            f'<span style="color:{hues[role]}">&#9632;</span>&nbsp;'
             f'{html.escape(name)}'
-            for role, name in roles if role in COLORS)
+            for role, name in roles if role in hues)
         strip = label(f'<span style="color:{muted}">colour key&nbsp;&nbsp;</span>'
                       f'<span style="color:{muted}">{swatches}</span>',
                       rich=True, small=True)
         strip.setWordWrap(True)
         row.addWidget(strip, 1)
-        # Two lines is the ceiling.  This strip is pinned above the page, so every pixel
-        # it takes is a pixel the reader cannot read the operation in; it may reflow at a
-        # narrow window but it may never grow into a paragraph.
-        self.setMaximumHeight(2 * self.fontMetrics().lineSpacing() + 12)
+        # It lives at the top of the variable panel now, not pinned above the page, and
+        # at the panel's 330-pixel width the eight names need three lines.  A two-line
+        # ceiling cut the third off mid-word; four still keeps it from becoming a
+        # paragraph.
+        self.setMaximumHeight(4 * self.fontMetrics().lineSpacing() + 12)
 
         self._spoken = spoken
         self.setAccessibleName('Colour key: ' + ', '.join(spoken))
@@ -779,7 +868,8 @@ class StepReveal(QWidget):
     ANIMATION_MS = 320
 
     def __init__(self, steps, *, state: dict | None = None, state_key: str = '',
-                 caption: str = STRUCTURE_NOT_TIMING_NOTE, animate: bool = True, parent=None):
+                 caption: str = STRUCTURE_NOT_TIMING_NOTE, animate: bool = True,
+                 initial: int = 0, parent=None):
         super().__init__(parent)
         self._steps = list(steps)
         self._state = state if state is not None else {}
@@ -817,7 +907,9 @@ class StepReveal(QWidget):
         outer.addWidget(controls)
         outer.addWidget(label(caption, muted=True, small=True))
 
-        self.reveal_to(int(self._state.get(self._state_key) or 0))
+        # `initial` steps are open on arrival, so the section's focal point is a
+        # calculation rather than a button; a reader who chose another count keeps it.
+        self.reveal_to(int(self._state.get(self._state_key, initial) or 0))
 
     # -- state ----------------------------------------------------------------
     @property
@@ -1543,8 +1635,11 @@ class Section(QFrame):
         self._animation = None
 
         self._body = QVBoxLayout(self)
-        self._body.setContentsMargins(22, 18, 22, 20)
-        self._body.setSpacing(10)
+        # Flat on the page, not a card: the left margin leaves room for the accent rule
+        # that marks the reader's section, and the generous bottom margin is what
+        # separates one operation from the next.
+        self._body.setContentsMargins(28, 26, 24, 30)
+        self._body.setSpacing(12)
         # A preface sits above everything -- the notebook's destination card -- and a
         # kicker names the chapter that begins here.  Both scroll with the section, so a
         # chapter boundary is something the reader passes, not another control.
@@ -1562,12 +1657,15 @@ class Section(QFrame):
         self._body.addWidget(self.header)
         self.lede = None
         if lede:
-            self.lede = label(lede, rich=True)
+            # A sentence a reader is meant to read, so it keeps a readable measure even
+            # when the column is wider than the prose.
+            self.lede = measure_label(lede, rich=True)
             self.lede.setObjectName('sectionLede')
             self._body.addWidget(self.lede)
+            self._body.addSpacing(4)
         self._body_slot = QVBoxLayout()
         self._body_slot.setContentsMargins(0, 0, 0, 0)
-        self._body_slot.setSpacing(10)
+        self._body_slot.setSpacing(12)
         self._body.addLayout(self._body_slot)
         self.setAccessibleName(heading)
 
@@ -1683,10 +1781,15 @@ class AnchoredScrollPage(QWidget):
         # the scrollbar threshold -- which otherwise reflows every section mid-scroll.
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         inner = QWidget()
+        inner.setObjectName('pageSurface')
         self._page = QVBoxLayout(inner)
-        self._page.setContentsMargins(4, 10, 10, 40)
-        self._page.setSpacing(14)
+        self._page.setContentsMargins(16, 12, 16, 48)
+        self._page.setSpacing(0)
         self.scroll.setWidget(inner)
+        # Centre the sections in a reading column.  Margins rather than a maximum width
+        # on each section, so word-wrapped labels still get their height-for-width from
+        # the layout and the column simply narrows with the window.
+        self.scroll.viewport().installEventFilter(self)
         # A splitter from the start, so a page that wants a panel beside its scroll area
         # can add one without the scroll area having to be re-parented afterwards.
         self.split = QSplitter(Qt.Horizontal)
@@ -1694,6 +1797,17 @@ class AnchoredScrollPage(QWidget):
         self.split.setStretchFactor(0, 1)
         outer.addWidget(self.split, 1)
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+
+    def eventFilter(self, watched, event):                  # noqa: N802 - Qt name
+        if event.type() == QEvent.Resize and watched is self.scroll.viewport():
+            self._fit_column(event.size().width())
+        return super().eventFilter(watched, event)
+
+    def _fit_column(self, width: int) -> None:
+        side = max(16, (int(width) - COLUMN_WIDTH) // 2)
+        margins = self._page.contentsMargins()
+        if margins.left() != side:
+            self._page.setContentsMargins(side, margins.top(), side, margins.bottom())
 
     # ── Construction ─────────────────────────────────────────────────────────
 

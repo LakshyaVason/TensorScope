@@ -41,6 +41,7 @@ from PyQt5.QtWidgets import (
 
 from tensorscope_common import (
     COLORS, Card, ChapterProgress, ContentsButton, Disclosure, StageStack, chip_text, label,
+    role_colors,
 )
 from tensorscope_views import NotebookView, RawTensorDialog, ReferenceView
 
@@ -72,15 +73,15 @@ DEFAULT_COLORS = {
 }
 
 
-def _role_chip_rules() -> str:
+def _role_chip_rules(tokens: dict | None = None) -> str:
     """One stylesheet rule per semantic role, read from the diagrams' own palette.
 
-    `COLORS` is the single source of these hues, so a chip and the picture beside it can
-    never disagree about what colour Q is.
+    `role_colors` (over `COLORS`) is the single source of these hues, so a chip and the
+    picture beside it can never disagree about what colour Q is -- in either palette.
     """
     return '\n'.join(
         f'QPushButton#variableChip[role="{role}"] {{ border-left-color: {hue}; }}'
-        for role, hue in COLORS.items())
+        for role, hue in role_colors(tokens).items())
 
 
 class ComputationRecap(QDialog):
@@ -118,14 +119,29 @@ class ComputationRecap(QDialog):
 
             /* Typography */
             #journeyTitle {{ font-size: 20px; font-weight: 700; }}
-            #journeyText  {{ font-size: 13px; line-height: 1.55; }}
-            #journeyMuted {{ color: {colors['text_secondary']}; font-size: 11px; letter-spacing: 0.04em; }}
-            #journeySmall {{ color: {colors['text_secondary']}; font-size: 11px; }}
+            #journeyText  {{ font-size: 14px; }}
+            #journeyMuted {{ color: {colors['text_secondary']}; font-size: 12px; letter-spacing: 0.04em; }}
+            #journeySmall {{ color: {colors['text_secondary']}; font-size: 12px; }}
             #journeyEquation {{
-                font-size: 13px; padding: 12px 14px;
-                background: {colors['bg']};
+                font-size: 14px; padding: 12px 16px;
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']};
                 border-left: 3px solid {colors['accent']};
-                border-radius: 4px;
+                border-radius: 8px;
+            }}
+            /* A formula set on its own lines, in a mathematical face where one exists. */
+            #formulaBlock {{
+                font-family: 'Cambria Math', 'Cambria', 'Latin Modern Math', 'STIX Two Math',
+                             'Times New Roman', serif;
+                font-size: 19px; padding: 14px 20px;
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']};
+                border-left: 3px solid {colors['accent']};
+                border-radius: 8px;
+            }}
+            #partLabel {{
+                color: {colors['text_muted']}; font-size: 11px; font-weight: 700;
+                letter-spacing: 0.1em; padding-top: 6px;
             }}
 
             /* Section rule */
@@ -165,10 +181,10 @@ class ComputationRecap(QDialog):
                 text-align: left;
                 border: 1px solid {colors['border']};
                 border-radius: 6px;
-                padding: 6px 12px;
+                padding: 7px 12px;
                 background: transparent;
                 color: {colors['text_secondary']};
-                font-size: 12px;
+                font-size: 13px;
             }}
             QPushButton[checkable="true"]:hover {{
                 border-color: {colors['accent']};
@@ -192,12 +208,12 @@ class ComputationRecap(QDialog):
             }}
 
             /* Banner */
-            #recapBanner {{
-                padding: 10px 24px;
+            QWidget#recapBanner {{
+                background: {colors['bg']};
                 border-bottom: 1px solid {colors['border']};
-                font-weight: 600;
-                font-size: 13px;
             }}
+            #recapBannerTitle {{ font-weight: 700; font-size: 14px; }}
+            #recapBannerModel {{ color: {colors['text_secondary']}; font-size: 13px; }}
             #recapBannerSub {{ color: {colors['text_secondary']}; font-size: 11px; }}
 
             /* The reading bar: prompt, progress, toolbar, contents, previous/next */
@@ -218,14 +234,20 @@ class ComputationRecap(QDialog):
             QToolButton#contentsButton:focus, QToolButton#focusChip:focus {{
                 border-color: {colors['accent']};
             }}
-            QPushButton#modeButton {{
-                border: 1px solid {colors['border']}; border-radius: 6px;
-                padding: 4px 12px; background: transparent;
-                color: {colors['text_secondary']}; font-size: 12px; text-align: center;
+            /* The two pages as one segmented control. */
+            QWidget#modeSwitch {{
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']}; border-radius: 8px;
             }}
+            QPushButton#modeButton {{
+                border: none; border-radius: 6px;
+                padding: 5px 14px; background: transparent;
+                color: {colors['text_secondary']}; font-size: 13px; text-align: center;
+            }}
+            QPushButton#modeButton:hover {{ color: {colors['text_primary']}; }}
+            QPushButton#modeButton:focus {{ border: 1px solid {colors['accent']}; }}
             QPushButton#modeButton:checked {{
-                background: {colors['nav_active_bg']}; color: {colors['text_primary']};
-                border-color: {colors['accent']}; font-weight: 600;
+                background: {colors['accent']}; color: #ffffff; font-weight: 600;
             }}
             QPushButton#stepButton {{
                 border: 1px solid {colors['border']}; border-radius: 6px;
@@ -239,39 +261,45 @@ class ComputationRecap(QDialog):
 
             /* Teaching structure inside an operation */
             #sectionKicker {{
-                color: {colors['accent']}; font-size: 11px; font-weight: 700;
-                letter-spacing: 0.08em;
+                color: {colors['accent']}; font-size: 12px; font-weight: 700;
+                letter-spacing: 0.12em; padding-bottom: 2px;
             }}
-            #sectionLede {{ font-size: 14px; }}
+            #sectionLede {{ font-size: 15px; color: {colors['text_secondary']}; }}
             QFrame#destinationCard {{
-                background: {colors['bg']};
+                background: {colors['card_bg']};
                 border: 1px solid {colors['border']};
-                border-left: 3px solid {colors['accent']};
+                border-radius: 12px;
+            }}
+            #destinationPrompt {{ font-size: 22px; font-weight: 700; }}
+            #destinationAnswer {{ font-size: 16px; }}
+            QWidget#ioRow {{
+                background: transparent;
+                border: 1px solid {colors['border']};
                 border-radius: 8px;
             }}
-            #destinationPrompt {{ font-size: 16px; font-weight: 700; }}
-            #destinationAnswer {{ font-size: 14px; }}
-            QWidget#ioRow {{
-                background: {colors['bg']};
-                border: 1px solid {colors['border']};
-                border-radius: 6px;
+            #ioTag {{
+                color: {colors['text_muted']};
+                font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
             }}
-            #ioTag {{ font-size: 10px; font-weight: 700; letter-spacing: 0.08em; }}
-            #ioAction {{ font-size: 12px; font-style: italic; }}
-            #ioPlain {{ font-family: Consolas, 'Courier New', monospace; font-size: 12px; }}
+            #ioAction {{ font-size: 13px; font-style: italic; color: {colors['text_secondary']}; }}
+            #ioPlain {{ font-family: Consolas, 'Courier New', monospace; font-size: 13px; }}
             #teachingNote {{
-                padding: 8px 12px;
+                padding: 10px 14px;
+                border: 1px solid {colors['border']};
                 border-left: 3px solid {colors['text_secondary']};
-                background: {colors['bg']};
-                border-radius: 4px; font-size: 12px;
+                background: {colors['card_bg']};
+                border-radius: 6px; font-size: 13px; color: {colors['text_primary']};
             }}
             #takeawayLine {{
-                padding: 6px 0 2px 0; font-size: 12px; font-weight: 600;
+                padding: 12px 0 2px 0; font-size: 13px; font-weight: 600;
                 color: {colors['text_primary']};
+                border-top: 1px solid {colors['border']};
             }}
             #focusShift {{
-                padding: 10px 12px; font-size: 13px;
-                border: 1px solid {colors['accent']}; border-radius: 6px;
+                padding: 12px 16px; font-size: 14px;
+                background: {colors['card_bg']};
+                border: 1px solid {colors['accent']}; border-left: 4px solid {colors['accent']};
+                border-radius: 8px;
             }}
             QPushButton#passButton {{
                 text-align: left; border: 1px solid {colors['border']}; border-radius: 5px;
@@ -347,15 +375,16 @@ class ComputationRecap(QDialog):
                 padding: 8px 10px; border-left: 3px solid {colors['accent']};
             }}
             QFrame#valueBox {{
-                background: {colors['bg']};
+                background: {colors['card_bg']};
                 border: 1px solid {colors['border']};
-                border-radius: 5px;
+                border-radius: 6px;
             }}
             #valueBoxNumber {{
-                font-family: Consolas, 'Courier New', monospace; font-size: 12px;
+                font-family: Consolas, 'Courier New', monospace; font-size: 14px;
+                font-weight: 600;
             }}
-            #bandHeading {{ font-size: 10px; letter-spacing: 0.06em; padding-top: 4px; }}
-            #responseText {{ font-size: 14px; }}
+            #bandHeading {{ font-size: 11px; letter-spacing: 0.08em; padding-top: 6px; }}
+            #responseText {{ font-size: 15px; }}
 
             /* Operators between shape/flow boxes */
             #shapeOp {{
@@ -369,11 +398,16 @@ class ComputationRecap(QDialog):
             /* One anchored section of a long page.  The reader's current section is
                marked with a dynamic property rather than an inline stylesheet, so both
                palettes are handled here and the widget code stays colour-free. */
+            /* Sections sit flat on the page, like the pages of a textbook: a hairline
+               between them, and an accent rule in the margin beside the one being read.
+               Figures, formulas and values are the only raised surfaces, so the eye lands
+               on them. */
             QFrame#notebookSection {{
-                background: {colors['card_bg']};
-                border: 1px solid {colors['border']};
+                background: {colors['bg']};
+                border: none;
                 border-left: 3px solid transparent;
-                border-radius: 10px;
+                border-bottom: 1px solid {colors['border']};
+                border-radius: 0px;
             }}
             QFrame#notebookSection[current="true"] {{
                 border-left: 3px solid {colors['accent']};
@@ -383,9 +417,9 @@ class ComputationRecap(QDialog):
                 background: {colors['nav_active_bg']};
             }}
             QFrame#notebookSection:focus {{
-                border-color: {colors['accent']};
+                border-left: 3px solid {colors['accent']};
             }}
-            #sectionHeader {{ font-size: 17px; font-weight: 700; }}
+            #sectionHeader {{ font-size: 24px; font-weight: 700; padding-top: 2px; }}
 
             /* Invented content.  A dashed border and a different surface, so a made-up
                example can never be skim-read as a captured result. */
@@ -412,7 +446,7 @@ class ComputationRecap(QDialog):
                 font-family: Consolas, 'Courier New', monospace;
                 font-size: 12px;
             }}
-            {_role_chip_rules()}
+            {_role_chip_rules(colors)}
             QPushButton#variableChip:hover {{
                 border-color: {colors['accent']};
                 background: {colors['nav_active_bg']};
@@ -420,9 +454,10 @@ class ComputationRecap(QDialog):
             QPushButton#variableChip:focus {{ border-color: {colors['accent']}; }}
 
             QWidget#equationRow {{
-                background: {colors['bg']};
+                background: {colors['card_bg']};
+                border: 1px solid {colors['border']};
                 border-left: 3px solid {colors['accent']};
-                border-radius: 4px;
+                border-radius: 8px;
             }}
             QPushButton#equationTerm {{
                 text-align: center;
@@ -433,8 +468,8 @@ class ComputationRecap(QDialog):
                 background: transparent;
                 color: {colors['text_primary']};
                 font-family: Consolas, 'Courier New', monospace;
-                font-size: 14px;
-                font-weight: 600;
+                font-size: 17px;
+                font-weight: 700;
             }}
             QPushButton#equationTerm:hover {{
                 border-color: {colors['accent']};
@@ -443,8 +478,9 @@ class ComputationRecap(QDialog):
             QPushButton#equationTerm:focus {{ border-color: {colors['accent']}; }}
             #equationOperator {{
                 color: {colors['text_secondary']};
-                font-family: Consolas, 'Courier New', monospace;
-                font-size: 14px;
+                font-family: 'Cambria Math', 'Cambria', 'Latin Modern Math', serif;
+                font-size: 19px;
+                padding: 0 2px;
             }}
 
             /* The one shared inspection panel. */
@@ -462,15 +498,15 @@ class ComputationRecap(QDialog):
 
             /* Reference page <-> notebook links. */
             QPushButton#crossPageLink {{
-                border: 1px solid {colors['border']};
+                border: 1px solid transparent;
                 border-radius: 6px;
-                padding: 6px 12px;
+                padding: 6px 10px;
                 background: transparent;
                 color: {colors['accent']};
-                font-size: 12px;
+                font-size: 13px;
                 font-weight: 600;
             }}
-            QPushButton#crossPageLink:hover {{
+            QPushButton#crossPageLink:hover, QPushButton#crossPageLink:focus {{
                 border-color: {colors['accent']};
                 background: {colors['nav_active_bg']};
             }}
@@ -505,17 +541,26 @@ class ComputationRecap(QDialog):
         host = QWidget()
         host.setObjectName('recapBanner')
         row = QHBoxLayout(host)
-        row.setContentsMargins(16, 6, 16, 6)
+        row.setContentsMargins(16, 8, 16, 8)
         row.setSpacing(8)
         title = QLabel(
             f'{"Saved run #" + str(run_id) if run_id is not None else "Current capture"}  ·  '
             f'{self.capture.metadata.get("model", "Model ID unavailable")}')
-        title.setObjectName('recapBanner')
+        # Its own name: sharing the host's made the label draw the banner's bottom rule
+        # under itself, a stray underline beneath the run title.
+        title.setObjectName('recapBannerTitle')
         title.setToolTip(title.text())
         title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         title.setMinimumWidth(120)
         row.addWidget(title, 1)
         self._mode_buttons: dict[str, QPushButton] = {}
+        switch = QWidget()
+        switch.setObjectName('modeSwitch')
+        switch_row = QHBoxLayout(switch)
+        switch_row.setContentsMargins(3, 3, 3, 3)
+        switch_row.setSpacing(2)
+        row.addWidget(switch)
+        row.addSpacing(8)
         for key, name, purpose, _ in MODES:
             button = QPushButton(name)
             button.setObjectName('modeButton')
@@ -527,7 +572,7 @@ class ComputationRecap(QDialog):
             bold = button.font()
             bold.setBold(True)
             button.setMinimumWidth(QFontMetrics(bold).horizontalAdvance(name) + 34)
-            row.addWidget(button)
+            switch_row.addWidget(button)
             self._mode_buttons[key] = button
         verified = QLabel('✓ Validated capture')
         verified.setStyleSheet(

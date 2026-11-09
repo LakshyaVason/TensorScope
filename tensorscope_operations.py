@@ -41,8 +41,8 @@ from tensorscope_common import (
     AnnotatedValueRow, BandedTokenStrip, Disclosure, EvidenceBadge, PassTimeline,
     PredictCheck, ResponseTextView, StepReveal, approx, approx_share, badge_row, badged,
     bullets,
-    chip_text, head_slice, label, read_only_table, replace_in, shape_line, token_labels,
-    token_table,
+    chip_text, head_slice, label, measure_label, read_only_table, replace_in, shape_line,
+    token_labels, token_table, PROSE_WIDTH,
 )
 from tensorscope_content import (
     CONTINUATION, OPERATION_INDEX, CACHED_KV_NOTE, DISPLAY_CALC_NOTE, EOS_IS_A_SCORED_ENTRY, EVIDENCE_CONCEPTUAL,
@@ -240,8 +240,8 @@ class NotebookContext:
         host = QWidget()
         host.setObjectName('ioRow')
         row = QHBoxLayout(host)
-        row.setContentsMargins(10, 6, 10, 6)
-        row.setSpacing(8)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(10)
 
         def terms(keys) -> None:
             for key in keys:
@@ -281,7 +281,7 @@ class NotebookContext:
         """The one misunderstanding worth heading off at this step, as a callout."""
         if not operation.note:
             return None
-        callout = label(self.text(operation.note), small=True)
+        callout = measure_label(self.text(operation.note), width=PROSE_WIDTH + 40)
         callout.setObjectName('teachingNote')
         return callout
 
@@ -1039,7 +1039,7 @@ def build_mix(ctx: NotebookContext, section) -> QWidget:
                  [example['total']], labels=['feature 0 of Z_h'], kind=EVIDENCE_DERIVED,
                  caption=ctx.say('mix_total_caption', head=head),
                  note='calculated for this display', total=1)},
-        ], state=ctx.state.setdefault('reveals', {}), state_key='mix'))
+        ], state=ctx.state.setdefault('reveals', {}), state_key='mix', initial=1))
         lines.addWidget(label(DISPLAY_CALC_NOTE, muted=True, small=True))
         return inner
 
@@ -1228,6 +1228,10 @@ def build_decide(ctx: NotebookContext, section) -> QWidget:
     facts = ctx.facts
     final = int(facts['final_position'])
     host, body = _panel()
+    # The formula and the in/out line first, as in every other operation; the hand-off to
+    # the final position follows, directly above the picture that shows it.
+    body.addWidget(ctx.equation(('final_logits', '=', 'X_final_norm', '@', 'W_U')))
+    body.addWidget(ctx.io_row(operation))
 
     # The hand-off.  Everything above followed one position; the decision is made at the
     # final one, and the page says so rather than letting the followed row look as if it
@@ -1257,9 +1261,8 @@ def build_decide(ctx: NotebookContext, section) -> QWidget:
         return inner
 
     ctx.slot(body, shift)
-    # The formula, as clickable operands, and then the chain it stands for: which links a
-    # capture holds (solid) and which happened in the model and were not kept (dashed).
-    body.addWidget(ctx.io_row(operation))
+    # The chain the formula stands for: which links a capture holds (solid) and which
+    # happened in the model and were not kept (dashed).
     body.addWidget(DecisionChain(
         [(f'row {final} of X_final', True), ('final RMSNorm', False), ('× W_Uᵀ', False),
          ('logits', capture.logits is not None), ('argmax', True), ('token', True)],

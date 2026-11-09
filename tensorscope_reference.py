@@ -17,10 +17,11 @@ Captured values live on the other page, next to the badge that says where they c
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QGridLayout, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from tensorscope_common import (
-    AnchoredScrollPage, Card, Disclosure, EvidenceBadge, Section, badge_row, label,
+    AnchoredScrollPage, Card, Disclosure, EvidenceBadge, Section, badge_row, formula_block,
+    label, measure_label, part_label,
 )
 from tensorscope_content import (
     EVIDENCE_CONCEPTUAL, ILLUSTRATIONS, OPERATION_INDEX, REFERENCE_TOPICS, REFERENCE_TOPIC_INDEX,
@@ -124,16 +125,14 @@ class ReferenceView(AnchoredScrollPage):
         body.setSpacing(10)
 
         if topic.formula:
-            formula = label(topic.formula.format(**self.facts), rich=True)
-            formula.setObjectName('journeyEquation')
-            body.addWidget(label('THE OPERATION', muted=True))
-            body.addWidget(formula)
+            body.addWidget(part_label('The operation'))
+            body.addWidget(formula_block(topic.formula.format(**self.facts)))
 
         if topic.key == 'notation':
             body.addWidget(label(ROW_VECTOR_NOTE, muted=True, small=True))
 
         if topic.symbols:
-            body.addWidget(label('THE SYMBOLS IN IT', muted=True))
+            body.addWidget(part_label('The symbols in it'))
             body.addWidget(self._glossary(topic.symbols))
 
         for name in topic.visual:
@@ -168,25 +167,31 @@ class ReferenceView(AnchoredScrollPage):
         panel that said "[15 x 2,560]" here would be quoting a run the reader has not
         opened.  Shapes stay on the run page, where they are facts.
         """
+        # One grid, so every meaning starts at the same x and the symbol column is only
+        # as wide as its widest symbol.
         host = QWidget()
-        rows = QVBoxLayout(host)
+        rows = QGridLayout(host)
         rows.setContentsMargins(0, 0, 0, 0)
-        rows.setSpacing(3)
+        rows.setHorizontalSpacing(18)
+        rows.setVerticalSpacing(6)
+        index = 0
         for key in symbols:
             if not self.registry.known(key):
                 continue
             resolved = self.registry.resolve(key)
-            row = QWidget()
-            line = QHBoxLayout(row)
-            line.setContentsMargins(0, 0, 0, 0)
-            line.setSpacing(10)
             symbol = label(resolved.symbol)
             symbol.setObjectName('glossarySymbol')
-            symbol.setMinimumWidth(130)
             symbol.setWordWrap(False)
-            line.addWidget(symbol, 0)
-            line.addWidget(label(resolved.role or resolved.title, small=True), 1)
-            rows.addWidget(row)
+            rows.addWidget(symbol, index, 0, Qt.AlignLeft | Qt.AlignTop)
+            meaning = measure_label(resolved.role or resolved.title, width=640)
+            meaning.setObjectName('journeySmall')
+            rows.addWidget(meaning, index, 1)
+            index += 1
+        # The spare width goes to an empty last column, not between symbol and meaning.
+        rows.setColumnStretch(0, 0)
+        rows.setColumnStretch(1, 0)
+        rows.setColumnStretch(2, 1)
+        rows.setColumnMinimumWidth(1, 520)
         return host
 
     def _illustration(self, key: str) -> QWidget:

@@ -366,9 +366,11 @@ class EquationRow(QWidget):
     def __init__(self, registry: VariableRegistry, terms, *, parent=None):
         super().__init__(parent)
         self.setObjectName('equationRow')
+        # A QWidget subclass paints no stylesheet background unless asked to.
+        self.setAttribute(Qt.WA_StyledBackground, True)
         row = QHBoxLayout(self)
-        row.setContentsMargins(10, 8, 10, 8)
-        row.setSpacing(6)
+        row.setContentsMargins(18, 12, 18, 12)
+        row.setSpacing(8)
         spoken = []
         self.chips: list[VariableChip] = []
         for term in terms:
@@ -407,6 +409,7 @@ class VariablePanel(QWidget):
                  legend: QWidget | None = None, parent=None):
         super().__init__(parent)
         self.setObjectName('variablePanel')
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._registry = registry
         self._tokens = tokens or {}
         self._body = QVBoxLayout(self)

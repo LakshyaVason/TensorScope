@@ -28,7 +28,7 @@ from PyQt5.QtCore import QRect, QRectF, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPolygonF
 from PyQt5.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 
-from tensorscope_common import CHROME, COLORS, OFFSCREEN, label
+from tensorscope_common import CHROME, COLORS, OFFSCREEN, is_light, label, role_colors
 
 
 # How many cells a strip or a grid axis draws before it gives up and shows an ellipsis.
@@ -64,16 +64,36 @@ class _Canvas(QWidget):
         super().__init__(parent)
         self._diagram = diagram
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setMinimumHeight(diagram.BODY_HEIGHT)
+        self.setMinimumHeight(diagram.BODY_HEIGHT + 2 * diagram.PAD)
 
     def sizeHint(self) -> QSize:
-        return QSize(self._diagram.BODY_WIDTH, self._diagram.BODY_HEIGHT)
+        pad = 2 * self._diagram.PAD
+        return QSize(self._diagram.BODY_WIDTH + pad, self._diagram.BODY_HEIGHT + pad)
+
+    def drawing_rect(self) -> QRect:
+        """Where the sketch is drawn: inside the figure's padding, no wider than the
+        diagram's own `MAX_WIDTH`, centred.  A sketch of a shape has a natural width;
+        stretched across a wide window a 15 x 15 grid stops reading as a square."""
+        pad = self._diagram.PAD
+        inner = self.rect().adjusted(pad, pad, -pad, -pad)
+        width = min(inner.width(), self._diagram.MAX_WIDTH)
+        left = inner.x() + max(0, (inner.width() - width) // 2)
+        return QRect(left, inner.y(), width, inner.height()).adjusted(1, 1, -2, -2)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         try:
-            self._diagram.draw(painter, self.rect().adjusted(1, 1, -2, -2))
+            if self._diagram.PAD:
+                # The figure: one raised panel per picture, so a diagram reads as a
+                # figure in a textbook rather than as lines floating among the prose.
+                painter.save()
+                painter.setPen(QPen(self._diagram.faint(), 1.0))
+                painter.setBrush(self._diagram.surface())
+                painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                                        8, 8)
+                painter.restore()
+            self._diagram.draw(painter, self.drawing_rect())
         finally:
             painter.end()
 
@@ -93,6 +113,9 @@ class Diagram(QWidget):
     HIGHLIGHT_MS = 180
     BODY_HEIGHT = 120
     BODY_WIDTH = 360
+    # The widest the sketch itself is drawn, and the figure padding around it.
+    MAX_WIDTH = 760
+    PAD = 14
 
     def __init__(self, *, tokens: dict | None = None, caption: str = '', parent=None):
         super().__init__(parent)
@@ -108,6 +131,13 @@ class Diagram(QWidget):
             outer.addWidget(label(caption, muted=True, small=True))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+    def set_body_height(self, height: int) -> None:
+        """Give this instance a drawing height of its own -- for a sketch whose natural
+        height depends on what it draws, such as a grid with one row per position."""
+        self.BODY_HEIGHT = int(height)
+        self.canvas.setMinimumHeight(self.BODY_HEIGHT + 2 * self.PAD)
+        self.canvas.updateGeometry()
+
     # ── Colours ──────────────────────────────────────────────────────────────
 
     def _token(self, name: str, fallback: str) -> QColor:
@@ -120,10 +150,21 @@ class Diagram(QWidget):
         return self.palette().windowText().color()
 
     def muted(self) -> QColor:
-        return self._token('text_muted', CHROME['muted'])
+        """Secondary text.  The page's secondary ink rather than its faintest grey: a
+        diagram's labels are part of what it says, and the muted token sits at about 3:1
+        on the figure surface."""
+        return self._token('text_secondary', self._token('text_muted', CHROME['muted']).name())
 
     def faint(self) -> QColor:
-        return self._token('border', CHROME['ahead'])
+        """Outlines of cells that are drawn but not selected: a third of the way from the
+        border colour towards the secondary ink, so an empty grid still reads as a grid
+        on the raised figure surface."""
+        border = self._token('border', CHROME['ahead'])
+        toward = self.muted()
+        mix = 0.33
+        return QColor(round(border.red() + (toward.red() - border.red()) * mix),
+                      round(border.green() + (toward.green() - border.green()) * mix),
+                      round(border.blue() + (toward.blue() - border.blue()) * mix))
 
     def surface(self) -> QColor:
         return self._token('card_bg', '#1c1c20')
@@ -131,8 +172,13 @@ class Diagram(QWidget):
     def accent(self) -> QColor:
         return QColor(CHROME['accent'])
 
+    def light(self) -> bool:
+        return is_light(self._tokens)
+
     def role(self, key: str) -> QColor:
-        return QColor(COLORS.get(key, CHROME['muted']))
+        """A role's hue for this palette: one step darker on the light palette, where the
+        dark-palette hues are too faint to carry a label."""
+        return QColor(role_colors(self._tokens).get(key, CHROME['muted']))
 
     @staticmethod
     def wash(colour: QColor, alpha: int = 46) -> QColor:
@@ -381,7 +427,9 @@ class MatrixGrid(Diagram):
         self._grid = QRect(rect.x() + side, rect.y() + line + 4,
                            max(40, rect.width() - side - 4),
                            max(30, rect.height() - 2 * line - 12))
-        self.write(painter, QRect(rect.x(), self._grid.y(), side - 6, self._grid.height()),
+        # The row axis is named on the bottom line, under the row labels, so it can never
+        # sit on top of the "row N" marker beside the followed row.
+        self.write(painter, QRect(rect.x(), rect.bottom() - line, side - 6, line),
                    self._row_axis, colour=self.muted(),
                    align=Qt.AlignRight | Qt.AlignVCenter)
         self.write(painter, QRect(self._grid.x(), rect.bottom() - line,
@@ -774,7 +822,7 @@ class KVShare(Diagram):
 class QKCompare(Diagram):
     """One query vector against one key vector, with the shared width bracketed."""
 
-    BODY_HEIGHT = 128
+    BODY_HEIGHT = 104
 
     def __init__(self, head_dim: int, *, query_pos: int = 0, key_pos: int = 0,
                  query_label: str = '', key_label: str = '', tokens=None, caption: str = '',
@@ -811,7 +859,9 @@ class QKCompare(Diagram):
         painter.restore()
         self.write(painter, QRect(rect.x(), bracket_bottom + 2, body, line),
                    self._lines()[2], colour=self.accent())
-        out = QRect(rect.right() - 92, rect.y() + rect.height() // 2 - 16, 40, 32)
+        # Level with the gap between the two rows it combines.
+        middle = rect.y() + line + strip_h + (line + 6) // 2
+        out = QRect(rect.right() - 92, middle - 16, 40, 32)
         self.arrow(painter, rect.x() + body + 4, out.y() + 16, out.x() - 4, self.role('scores'))
         self.outline(painter, out, self.role('scores'), radius=3, width=1.4,
                      fill=self.wash(self.role('scores'), 40))
@@ -848,6 +898,11 @@ class CausalMaskTriangle(Diagram):
         if clickable:
             self.canvas.setFocusPolicy(Qt.StrongFocus)
             self.canvas.setCursor(Qt.PointingHandCursor)
+        # Tall enough for square cells: a one-query pass is a single row, a 15-position
+        # prefill is a square.
+        shown_q, _ = self._drawn_counts()
+        line = self.text_height(8)
+        self.set_body_height(max(108, shown_q * 15 + 3 * line + 20))
 
     def _shape_text(self) -> str:
         return (f'{_count(self._queries, "query", "queries")} × '
@@ -863,8 +918,15 @@ class CausalMaskTriangle(Diagram):
     # and `_selected_key` are always REAL positions, because that is what the caller
     # passes in and what `cellClicked` consumers index captured tensors with.
 
+    # Every position is drawn when the prompt is short enough for square cells to stay
+    # readable -- which covers every saved run -- so the triangle a reader sees is the
+    # real causal boundary, row for row.  Longer prompts fall back to a sample.
+    MAX_QUERY_ROWS = 16
+    MAX_KEY_COLUMNS = 24
+    MAX_CELL = 20
+
     def _drawn_counts(self) -> tuple[int, int]:
-        return min(self._queries, DRAWN_ROWS), min(self._keys, DRAWN_CELLS + 4)
+        return min(self._queries, self.MAX_QUERY_ROWS), min(self._keys, self.MAX_KEY_COLUMNS)
 
     @staticmethod
     def _to_real(index: int, shown: int, total: int) -> int:
@@ -882,11 +944,20 @@ class CausalMaskTriangle(Diagram):
 
     def draw(self, painter: QPainter, rect: QRect) -> None:
         line = self.text_height(8)
-        self.write(painter, QRect(rect.x(), rect.y(), rect.width(), line),
-                   self._shape_text(), colour=self.role('scores'), points=9, bold=True)
         shown_q, shown_k = self._drawn_counts()
-        self._grid = QRect(rect.x() + 58, rect.y() + line + 4,
-                           max(60, rect.width() - 62), max(28, rect.height() - 3 * line - 12))
+        side = 58
+        top = rect.y() + line + 8
+        legend_width = 200 if rect.width() >= side + 160 + 200 else 0
+        cell = max(4.0, min((rect.width() - side - legend_width - 24) / shown_k,
+                            (rect.bottom() - 2 * line - 6 - top) / shown_q,
+                            float(self.MAX_CELL)))
+        # Centre the grid and its key as one block inside the figure.
+        content = side + int(cell * shown_k) + (24 + legend_width if legend_width else 0)
+        rect = QRect(rect.x() + max(0, (rect.width() - content) // 2), rect.y(),
+                     min(rect.width(), content), rect.height())
+        self._grid = QRect(rect.x() + side, top, int(cell * shown_k), int(cell * shown_q))
+        self.write(painter, QRect(self._grid.x(), rect.y(), rect.width() - side, line),
+                   self._shape_text(), colour=self.role('scores'), points=9, bold=True)
         cell_w = self._grid.width() / shown_k
         cell_h = self._grid.height() / shown_q
         allowed, blocked = self.role('weights'), self.muted()
@@ -906,34 +977,82 @@ class CausalMaskTriangle(Diagram):
                 # In the cached case every drawn query is the single new position, which may
                 # read every key; otherwise a query may read keys up to its own index.
                 may_read = real_k <= real_q + self._cached
-                colour = allowed if may_read else blocked
                 picked = picked_row is not None and row == picked_row
-                cell = picked and picked_col is not None and col == picked_col
-                self.outline(painter, box, colour if may_read else self.faint(), radius=1,
-                             width=1.8 if cell else 1.3 if picked else 1.0,
-                             fill=self.wash(colour, 110 if (may_read and cell) else
-                                            70 if (may_read and picked) else
-                                            40 if may_read else 0))
-                if not may_read:
-                    painter.save()
-                    painter.setPen(QPen(self.faint(), 0.8))
-                    painter.drawLine(QRectF(box.x(), box.bottom(), 0, 0).topLeft(),
-                                     QRectF(box.right(), box.y(), 0, 0).topLeft())
-                    painter.restore()
+                cell_hit = picked and picked_col is not None and col == picked_col
+                self._mask_cell(painter, box, may_read, picked, cell_hit, allowed)
+        # Row numbers when there is room for them, the followed row always.
+        label_box = QRect(rect.x(), 0, side - 8, int(cell_h))
+        small = cell_h >= 11
+        for row in range(shown_q):
+            real_q = self._to_real(row, shown_q, self._queries)
+            mine = picked_row is not None and row == picked_row
+            if not (small or mine):
+                continue
+            box = label_box.translated(0, int(self._grid.y() + row * cell_h))
+            self.write(painter, box, (f'query {real_q}' if mine else str(real_q)),
+                       colour=self.accent() if mine else self.muted(),
+                       points=8 if mine else 7, bold=mine,
+                       align=Qt.AlignRight | Qt.AlignVCenter)
+        if picked_col is not None:
+            real_k = self._to_real(picked_col, shown_k, self._keys)
+            x = int(self._grid.x() + picked_col * cell_w)
+            self.write(painter, QRect(x - 20, self._grid.bottom() + 2, int(cell_w) + 40, line),
+                       f'key {real_k}', colour=self.accent(), points=7, bold=True,
+                       align=Qt.AlignHCenter | Qt.AlignTop)
         if self._cached:
-            band = QRect(self._grid.x(), self._grid.y() - 3,
+            band = QRect(self._grid.x(), self._grid.y() - 4,
                          int(cell_w * min(shown_k, max(1, round(
                              self._cached * shown_k / self._keys)))), 2)
             self.outline(painter, band, self.role('k'), radius=1, width=1.0,
                          fill=self.wash(self.role('k'), 170))
-            self.write(painter, QRect(self._grid.x(), rect.bottom() - 2 * line,
-                                      self._grid.width(), line),
-                       f'{_count(self._cached, "key")} came from the cache',
-                       colour=self.role('k'))
-        self.write(painter, QRect(rect.x(), self._grid.y(), 52, self._grid.height()),
-                   'query', colour=self.muted(), align=Qt.AlignRight | Qt.AlignVCenter)
-        self.write(painter, QRect(rect.x(), rect.bottom() - line, rect.width(), line),
-                   'allowed / blocked', colour=self.muted())
+        self.write(painter, QRect(self._grid.x(), rect.bottom() - line,
+                                  max(self._grid.width(), 120), line),
+                   'key position  →', colour=self.muted())
+        if not small and picked_row is None:
+            self.write(painter, QRect(rect.x(), self._grid.y(), side - 8, self._grid.height()),
+                       'query', colour=self.muted(), align=Qt.AlignRight | Qt.AlignVCenter)
+        # The key, beside the grid: what each kind of cell means, in words.
+        if legend_width:
+            x = self._grid.right() + 24
+            y = self._grid.y()
+            for may_read, name in ((True, 'allowed'), (False, 'blocked')):
+                self._mask_cell(painter, QRect(x, y + 2, 14, 14), may_read, False, False,
+                                allowed)
+                self.write(painter, QRect(x + 22, y, legend_width - 22, 18), name,
+                           colour=self.ink(), points=8, bold=True)
+                y += 22
+            notes = [self._mask_text()]
+            if self._cached:
+                notes.insert(0, f'{_count(self._cached, "key")} came from the cache')
+            for note in notes:
+                height = max(line, rect.bottom() - y - line)
+                painter.save()
+                painter.setFont(self.font_at(7))
+                bounds = painter.boundingRect(QRectF(x, y + 4, legend_width, height),
+                                              int(Qt.TextWordWrap), note)
+                painter.restore()
+                self.write(painter, QRectF(x, y + 4, legend_width, bounds.height()), note,
+                           colour=self.role('k') if 'cache' in note else self.muted(),
+                           points=7, align=Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap)
+                y += int(bounds.height()) + 6
+        else:
+            self.write(painter, QRect(rect.x(), rect.bottom() - line, side - 8, line),
+                       'allowed / blocked', colour=self.muted(),
+                       align=Qt.AlignRight | Qt.AlignVCenter)
+
+    def _mask_cell(self, painter, box, may_read: bool, picked: bool, cell: bool,
+                   allowed: QColor) -> None:
+        self.outline(painter, box, allowed if may_read else self.faint(), radius=2,
+                     width=1.8 if cell else 1.3 if picked else 1.0,
+                     fill=self.wash(allowed, 150 if (may_read and cell) else
+                                    95 if (may_read and picked) else
+                                    55 if may_read else 0))
+        if not may_read:
+            painter.save()
+            painter.setPen(QPen(self.faint(), 0.8))
+            painter.drawLine(QRectF(box.x(), box.bottom(), 0, 0).topLeft(),
+                             QRectF(box.right(), box.y(), 0, 0).topLeft())
+            painter.restore()
 
     def handle_click(self, point) -> bool:
         if not self._clickable or not self._grid.contains(point):
@@ -954,8 +1073,8 @@ class CausalMaskTriangle(Diagram):
 
     def describe(self) -> list[str]:
         extra = [f'{_count(self._cached, "key")} came from the cache'] if self._cached else []
-        return [self._shape_text(), 'query', 'allowed / blocked', self._mask_text()] \
-            + extra + super().describe()
+        return [self._shape_text(), 'query', 'key position', 'allowed', 'blocked',
+                self._mask_text()] + extra + super().describe()
 
 
 class SoftmaxFlow(Diagram):
@@ -1011,7 +1130,8 @@ class SoftmaxBars(Diagram):
     beside the bars rather than asking the reader to measure a length.
     """
 
-    BODY_HEIGHT = 170
+    BODY_HEIGHT = 214
+    MAX_COLUMN = 76
 
     def __init__(self, scores, weights, *, labels=None, masked_indices=(),
                  selected: int | None = None, drawn: int = DRAWN_CELLS,
@@ -1057,7 +1177,16 @@ class SoftmaxBars(Diagram):
         if shown == 0:
             self.write(painter, rect, 'no values to draw', colour=self.muted())
             return
-        column = rect.width() / shown
+        # A bar per key, at a width that still reads as a bar: five keys spread over a
+        # wide window had become 250-pixel slabs.
+        column = min(float(self.MAX_COLUMN), rect.width() / shown)
+        # Centre the chart as one block: its bars, or its band titles if those are wider.
+        metrics = QFontMetrics(self.font_at(8, bold=True))
+        content = int(max(column * shown,
+                          max(metrics.horizontalAdvance(name) for name in self._rows()) + 4))
+        content = min(rect.width(), content)
+        rect = QRect(rect.x() + (rect.width() - content) // 2, rect.y(), content,
+                     rect.height())
         finite = self._scores[np.isfinite(self._scores)]
         # Masked entries are a large negative additive value, so including them in the
         # range would flatten every real score into one pixel.  They are still drawn and
@@ -1073,43 +1202,50 @@ class SoftmaxBars(Diagram):
                        if self._indices else 1.0)
         weight_high = weight_high or 1.0
 
+        has_sub = any(self._sublabel_for(real) for real in self._indices)
+        footer = (2 if has_sub else 1) * line + 4
+        band_height = (rect.height() - footer) // 2
         for band, (name, colour) in enumerate(
                 zip(self._rows(), (self.role('scores'), self.role('weights')))):
-            top = rect.y() + band * (rect.height() // 2)
+            top = rect.y() + band * band_height
             self.write(painter, QRect(rect.x(), top, rect.width(), line), name,
                        colour=colour, points=8, bold=True)
-            plot = QRect(rect.x(), top + line + 1, rect.width(),
-                         max(18, rect.height() // 2 - 2 * line - 4 - (line if band else 0)))
+            plot = QRect(rect.x(), top + line + 3, int(column * shown),
+                         max(16, band_height - 2 * line - 8))
+            painter.save()
+            painter.setPen(QPen(self.faint(), 1.0))
+            painter.drawLine(QRectF(plot.x(), plot.bottom() + 0.5, 0, 0).topLeft(),
+                             QRectF(plot.right(), plot.bottom() + 0.5, 0, 0).topLeft())
+            painter.restore()
             for index in range(shown):
                 real = self._indices[index]
                 value = float(self._scores[real] if band == 0 else self._weights[real])
                 fraction = ((value - low) / span) if band == 0 else (value / weight_high)
-                fraction = max(0.03, min(1.0, fraction))
+                fraction = max(0.04, min(1.0, fraction))
                 height = max(3, int(plot.height() * fraction))
-                bar = QRect(int(rect.x() + index * column) + 2, plot.bottom() - height,
-                            max(4, int(column) - 4), height)
+                x = int(rect.x() + index * column)
+                bar = QRect(x + 4, plot.bottom() - height, max(4, int(column) - 8), height)
                 masked = real in self._masked
                 picked = self._selected_row is not None and real == self._selected_row
-                self.outline(painter, bar, colour if not masked else self.faint(), radius=1,
-                             width=1.4 if picked else 1.0,
+                self.outline(painter, bar, self.accent() if picked else
+                             (colour if not masked else self.faint()), radius=2,
+                             width=1.8 if picked else 1.0,
                              fill=self.wash(self.accent() if picked else colour,
-                                            0 if masked else 120))
+                                            0 if masked else 150 if picked else 110))
                 if masked:
                     painter.save()
                     painter.setPen(QPen(self.faint(), 0.8, Qt.DashLine))
                     painter.drawLine(QRectF(bar.x(), bar.bottom(), 0, 0).topLeft(),
                                      QRectF(bar.right(), bar.y(), 0, 0).topLeft())
                     painter.restore()
-                self.write(painter, QRect(bar.x() - 4, plot.bottom() + 1,
-                                          max(14, int(column)), line),
-                           f'{value:.3g}', colour=self.muted(), points=7,
-                           align=Qt.AlignCenter)
-        has_sub = any(self._sublabel_for(real) for real in self._indices)
+                self.write(painter, QRect(x, plot.bottom() + 3, int(column), line),
+                           f'{value:.3g}', colour=self.ink() if picked else self.muted(),
+                           points=7, bold=picked, align=Qt.AlignHCenter | Qt.AlignTop)
         for index in range(shown):
             real = self._indices[index]
             cell = QRect(int(rect.x() + index * column),
                          rect.bottom() - (2 * line if has_sub else line),
-                         max(14, int(column)), line)
+                         int(column), line)
             self.write(painter, cell, self._label_for(real)[:6], colour=self.muted(),
                        points=7, align=Qt.AlignCenter)
             if has_sub:
@@ -1742,6 +1878,35 @@ def gallery(tokens: dict | None = None) -> list[Diagram]:
         PositionScope(tokens=tokens, caption='Across positions, then within one.'),
     ]
 
+
+
+# ── Figure widths ────────────────────────────────────────────────────────────
+# The widest each sketch is drawn.  Set in one table so the proportions of the whole
+# set of figures can be judged together; a figure in a wider window grows margins.
+_FIGURE_WIDTHS = {
+    VectorStrip: 560,
+    MatrixGrid: 760,
+    EmbeddingLookupRow: 780,
+    MatMulShapes: 780,
+    HeadSplit: 780,
+    KVShare: 700,
+    QKCompare: 700,
+    CausalMaskTriangle: 620,
+    SoftmaxFlow: 640,
+    SoftmaxBars: 760,
+    AttentionGrid: 560,
+    ResidualBypass: 780,
+    GatedFFNPath: 760,
+    VocabularyProjection: 840,
+    LayerStack: 700,
+    TrainingVsInference: 700,
+    StoppingLoop: 660,
+    DecisionChain: 840,
+    PositionScope: 700,
+}
+for _cls, _width in _FIGURE_WIDTHS.items():
+    _cls.MAX_WIDTH = _width
+del _cls, _width
 
 if __name__ == '__main__':   # pragma: no cover - a visual check, not a test
     import sys

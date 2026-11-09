@@ -545,6 +545,42 @@ reconstructing one.
 Shapes written short always carry `shape_line`'s caption naming the stored shape, so the
 batch axis can never be dropped quietly. One helper, used everywhere.
 
+### The presentation system: paper, figures, one reading column
+
+The recap is laid out like a textbook page, and four mechanisms hold that together. Each
+replaced a specific rendered defect, so don't undo one without looking at a screenshot.
+
+- **Sections are flat.** `QFrame#notebookSection` has the page background, a hairline
+  below, and a 3 px left rule that turns accent for the reader's section. The app QSS
+  paints *every* `QWidget` with `bg`, so a section painted `card_bg` showed each body
+  container as a darker slab inside the card. Only figures, formulas, value boxes,
+  callouts and the destination card are raised (`card_bg` + border). A `QWidget`
+  *subclass* paints no stylesheet background unless it sets `WA_StyledBackground`
+  (`EquationRow`, `VariablePanel` do).
+- **One reading column.** `AnchoredScrollPage._fit_column` centres the sections in
+  `COLUMN_WIDTH` (940 px) by growing the page layout's side margins on every viewport
+  resize. Margins rather than a maximum width per section, so height-for-width still
+  flows through the layout. Ledes and callouts are held to `PROSE_WIDTH` with
+  `measure_label` / `MeasureLabel`, because `QLabel.heightForWidth` ignores the label's
+  own maximum width: a capped label measured at the column width reserves too few lines
+  and the layout squeezes something else (it crushed the prompt's token chips).
+- **Diagrams are figures.** `_Canvas` paints a rounded `card_bg` panel and draws the sketch
+  in `drawing_rect()`: inside `PAD`, no wider than the class's `MAX_WIDTH` (one table,
+  `_FIGURE_WIDTHS`, at the end of `tensorscope_diagrams`), centred. Stretched to 1,300 px,
+  the 15 x 15 mask had become bars. `CausalMaskTriangle` now draws every position up to
+  16 x 24 with square cells and sizes itself with `set_body_height`; `SoftmaxBars` caps a
+  bar's column at `MAX_COLUMN`. Click hit-testing reads the `_grid` rect recorded in
+  `draw`, so it follows the centring.
+- **Role hues are per palette.** `role_colors(tokens)` returns `COLORS` (dark) or
+  `COLORS_LIGHT` (one step darker; the dark hues sit at 1.6-2.6:1 on white). K is pink,
+  not purple: blue vs purple measured OKLab delta-E 1.3 under deuteranopia, and Q and K
+  are drawn side by side. Diagrams, chips (`_role_chip_rules(tokens)`) and the legend all
+  read it. Every coloured element is still labelled in words.
+
+Reference formulas go through `formula_block`, which splits the copy's multi-space
+separators onto lines: rendered as rich text, "S = s·(QKᵀ) + M      A = softmax(S)"
+collapsed into one false equation.
+
 ### Copy never lives inline in a widget
 
 `TENSOR_LABELS`, `TENSOR_EXPLANATIONS`, `EXTRA_TENSOR_LABELS`/`EXTRA_TENSOR_EXPLANATIONS`,

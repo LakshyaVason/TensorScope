@@ -165,7 +165,7 @@ class NotebookView(AnchoredScrollPage):
         card = QFrame()
         card.setObjectName('destinationCard')
         body = QVBoxLayout(card)
-        body.setContentsMargins(16, 12, 16, 14)
+        body.setContentsMargins(24, 18, 24, 20)
         body.setSpacing(4)
         body.addWidget(label(NOTEBOOK_TEXT['destination_asked'], muted=True))
         prompt = label(self.capture.prompt or '(empty prompt)')
@@ -178,7 +178,9 @@ class NotebookView(AnchoredScrollPage):
         # The first token, marked where it begins the excerpt: that is the token whose
         # calculation the page follows.  Only marked when it really is the excerpt's start.
         if first and excerpt.startswith(first):
-            shown = (f'<span style="border-bottom: 2px solid {CHROME["accent"]}; '
+            # Qt's rich text has no border-bottom, so the old rule drew nothing but bold;
+            # colour and an underline are what it can render.
+            shown = (f'<span style="color: {CHROME["accent"]}; text-decoration: underline; '
                      f'font-weight: 700;">{html.escape(first, quote=False)}</span>'
                      + html.escape(excerpt[len(first):], quote=False))
         else:
