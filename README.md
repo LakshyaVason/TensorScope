@@ -28,14 +28,25 @@ per-head value mix and everything inside the feed-forward network are computed a
 discarded. TensorScope **names those, explains what they do, and shows you what it does
 have instead.** It never fills the gap with a plausible-looking number.
 
-So every set of values on screen is labelled with where it came from, in one of four ways:
-a tensor the model produced and the checks above cover; real output of the real forward pass
-that no check independently re-derived (the candidate scores for the second generated token
-onwards); something TensorScope worked out from captured numbers for the display; or an
-operation the model performed whose result this capture did not keep, described rather than
-shown.
+So every set of values on screen is marked with where it came from, in one of four ways:
+
+| Mark | Meaning |
+| --- | --- |
+| solid green left edge | **Observed**: a tensor the model produced, covered by the checks above |
+| a badge, *Observed · unattested* | real output of the real forward pass that no check independently re-derived (the candidate scores for the second generated token onwards) |
+| a badge, *Derived* | something TensorScope worked out from captured numbers for the display: a ranking, a total, a head-average, a margin |
+| dashed grey left edge | **Conceptual**: an operation the model performed whose result this capture did not keep, described rather than shown |
+
+Most numbers are observed, so they carry a quiet edge rather than a label on every line.
+The two kinds you should stop and weigh are always named in words. The variable panel holds
+the key to all four, and every mark also appears in the value's tooltip.
 
 ---
+
+> **In progress:** the recap is being redesigned in phases on the `recap-zoom-levels`
+> branch, towards four zoom levels: the outcome, a map of the whole pass, one card per
+> operation, and the raw tensors. Phase 1 (provenance marks, template tokens, the
+> attention-sink note) is done. The plan for the rest is at the end of `CLAUDE.md`.
 
 ## Requirements
 
@@ -112,6 +123,17 @@ Then, in the window:
    follows one prompt position (the last word you typed) through every step, then hands
    over explicitly to the final position, whose row actually chose the token. Nothing above
    you disappears as you go, so you can always scroll back to a value you met earlier.
+
+   Two things are explained where you first meet them:
+   - **Tokens you did not type.** Most of the prompt's positions are markers added by the
+     model's chat template (12 of 15 for a short question). Operation 1 shows them faded
+     and says why they are there. Tokens are written as text, with a leading space shown
+     as ␣ and a newline as ↵, and the stored tokenizer spelling sits beside the selected
+     token.
+   - **The attention sink.** Wherever a weight row on screen gives the first position at
+     least 40% of its weight, a note says this is a widely reported pattern: heads with
+     nothing useful to collect park their leftover weight on the first token. It is not
+     the model reading that token.
 
    Every named variable is clickable. Clicking one opens a panel with what it is, its
    shape in this run, where its numbers came from, a few values (rounded for reading; hover

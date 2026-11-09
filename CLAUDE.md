@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Work in progress:** a phased redesign of the recap is underway on branch
+> `recap-zoom-levels`. Before changing any recap module, read
+> [Redesign in progress](#redesign-in-progress-the-recaps-four-zoom-levels) at the end of
+> this file: status, decisions already made, and the plans for the remaining phases.
+
 ## What this is
 
 TensorScope inspects the *exact* intermediate tensors produced during a real local LLM
@@ -726,3 +731,213 @@ back to the model dtype, and bf16 has an 8-bit mantissa, so the relative step is
 2⁻⁸ ≈ 0.0039. The measured disagreement (1.9e-3) sits right where that predicts. Don't
 "fix" it by loosening further or by recomputing in float32 — the captured weights are the
 ones the model used.
+
+## Redesign in progress: the recap's four zoom levels
+
+**Read this first if you are picking this work up in a new session.** It is the handoff for
+an unfinished, phased, presentation-only redesign. Everything above still holds; where this
+section and anything above disagree, the section above wins, so stop and ask.
+
+### Goal and hard limits
+
+Make the Computation Recap followable by an engineering student who knows vectors and
+matrix multiplication but not transformers. It stays a PyQt5 desktop app that ships as a
+PyInstaller `.exe`. It is **presentation only**. Do not change:
+
+- **Capture, persistence and verification:** `ModelCapture`, `CaptureAttention`, the three
+  gates, `RunCapture.validate()`, `RunDatabase`, `verify_capture.py`.
+- **The no-reconstruction rule and the four evidence tiers.** How a tier is *drawn* may
+  change; what each tier may *show* may not. The "Forbidden" list (RMS or norms of X,
+  differences of captured tensors, H/F/Z beyond op 8's one scalar) applies to every new
+  widget.
+- **`tensorscope_runs.sqlite3`.** It is a hashed fixture: never write to it, and open it
+  `mode=ro` in any script.
+- **The module DAG** (`ModuleLayeringTests`). Diagrams take ints, strings and numpy
+  slices, and never import `TensorScope`.
+- **Copy lives in `tensorscope_content.py`**, never inline in a widget.
+
+Target structure:
+- **Level 0 · Outcome:** the prompt, the deciding position, the top-10 logits as scores,
+  the margin.
+- **Level 1 · Map:** a pipeline strip and a per-layer depth view.
+- **Level 2 · Operation card:** Idea / Math / Your run, plus a "Go deeper" disclosure.
+- **Level 3 · Raw tensors:** the existing `VariablePanel` and `RawTensorDialog`,
+  unchanged.
+
+### How the work runs
+
+- Branch **`recap-zoom-levels`**, cut from `8be0d5a` on `UI-presentation`. One commit per
+  phase, plus any follow-ups the user asks for. **Do not push or open a PR unless asked.**
+  Never commit `output/` (untracked, unrelated).
+- **Stop after every phase.** Show screenshots and wait for the user's OK before starting
+  the next.
+- **Gate for every phase:** `TensorScope.py --self-test`, `test_recap.py` and
+  `test_threading.py` (commands at the top of this file), run with
+  `QT_QPA_PLATFORM=offscreen`.
+- **Screenshots:** a throwaway driver, outside the repo, at
+  `C:\Users\Expertician\TensorScope\screens\shoot.py`. Usage:
+  `.venv/Scripts/python.exe -I shoot.py <out_dir> [prefix…]`. It mirrors `__main__`
+  (`_make_qss(tokens)` plus Segoe UI 10), uses the real Windows platform with windows
+  placed off-screen (`grab()` on an unmapped offscreen child crashes), and scrolls to a
+  widget by `objectName` (`target=`) rather than by pixel offset. Shots so far are in
+  `screens/phase1/` and `screens/phase1b/`.
+- **Two traps that bit this redesign, both cheap to avoid:**
+  - **Line endings.** Writing a repo file from Python in text mode on Windows turns LF into
+    CRLF. Use the Edit tool, or write bytes. `TensorScope.py` and `test_threading.py` were
+    already CRLF in the checkout; leave them that way.
+  - **Losing a label's style.** `label()` / `measure_label()` style text through
+    `objectName` (`journeyText`, `journeyMuted`, …). Renaming a label for a test hook
+    drops that style and the text renders black. Give every renamed label its own QSS
+    rule in `tensorscope_ui` (as for `#templateTokensWhy`, `#sinkNote`, `#sinkRule`).
+
+### Status
+
+| Phase | State | Commit |
+| --- | --- | --- |
+| 1 · copy and hierarchy | done, user reviewed, follow-ups applied | `3aed50b`, `a398a34` |
+| 2 · Level 0 and Level 1 | **next**; waiting for the user's OK to start | — |
+| 3 · operation cards | planned | — |
+| 4 · packaging and download page | out of scope; do not touch `build/` | — |
+
+**Known failing test, by agreement:** `test_a_section_stays_a_readable_height_at_laptop_width`.
+It already failed on `8be0d5a` (scores 2779, mix 2655, total 25561, against limits of 2600
+and 24000). After Phase 1 it is scores 2623, mix 2692 and total 25704. Phase 3 must bring it
+back under the *existing* bounds. Do not loosen them without asking. Every other test
+passes: 56/57 recap, 12/12 threading, and the self-test.
+
+**Decisions the user has already made** (do not re-ask):
+- An attention-weight percentage (`approx_share`) may appear anywhere, provided its section
+  also shows `WEIGHTS_NOT_PROBABILITIES` or op 7's note. A test enforces this.
+- Level 1 lives in the `input` section's preface, below Level 0. It is not a new anchor:
+  `NAV`, `CHAPTERS` and the 13-anchor assertions stay unchanged.
+- "Only DERIVED and UNATTESTED keep inline wording" covers CONCEPTUAL too, which gets a
+  dashed edge (done in Phase 1).
+
+**Open question for the user:** whether to merge each operation's `note` and `takeaway`
+into one line. Three before/afters were proposed for ops 4, 7 and 12; nothing is applied.
+Op 7's note is pinned word for word by the self-test, so merging it changes that assertion.
+If approved, the merged line becomes the Phase 3 card footer.
+
+**Facts checked against the DB** (run 7, Qwen3-4B, "favorite color?"; the same pattern
+holds in all 7 runs):
+- 12 of the 15 positions are template tokens. Position 14 (the final `"\n\n"`) chose `'I'`.
+- For position 14, position 0 is the heaviest key in 29 of 36 layers (every layer from 7
+  on), at 0.444–0.931 head-averaged.
+- Layer 23 puts the most head-averaged weight on the typed tokens: 0.270. Its head 15 puts
+  0.904 there, 0.672 of it on `"?"`.
+- The top-two logit margin is 5.0.
+- For position 4, feature 0 is X_next's largest coordinate in 21 of 36 layers.
+
+### Phase 2 — Level 0 and Level 1 (in the `input` preface)
+
+Files: content, diagrams, operations (data builders), notebook (`_destination`), test_recap,
+the `TensorScope.py` self-test, and this file.
+
+1. **Three new QPainter diagrams in `tensorscope_diagrams.py`.** Each one takes ints,
+   strings and caller-built arrays only, gets its copy from content, gets a
+   `_FIGURE_WIDTHS` entry, and is added to `DIAGRAMS` and to `gallery()` in both themes.
+   - `PipelineStrip(stages=[(key, title, shape_text)])` emits `stageClicked(str)`; the
+     notebook wires it to `self.go_to`.
+   - `LayerDepthView(matrix L×P, layer_labels, key_labels, typed, highlight_layer)`: one
+     row per layer, one cell per key. Typed columns are emphasised and the highlighted
+     row is outlined. Hovering shows the exact float64 head-mean, through a new `_Canvas`
+     mouse-move → `Diagram.tooltip_at()` hook.
+   - `ScoreDotPlot(scores, labels, selected)`: the top-10 logits on a raw score axis,
+     labelled "score (logit)". Never percentages.
+2. **Level 0** (the rebuilt `_destination` card):
+   - The prompt as chips, using `display_spelling` and faded template chips, with the
+     deciding (final) position marked.
+   - The answer excerpt, as today.
+   - The dot plot. The values are OBSERVED (edge); the ranking and the top-two margin are
+     DERIVED (badge).
+   - Degrade by capability:
+     - Schema 2 (no logits): `LOGITS_UNAVAILABLE` in place of the plot, plus the known
+       first token.
+     - Schema 3 (logits, no trace): label by token ID, with a content note that the
+       spellings were not recorded.
+     - Schema 4: spellings from `generation_trace[0].top_candidates`.
+3. **Level 1** (below Level 0):
+   - The pipeline strip with this run's real shapes: `IDs [P] → [P × hidden] → N × layer
+     → [vocab] → token`. In schema 2 the vocab size reads "not recorded".
+   - The depth view: the head-mean `attention_weights` row for the deciding position,
+     over all keys, one row per layer, with a DERIVED badge. Add a builder
+     `depth_rows(ctx)` in operations that generalises `layer_summary_rows`.
+   - Highlight the layer whose head-mean row puts the most total weight on the typed
+     positions. State the selection rule in the copy and badge the value DERIVED. With no
+     bands there is no highlight, and a fallback line says why.
+   - The sink note applies here too (head-mean, via `sink_callout(averaged=True)`), and
+     this section then needs `WEIGHTS_NOT_PROBABILITIES` beside any percentage.
+4. **Tiers.** Add `OVERVIEW_TIERS = (OBSERVED, DERIVED, CONCEPTUAL)` in content. The tier
+   test checks the preface against it and the section body against op 1's declaration.
+   Op 1's `tiers` stays unchanged.
+5. **Tests.**
+   - DiagramTests for the three widgets: both themes, `describe()`, empty and degenerate
+     input, hover returns the exact digits, and a click emits the right stage key.
+   - SavedCaptureTests:
+     - The outcome degrades correctly for each schema group. Select the groups by
+       capability and assert each is non-empty.
+     - The depth highlight equals an independently computed argmax for every run (layer
+       23 on run 7).
+     - Clicking a pipeline stage calls `go_to`.
+     - The tier test covers the preface.
+   - If the preface pushes `input` over the height bound, report the measured number and
+     ask before raising anything.
+
+### Phase 3 — operation cards
+
+Files: content (`Operation.idea`, a `finding_*` caption per op with its
+`NOTEBOOK_TEXT_FIELDS`, `FOLLOW_DECIDING_POSITION`); common (`OperationCard`, `PaneRow`,
+magnitude bars on `AnnotatedValueRow`); operations (all 12 builders); diagrams (a
+`set_typed(positions)` on the base class, with typed labels emphasised in MatrixGrid,
+CausalMaskTriangle, SoftmaxBars, AttentionGrid, VocabularyProjection and LayerDepthView);
+notebook (the FocusChip menu offers "Follow ' color' (last typed word)"); test_recap; and
+this file.
+
+1. **`OperationCard`**, three fixed panes:
+   - **Idea:** one symbol-free sentence plus the existing structural sketch. Invented
+     numbers go only inside an `Illustration`.
+   - **Math:** `EquationRow`, `formula_block`, and one `shape_line` per operand.
+   - **Your run:** two or three real values with magnitude bars, scaled to the largest
+     *shown* value. That is display only, never a norm, and the caption states the scale.
+     Plus one highlighted `finding` line.
+
+   Under the panes, the footer (the merged note/takeaway line, if approved), then **one**
+   "Go deeper" `Disclosure` holding the io_row, variable list, check, explorer, full grids
+   and remaining notes. Nested disclosures stay.
+2. **`PaneRow` layout:** Idea | Math in two columns, Your run full-width below, all stacked
+   below `CARD_STACK_WIDTH = 720` (common). Drive it from the viewport resize that
+   `_fit_column` already handles. `test_the_shell_fits_a_laptop_screen` must pass
+   unchanged.
+3. **Keep:** `AnchoredScrollPage`, go_to-scrolls-not-swaps, `ctx.slot` rebuilds, the
+   registry, chips, the picker homes (head 6–8, layer 11, phase in the continuation), and
+   op 8's `StepReveal` (it moves into Your run). Op 7's not-probabilities note must stay
+   visible, not hidden in Go deeper, because the sink note relies on it.
+4. **Default followed position:** `FOLLOW_DECIDING_POSITION = True` in content, the one
+   switch to revert. `learn_facts()['focus_position']` uses it. `default_focus_position`
+   becomes `typed_focus_position` and feeds the FocusChip shortcut. Op 12 then shows
+   `focus_is_final` by default. Its "follow the final position" button is still offered
+   whenever the reader has picked another position.
+5. **This phase must also bring the height test back under its existing bounds.**
+6. **Tests whose meaning changes.** Rewrite them rather than delete them, and tell the user
+   about each:
+   - `test_initial_focus_is_a_meaningful_prompt_token`: the default becomes the final
+     position, and the chip offers the typed word.
+   - `test_the_decision_shifts_to_the_final_prompt_position`: select the typed word
+     first, then assert the same hand-off.
+   - The section-height bounds.
+   - `test_rounded_values_carry_their_exact_value`: the boxes now sit inside cards.
+   - `test_controls_appear_where_they_explain_something`, if a picker moves into Go
+     deeper.
+   - New tests: cards stack below `CARD_STACK_WIDTH`; every op has three panes and exactly
+     one Go deeper; typed positions are emphasised in every positional diagram.
+
+### Phase 4 — out of scope
+
+Packaging and the download page. Do not touch `build/`.
+
+### Inline copy that predates this redesign
+
+Some strings still live inline in `tensorscope_operations.py` (for example the "This phase
+did not capture …" fallbacks and several diagram captions) and in `tensorscope_diagrams.py`
+(drawn labels). New copy must go in content. Move these as you touch them, but do not sweep
+them in a phase that is not about them.
