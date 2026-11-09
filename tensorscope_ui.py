@@ -40,8 +40,8 @@ from PyQt5.QtWidgets import (
 )
 
 from tensorscope_common import (
-    COLORS, Card, ChapterProgress, ContentsButton, Disclosure, StageStack, chip_text,
-    evidence_edge_rules, label, role_colors,
+    COLORS, TEMPLATE_CHIP_INK, Card, ChapterProgress, ContentsButton, Disclosure,
+    StageStack, chip_text, evidence_edge_rules, label, role_colors,
 )
 from tensorscope_views import NotebookView, RawTensorDialog, ReferenceView
 
@@ -284,6 +284,7 @@ class ComputationRecap(QDialog):
             #ioAction {{ font-size: 13px; font-style: italic; color: {colors['text_secondary']}; }}
             #ioPlain {{ font-family: Consolas, 'Courier New', monospace; font-size: 13px; }}
             #templateTokensWhy {{ font-size: 13px; color: {colors['text_secondary']}; }}
+            #sinkRule {{ font-size: 11px; color: {colors['text_secondary']}; padding-left: 4px; }}
             #teachingNote, #sinkNote {{
                 padding: 10px 14px;
                 border: 1px solid {colors['border']};
@@ -329,7 +330,7 @@ class ComputationRecap(QDialog):
                 font-size: 12px;
             }}
             QPushButton#tokenChip[template="true"] {{
-                color: {colors['text_muted']};
+                color: {colors[TEMPLATE_CHIP_INK]};
                 background: transparent;
                 border-style: dashed;
             }}

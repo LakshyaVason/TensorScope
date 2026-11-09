@@ -33,7 +33,8 @@ from tensor_widgets import exact_scalar
 from tensorscope_content import (
     EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_INLINE_TIERS, EVIDENCE_KINDS,
     EVIDENCE_LEGEND_TITLE, EVIDENCE_MARKS, EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED,
-    NOTEBOOK_TEXT, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE, TEMPLATE_BAND, readable_spelling,
+    NOTEBOOK_TEXT, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE, TEMPLATE_BAND, display_spelling,
+    readable_spelling,
 )
 
 
@@ -78,6 +79,26 @@ def role_colors(tokens: dict | None = None) -> dict:
 # bars.  Pages centre their sections in a column of this width and let the margins grow.
 COLUMN_WIDTH = 940
 PROSE_WIDTH = 760
+
+# The design token the faded chat-template chips are inked in.  `text_muted` read as
+# faded but measured 3.2:1 (dark) and 3.0:1 (light) on the page; this one clears 4.5:1 on
+# every background a chip can sit on, so the fading is carried by the dashed outline and the
+# missing fill.  The self-test checks the ratio for both token sets.
+TEMPLATE_CHIP_INK = 'text_secondary'
+TEMPLATE_CHIP_BACKGROUNDS = ('bg', 'card_bg', 'nav_active_bg')
+MIN_TEXT_CONTRAST = 4.5
+
+
+def contrast_ratio(first: str, second: str) -> float:
+    """WCAG 2 contrast ratio between two '#rrggbb' colours."""
+    def luminance(colour: str) -> float:
+        value = colour.lstrip('#')
+        channels = [int(value[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+                  for c in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    high, low = sorted((luminance(first), luminance(second)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
 
 # One hue per evidence tier, chosen to stay legible on both light and dark palettes
 # (the tint is an alpha wash over whatever the card background happens to be).
@@ -1424,13 +1445,17 @@ class BandedTokenStrip(QWidget):
         grid.setSpacing(4)
         for position, index in enumerate(range(start, end)):
             token = self._tokens[index]
-            button = QPushButton(chip_text(token))
+            # The text the token stands for, with a leading space as ␣ and a newline as ↵.
+            # The stored BPE spelling ('Ġcolor') appears only in the selected token's detail
+            # line, where it is labelled as the stored form.
+            button = QPushButton(chip_text(display_spelling(token)))
             button.setObjectName('tokenChip')
             button.setCheckable(True)
-            # Faded, not hidden: the model read these exactly like the typed tokens, and
-            # the stylesheet only lowers their contrast so the reader's own words stand out.
+            # Faded, not hidden: the model read these exactly like the typed tokens.  The
+            # stylesheet drops the fill and dashes the border, and keeps the text at
+            # TEMPLATE_CHIP_INK, which clears 4.5:1 on every page background.
             button.setProperty('template', bool(template))
-            button.setToolTip(f'position {index + self._offset}  ·  stored {token!r}  ·  '
+            button.setToolTip(f'position {index + self._offset}  ·  '
                               f'reads as {readable_spelling(token)!r}'
                               + (f'  ·  {TEMPLATE_BAND.lower()}' if template else ''))
             button.clicked.connect(lambda _, i=index: self.select(i))

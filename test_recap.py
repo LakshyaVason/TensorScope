@@ -53,8 +53,10 @@ from tensorscope_content import (
     NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, PROMPT_SPAN_UNKNOWN, PROVENANCE_ABSENT,
     PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED, REFERENCE_TOPICS,
     ROLE_LEGEND, TELEMETRY_UNAVAILABLE, TEMPLATE_BAND, TYPED_BAND, VARIABLE_ROLES,
-    WEIGHTS_NOT_PROBABILITIES, learn_facts, prompt_token_bands, readable_spelling,
+    WEIGHTS_NOT_PROBABILITIES, display_spelling, learn_facts, prompt_token_bands,
+    readable_spelling,
 )
+from tensorscope_common import chip_text
 import tensorscope_operations as operations
 from tensorscope_diagrams import CausalMaskTriangle, Diagram
 from tensorscope_ui import DEFAULT_MODE, MODE_INDEX, MODES, ComputationRecap
@@ -748,6 +750,14 @@ class SavedCaptureTests(unittest.TestCase):
                 self.assertEqual(len(chips), len(capture.prompt_tokens))
                 self.assertEqual({index for index, chip in enumerate(chips)
                                   if chip.property('template')}, template)
+                # Chips show the display spelling; the stored BPE form is only in the
+                # selected token's detail line.
+                for token, chip in zip(capture.prompt_tokens, chips):
+                    self.assertEqual(chip.text(), chip_text(display_spelling(token)))
+                    if token != readable_spelling(token):
+                        self.assertNotIn(repr(token), chip.toolTip())
+                selected = capture.prompt_tokens[notebook.registry.position]
+                self.assertIn(f'stored {selected!r}', section_text(section))
                 self.assertIn(NOTEBOOK_TEXT['template_tokens_why'].format(**facts),
                               section_text(section))
             notebook.deleteLater()
@@ -783,18 +793,34 @@ class SavedCaptureTests(unittest.TestCase):
                 both[side] += 1
                 notebook.select(layer_index=layer, head=head)
                 notebook.go_to('scores')
-                notes = [note for note in notebook.section('scores').findChildren(QLabel)
+                section = notebook.section('scores')
+                notes = [note for note in section.findChildren(QLabel)
                          if note.objectName() == 'sinkNote']
+                rules = [rule.text() for rule in section.findChildren(QLabel)
+                         if rule.objectName() == 'sinkRule']
                 with self.subTest(run_id=run_id, side=side, layer=layer, head=head):
                     if side == 'below':
                         self.assertEqual(notes, [])
+                        self.assertEqual(rules, [])
                         continue
                     self.assertEqual(len(notes), 1)
                     text = notes[0].text()
-                    self.assertIn(f'at least {threshold}', text)
+                    # The rule is its own smaller line, not part of the explanation.
+                    self.assertEqual(len(rules), 1)
+                    self.assertIn(f'at least {threshold}', rules[0])
+                    self.assertNotIn('TensorScope adds this note', text)
                     self.assertIn(repr(readable_spelling(capture.prompt_tokens[0])), text)
                     self.assertIn('not evidence that the model is reading', text)
-                    self.assertIn(WEIGHTS_NOT_PROBABILITIES, text)
+                    self.assertIn('park their leftover weight on the first token', text)
+                    # Op 7's own note says it; the sink note does not repeat it.
+                    self.assertNotIn(WEIGHTS_NOT_PROBABILITIES, text)
+                    self.assertIn('not next-token probabilities', section_text(section))
+                    # Position 0 is the heaviest key here, so the note names it once and
+                    # the separate heaviest-key line is gone.
+                    weights = np.asarray(capture.layers[layer].tensors['attention_weights'])
+                    if int(np.argmax(weights[0, head, position])) == 0:
+                        self.assertFalse(any('The heaviest key is' in label.text()
+                                             for label in section.findChildren(QLabel)))
             # Op 11's form counts the layers whose head-mean row trips the same rule.
             notebook.select(layer_index=min(capture.layers), head=0)
             notebook.go_to('layers')
@@ -804,10 +830,14 @@ class SavedCaptureTests(unittest.TestCase):
                 [0, :, position, 0].mean() >= ATTENTION_SINK_THRESHOLD)
             notes = [note.text() for note in notebook.section('layers').findChildren(QLabel)
                      if note.objectName() == 'sinkNote']
+            rules = [rule.text() for rule in notebook.section('layers').findChildren(QLabel)
+                     if rule.objectName() == 'sinkRule']
             with self.subTest(run_id=run_id, part='layers'):
                 if expected:
                     self.assertEqual(len(notes), 1)
                     self.assertTrue(notes[0].startswith(f'In {expected} of {len(capture.layers)} '))
+                    self.assertIn(WEIGHTS_NOT_PROBABILITIES, notes[0])
+                    self.assertEqual(len(rules), 1)
                 else:
                     self.assertEqual(notes, [])
             notebook.deleteLater()
@@ -1184,6 +1214,20 @@ class SavedCaptureTests(unittest.TestCase):
             # table behind a single disclosure.
             titles = [d.title for d in notebook.section('layers').findChildren(Disclosure)]
             self.assertFalse(any(title.startswith('Layer ') for title in titles), titles)
+            # The largest coordinate of X_next lives behind its own disclosure, with the
+            # line saying how often one feature leads, counted from the same rows.
+            self.assertIn(NOTEBOOK_TEXT['layer_feature_title'], titles)
+            headings = [table.horizontalHeaderItem(column).text()
+                        for table in notebook.section('layers').findChildren(QTableWidget)
+                        for column in range(table.columnCount())]
+            self.assertNotIn('Largest coordinate of X_next', headings)
+            open_every_disclosure(notebook.section('layers'))
+            features = [row['feature'] for row in rows]
+            leader = max(set(features), key=lambda f: (features.count(f), -f))
+            if features.count(leader) * 2 > len(features):
+                self.assertIn(f'Feature {leader} is the largest-magnitude coordinate of X_next '
+                              f'in {features.count(leader)} of {len(capture.layers)} layers',
+                              section_text(notebook.section('layers')))
             notebook.hide()
             notebook.deleteLater()
             QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)

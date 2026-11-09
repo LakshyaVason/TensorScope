@@ -255,6 +255,18 @@ def readable_spelling(token: str) -> str:
     return text
 
 
+def display_spelling(token: str) -> str:
+    """How a token is written on a chip: the text it stands for, with its invisible parts
+    made visible.  A leading space is '␣', a newline '↵', a tab '⇥'.
+
+    For display only.  The stored BPE spelling ('Ġcolor') is still shown, verbatim, in the
+    selected token's detail line, so the reader can always see what was actually stored.
+    """
+    text = readable_spelling(token).replace("\n", "↵").replace("\t", "⇥")
+    body = text.lstrip(" ")
+    return "␣" * (len(text) - len(body)) + body
+
+
 TEMPLATE_BAND = "Added by the chat template"
 TYPED_BAND = "Your text, as the tokenizer split it"
 
@@ -1561,21 +1573,24 @@ NOTEBOOK_TEXT = {
         "here only so your own tokens stand out.",
 
     # The attention sink, wherever a shown weight row trips ATTENTION_SINK_THRESHOLD.
+    # Op 7's own note already says attention weights are not next-token probabilities,
+    # so the per-row form does not repeat it; op 11's form has no such neighbour and does.
     "attention_sink":
-        "Position 0, {spelling}, takes {share}. TensorScope adds this note whenever a "
-        "weight row on screen gives position 0 at least {threshold} of its weight. It is a "
-        "widely reported pattern in trained transformers, often called an attention sink: "
-        "weight a head has no better use for collects on the first token. It is not "
-        "evidence that the model is reading what that token says. "
-        + WEIGHTS_NOT_PROBABILITIES,
+        "Position 0, {spelling}, takes {share}. This is a widely reported pattern in "
+        "trained transformers, often called an attention sink: heads with nothing useful "
+        "to collect park their leftover weight on the first token. It is not evidence that "
+        "the model is reading what that token says.",
     "attention_sink_layers":
         "In {count} of {layer_count} layers, the head-averaged weight row for position "
         "{query} gives position 0, {spelling}, at least {threshold} of its weight — from "
-        "{low} to {high}. TensorScope adds this note whenever a weight row on screen gives "
-        "position 0 at least {threshold}. It is a widely reported pattern in trained "
-        "transformers, often called an attention sink: weight a head has no better use for "
-        "collects on the first token. It is not evidence that the model is reading what "
-        "that token says. " + WEIGHTS_NOT_PROBABILITIES,
+        "{low} to {high}. This is a widely reported pattern in trained transformers, often "
+        "called an attention sink: heads with nothing useful to collect park their leftover "
+        "weight on the first token. It is not evidence that the model is reading what that "
+        "token says. " + WEIGHTS_NOT_PROBABILITIES,
+    # The rule, as a smaller secondary line under either form.
+    "attention_sink_rule":
+        "TensorScope adds this note whenever a weight row on screen gives position 0 at "
+        "least {threshold} of its weight.",
     "mean_weight_share": "≈{percent} of the weight, averaged over the heads",
 
     # Followed-feature samples, ops 2, 4, 9 and 10.
@@ -1692,9 +1707,17 @@ NOTEBOOK_TEXT = {
         "operations above at that layer.",
     "layer_table_note":
         "Most-attended position is where this position's attention weight went, averaged "
-        "over the {query_head_count_text} heads; the feature is the largest-magnitude "
-        "coordinate of that layer's output. Both are picked out for display — rankings of "
-        "captured values, not values the model reported.",
+        "over the {query_head_count_text} heads. It is picked out for display — a ranking "
+        "of captured values, not a value the model reported.",
+    "layer_feature_title": "The largest coordinate of each layer's output, X_next",
+    "layer_feature_dominance":
+        "Feature {feature} is the largest-magnitude coordinate of X_next in {count} of "
+        "{layer_count} layers for this position, so this column mostly shows that one "
+        "coordinate's size growing, not a change in which feature leads. Picked out for "
+        "display — a ranking of captured values, not a value the model reported.",
+    "layer_feature_note":
+        "The largest-magnitude coordinate of each layer's output for this position. Picked "
+        "out for display — a ranking of captured values, not a value the model reported.",
     "layer_shapes_title": "Stored tensors and their shapes (the same for every layer)",
     "layer_stack_caption":
         "The highlighted layer is the one the operations above are describing.",
@@ -1752,6 +1775,8 @@ NOTEBOOK_TEXT = {
 NOTEBOOK_TEXT_FIELDS = {
     "attention_sink": ("spelling", "share", "threshold"),
     "attention_sink_layers": ("count", "query", "spelling", "threshold", "low", "high"),
+    "attention_sink_rule": ("threshold",),
+    "layer_feature_dominance": ("feature", "count"),
     "mean_weight_share": ("percent",),
     "kept_captured": ("names",),
     "kept_described": ("names",),

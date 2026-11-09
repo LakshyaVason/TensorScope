@@ -433,9 +433,16 @@ multiplication, and its structure is mechanical rather than editorial:
   heavy extras sit behind `Disclosure`s. Captions live in `NOTEBOOK_TEXT`; the ones that
   need a builder value (a weight, a count) declare it in `NOTEBOOK_TEXT_FIELDS`, and the
   self-test formats every caption against both fixtures with zeros for those.
+- **Chips show display spellings.** `display_spelling` (content) writes what a token stands
+  for, with a leading space as ␣, a newline as ↵ and a tab as ⇥. The stored BPE spelling
+  (`'Ġcolor'`) appears only in the selected token's detail line, labelled "stored", and no
+  longer in the chip's tooltip.
 - **The tokens you did not type are explained up front.** In the shipped runs 12 of 15
   positions are chat-template markers. When `prompt_token_bands` resolves, op 1 fades the
-  template chips (`tokenChip[template="true"]`, dashed and muted — faded, never hidden) and
+  template chips (`tokenChip[template="true"]`: dashed outline, no fill, and ink
+  `TEMPLATE_CHIP_INK = 'text_secondary'`. `text_muted` measured 3.2:1 / 3.0:1, so the
+  self-test holds `contrast_ratio` ≥ 4.5 on `bg`, `card_bg` and `nav_active_bg` in both
+  themes. Faded, never hidden) and
   shows `NOTEBOOK_TEXT['template_tokens_why']`. When it does not, nothing is faded, no count
   is given, and `PROMPT_SPAN_UNKNOWN` shows instead; the self-test's unaligned fixture and
   `test_template_tokens_are_explained_and_faded_only_when_aligned` (on a copied capture
@@ -514,6 +521,14 @@ Three details are load-bearing:
   plus a single shape table behind a `Disclosure` — it used to be 36 identical shape
   tables. `open_every_disclosure` still *loops* until no new ones appear, because
   disclosures can contain disclosures.
+  The summary table is layer · most-attended position · head-mean weight. The largest
+  coordinate of each layer's X_next is behind its own `Disclosure` (`_layer_features`): for
+  the followed position one feature leads in most layers (feature 0, 21 of 36 in the shipped
+  runs), so that column mostly showed one coordinate growing. When a single feature leads
+  in more than half the layers, `layer_feature_dominance` says so, with the count read off
+  the same rows.
+- The variable panel's title goes through `panel_title`, because several `TENSOR_LABELS`
+  already end in " · <symbol>" and the symbol was printed twice.
 
 ### Variables are the interactive objects
 
@@ -551,8 +566,13 @@ never shown as percentages. `test_rounded_values_carry_their_exact_value`.
 `ATTENTION_SINK_THRESHOLD` (0.4) of its weight, `sink_callout` (ops 7 and 8, the per-head row
 on screen) or `layer_sink_callout` (op 11, the head-mean rows: "in N of L layers") adds
 `NOTEBOOK_TEXT['attention_sink']`. It reads one number off the captured row and nothing else,
-states its own rule, says the pattern is widely reported rather than the model "reading" the
-token, and carries `WEIGHTS_NOT_PROBABILITIES`. For the deciding position of the shipped runs,
+and says the pattern is widely reported — "heads with nothing useful to collect park their
+leftover weight on the first token" — rather than the model "reading" the token. Its rule
+("TensorScope adds this note whenever…", `attention_sink_rule`) is a separate smaller
+`#sinkRule` line beneath it. Op 7's form omits `WEIGHTS_NOT_PROBABILITIES` because op 7's own
+note says it; op 11's form keeps it. In op 7, when the note shows and position 0 is also
+the heaviest key, the separate heaviest-key line is dropped. It stays if another key is
+heavier, so the note can never imply that position 0 led the row. For the deciding position of the shipped runs,
 position 0 is the heaviest key in 29 of 36 layers (every layer from 7 on), at 0.44–0.93 of
 the head-averaged weight — unexplained, that looks like a bug.
 `test_the_attention_sink_note_follows_its_stated_rule` finds a (layer, head) on each side of

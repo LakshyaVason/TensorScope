@@ -246,6 +246,17 @@ class VariableRegistry(QObject):
         return self._current
 
 
+def panel_title(symbol: str, title: str) -> str:
+    """'X_norm · Normalized layer input', with the symbol said once.
+
+    Several TENSOR_LABELS already end in ' · <symbol>' ('Normalized layer input · X_norm'),
+    so prefixing the symbol as well printed it twice.
+    """
+    suffix = f' · {symbol}'
+    name = title[:-len(suffix)] if symbol and title.endswith(suffix) else title
+    return f'{symbol}   ·   {name}' if symbol and name != symbol else (name or symbol)
+
+
 def _colour_for(key: str) -> str:
     """The role colour for a captured tensor, by what it is rather than by its name."""
     if key in ('q', 'q_attended'):
@@ -488,7 +499,7 @@ class VariablePanel(QWidget):
         resolved = self._registry.resolve(key)
         self._current = key
         self._clear()
-        self._add(label(f'{resolved.symbol}   ·   {resolved.title}', title=True))
+        self._add(label(panel_title(resolved.symbol, resolved.title), title=True))
         word = VariableChip.PROVENANCE_WORDS.get(resolved.provenance, '')
         mark = evidence_mark(resolved.tier, word)
         if mark is not None:

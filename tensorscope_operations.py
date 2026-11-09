@@ -527,17 +527,27 @@ def sink_callout(ctx: NotebookContext, row, *, averaged: bool = False) -> QWidge
         return None
     phrase = (ctx.say('mean_weight_share', percent=f'{share * 100:.1f}%') if averaged
               else approx_share(share))
-    note = measure_label(ctx.say(
-        'attention_sink', spelling=repr(readable_spelling(ctx.spelling(0))), share=phrase,
-        threshold=_threshold_text()), width=PROSE_WIDTH + 40)
-    note.setObjectName('sinkNote')
-    note.setToolTip(f'Exact weight on position 0: {exact_scalar(row[0]) if not averaged else repr(share)}')
+    host, lines = _panel(4)
     if averaged:
-        host, lines = _panel(4)
         lines.addWidget(badge_row(EvidenceBadge(EVIDENCE_DERIVED, 'head-mean')))
-        lines.addWidget(note)
-        return host
-    return set_evidence(note, EVIDENCE_OBSERVED)
+    note = measure_label(ctx.say(
+        'attention_sink', spelling=repr(readable_spelling(ctx.spelling(0))), share=phrase),
+        width=PROSE_WIDTH + 40)
+    note.setObjectName('sinkNote')
+    note.setToolTip(f'Exact weight on position 0: '
+                    f'{repr(share) if averaged else exact_scalar(row[0])}')
+    lines.addWidget(note)
+    lines.addWidget(_sink_rule(ctx))
+    host.setObjectName('sinkCallout')
+    return host if averaged else set_evidence(host, EVIDENCE_OBSERVED)
+
+
+def _sink_rule(ctx: NotebookContext) -> QWidget:
+    """When the note appears, as a smaller secondary line beneath it."""
+    rule = label(ctx.say('attention_sink_rule', threshold=_threshold_text()),
+                 muted=True, small=True)
+    rule.setObjectName('sinkRule')
+    return rule
 
 
 def _tracked(ctx: NotebookContext, lines: QVBoxLayout, rows) -> None:
@@ -943,13 +953,18 @@ def build_scores(ctx: NotebookContext, section) -> QWidget:
         # digits on the tooltip.  The bars above carry every other shown key.
         heaviest = max(allowed, key=lambda index: (float(weight_row[index]), -index))
         weight = weight_row[heaviest]
-        line = observed_line(ctx.say(
-            'heaviest_key', key=heaviest,
-            spelling=repr(spellings[heaviest]) if heaviest < len(spellings) else '',
-            weight=approx(weight), percent=f'{float(weight) * 100:.1f}%'))
-        line.words.setToolTip(f'Exact stored value: {exact_scalar(weight)}')
-        lines.addWidget(line)
         sink = sink_callout(ctx, weight_row)
+        # When the sink note shows and position 0 is also the heaviest key, the note
+        # already names it and its share, so the heaviest-key line would say it twice.  If
+        # some other key is heavier still, that line stays: the note alone would let a
+        # reader assume position 0 led the row.
+        if sink is None or heaviest != 0:
+            line = observed_line(ctx.say(
+                'heaviest_key', key=heaviest,
+                spelling=repr(spellings[heaviest]) if heaviest < len(spellings) else '',
+                weight=approx(weight), percent=f'{float(weight) * 100:.1f}%'))
+            line.words.setToolTip(f'Exact stored value: {exact_scalar(weight)}')
+            lines.addWidget(line)
         if sink is not None:
             lines.addWidget(sink)
         total = float(np.asarray(weight_row, dtype=np.float64).sum())
@@ -1210,7 +1225,38 @@ def layer_sink_callout(ctx: NotebookContext, summary) -> QWidget | None:
         width=PROSE_WIDTH + 40)
     note.setObjectName('sinkNote')
     lines.addWidget(note)
+    lines.addWidget(_sink_rule(ctx))
+    host.setObjectName('sinkCallout')
     return host
+
+
+def _layer_features(ctx: NotebookContext, summary) -> QWidget:
+    """The largest coordinate of each layer's output, kept out of the main table.
+
+    In the shipped runs one feature leads by magnitude in nearly every layer, so the column
+    mostly showed one coordinate's size growing.  When a single feature leads in most
+    layers this says so, with the count read off the same rows.
+    """
+    inner, lines = _panel(4)
+    features = [entry['feature'] for entry in summary if entry['feature'] is not None]
+    if features:
+        leader = max(set(features), key=lambda feature: (features.count(feature), -feature))
+        count = features.count(leader)
+        key = ('layer_feature_dominance' if count * 2 > len(features)
+               else 'layer_feature_note')
+        lines.addWidget(badged(EvidenceBadge(EVIDENCE_DERIVED, 'ranking'),
+                               ctx.say(key, feature=leader, count=count)))
+    rows, tips = [], []
+    for entry in summary:
+        rows.append((entry['layer'],
+                     '' if entry['feature'] is None else f'feature {entry["feature"]}',
+                     '' if entry['value'] is None else approx(entry['value'])))
+        tips.append(('', '', '' if entry['value'] is None else
+                     f'Exact stored value: {exact_scalar(entry["value"])}'))
+    grid = read_only_table(['Layer', 'Largest coordinate', '≈ value'], rows, stretch=1,
+                           tooltips=tips)
+    lines.addWidget(evidence_frame(grid, EVIDENCE_OBSERVED))
+    return inner
 
 
 def build_layers(ctx: NotebookContext, section) -> QWidget:
@@ -1244,18 +1290,13 @@ def build_layers(ctx: NotebookContext, section) -> QWidget:
                 entry['layer'],
                 '' if key is None else
                 f'{key}  {spellings[key] if key < len(spellings) else ""}',
-                '' if entry['weight'] is None else approx(entry['weight']),
-                '' if entry['feature'] is None else
-                f'feature {entry["feature"]}  ·  {approx(entry["value"])}'))
+                '' if entry['weight'] is None else approx(entry['weight'])))
             tips.append(('', '',
                          '' if entry['weight'] is None else
-                         f'Exact head-mean weight: {entry["weight"]!r}',
-                         '' if entry['value'] is None else
-                         f'Exact stored value: {exact_scalar(entry["value"])}'))
-        grid = read_only_table(['Layer', 'Most-attended position', '≈ weight',
-                                'Largest coordinate of X_next'], rows, stretch=3,
-                               highlight=current, tooltips=tips)
-        for column, width in ((0, 56), (1, 190), (2, 90)):
+                         f'Exact head-mean weight: {entry["weight"]!r}'))
+        grid = read_only_table(['Layer', 'Most-attended position', '≈ head-mean weight'],
+                               rows, stretch=1, highlight=current, tooltips=tips)
+        for column, width in ((0, 56), (2, 160)):
             grid.setColumnWidth(column, width)
         grid.setMinimumHeight(min(260, 32 + 28 * max(1, len(rows))))
         grid.cellClicked.connect(
@@ -1263,6 +1304,8 @@ def build_layers(ctx: NotebookContext, section) -> QWidget:
         grid.setToolTip('Click a row to point the operations above at that layer.')
         lines.addWidget(grid)
         lines.addWidget(label(ctx.say('layer_table_note'), muted=True, small=True))
+        lines.addWidget(ctx.disclosure(ctx.say('layer_feature_title'),
+                                       lambda rows=summary: _layer_features(ctx, rows)))
         return inner
 
     ctx.slot(body, table)

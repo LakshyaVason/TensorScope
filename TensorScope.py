@@ -2321,9 +2321,38 @@ def self_test() -> None:
     assert set(EVIDENCE_INLINE_TIERS) == {EVIDENCE_DERIVED, EVIDENCE_UNATTESTED}
     assert 0 < ATTENTION_SINK_THRESHOLD < 1
     for key in ("attention_sink", "attention_sink_layers"):
-        assert NOTEBOOK_TEXT[key].endswith(WEIGHTS_NOT_PROBABILITIES), key
-        assert "{threshold}" in NOTEBOOK_TEXT[key] and "not evidence" in NOTEBOOK_TEXT[key], key
+        assert "not evidence" in NOTEBOOK_TEXT[key], key
+        assert "park their leftover weight on the first token" in NOTEBOOK_TEXT[key], key
+        assert "TensorScope adds this note" not in NOTEBOOK_TEXT[key], key   # the rule line
+    # Op 7's note already carries the caveat; op 11 has no such neighbour.
+    assert WEIGHTS_NOT_PROBABILITIES not in NOTEBOOK_TEXT["attention_sink"]
+    assert NOTEBOOK_TEXT["attention_sink_layers"].endswith(WEIGHTS_NOT_PROBABILITIES)
+    assert "{threshold}" in NOTEBOOK_TEXT["attention_sink_rule"]
     assert "{template_token_count}" in NOTEBOOK_TEXT["template_tokens_why"]
+
+    # Chips show what a token stands for, with its invisible parts visible.
+    from tensorscope_content import display_spelling
+    assert display_spelling("Ġcolor") == "␣color"
+    assert display_spelling("ĊĊ") == "↵↵"
+    assert display_spelling("Ġ") == "␣"
+    assert display_spelling("<|im_start|>") == "<|im_start|>"
+    assert display_spelling("favorite") == "favorite"
+
+    # Faded template chips must still read: 4.5:1 on every background, in both themes.
+    from tensorscope_common import (
+        MIN_TEXT_CONTRAST, TEMPLATE_CHIP_BACKGROUNDS, TEMPLATE_CHIP_INK, contrast_ratio,
+    )
+    for theme in (_TOKENS_DARK, _TOKENS_LIGHT):
+        for background in TEMPLATE_CHIP_BACKGROUNDS:
+            ratio = contrast_ratio(theme[TEMPLATE_CHIP_INK], theme[background])
+            assert ratio >= MIN_TEXT_CONTRAST, (background, theme[background], ratio)
+
+    # The variable panel names a tensor's symbol once.
+    from tensorscope_variables import panel_title
+    assert panel_title("X_norm", "Normalized layer input · X_norm") == \
+        "X_norm   ·   Normalized layer input"
+    assert panel_title("O", "Attention block output · after o_proj") == \
+        "O   ·   Attention block output · after o_proj"
 
     # What the capture establishes, filtered by what this run actually holds.  A schema-2
     # run has no score vector and no recorded rule, so it must not be told it has both.
