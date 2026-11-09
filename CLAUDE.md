@@ -54,7 +54,7 @@ mechanism cheaply. Run it against `Qwen/Qwen3-4B` as well before trusting a chan
 adds QK-norm and a head_dim decoupled from `hidden_size / num_heads`, which has caught
 shape assumptions that the 0.5B model does not.
 
-`test_recap.py` is the one to run after any UI change: 53 tests over every saved run, no
+`test_recap.py` is the one to run after any UI change: 57 tests over every saved run, no
 torch, no GPU, about three minutes. It takes an optional database path first, then
 test names — `test_recap.py SavedCaptureTests.test_token_span_selection_matches_the_recorded_candidates`
 runs one. (It only treats the first argument as a database when it looks like one, so
@@ -199,12 +199,12 @@ characters from a truncated multi-byte sequence, so it exercises rendering those
 
 Two degradation paths the saved runs do **not** reach, so don't assume they are covered:
 
-- `ResponseTextView`'s unfaithful-spellings fallback to `TokenChipStrip`. All six runs
+- `ResponseTextView`'s unfaithful-spellings fallback to `TokenChipStrip`. All seven runs
   reassemble correctly, so the branch is reachable in principle and untested in practice.
   `test_token_span_selection_matches_the_recorded_candidates` asserts `is_faithful()`
   against an independently computed comparison rather than assuming the faithful branch, so
   it will follow whichever is real — but today that is always the faithful one.
-- `PROMPT_SPAN_UNKNOWN`. `prompt_token_bands` resolves for all six runs, so the "could not
+- `PROMPT_SPAN_UNKNOWN`. `prompt_token_bands` resolves for all seven runs, so the "could not
   line your typed text up" notice never appears. Cover either of these with a synthetic
   fixture in `--self-test` if you touch them.
 
@@ -433,6 +433,13 @@ multiplication, and its structure is mechanical rather than editorial:
   heavy extras sit behind `Disclosure`s. Captions live in `NOTEBOOK_TEXT`; the ones that
   need a builder value (a weight, a count) declare it in `NOTEBOOK_TEXT_FIELDS`, and the
   self-test formats every caption against both fixtures with zeros for those.
+- **The tokens you did not type are explained up front.** In the shipped runs 12 of 15
+  positions are chat-template markers. When `prompt_token_bands` resolves, op 1 fades the
+  template chips (`tokenChip[template="true"]`, dashed and muted — faded, never hidden) and
+  shows `NOTEBOOK_TEXT['template_tokens_why']`. When it does not, nothing is faded, no count
+  is given, and `PROMPT_SPAN_UNKNOWN` shows instead; the self-test's unaligned fixture and
+  `test_template_tokens_are_explained_and_faded_only_when_aligned` (on a copied capture
+  with an unmatchable prompt) cover that branch.
 - **One position is followed.** `default_focus_position` picks the last typed token with a
   letter or digit (the last word of the question, not its `?`), only when
   `prompt_token_bands` resolves; otherwise the last typed token, then the last position.
@@ -533,9 +540,23 @@ variable, because there is no array behind them for a panel to be about.
 Values in the teaching view are rounded for reading (`approx`: "≈0.252"), and every value
 box carries the exact stored digits (`exact_scalar`) as its tooltip; the panel's complete
 array and `RawView` show exact digits only. `approx_share` turns an **attention weight**
-into "≈25.2% of this head's mixing weight" — the only percentage anywhere, always beside
-operation 7's note that attention weights are not next-token probabilities. Logits are
+into "≈25.2% of this head's mixing weight" (`mean_weight_share` for a head-mean). Attention
+weights are the only thing ever shown as a percentage, and **every section that shows one
+also shows `WEIGHTS_NOT_PROBABILITIES`** (or op 7's note, which says the same) —
+`test_every_attention_percentage_sits_beside_the_not_probabilities_line`. It used to be
+"only in op 7"; op 8, the sink note and the Level 1 depth view needed it too. Logits are
 never shown as percentages. `test_rounded_values_carry_their_exact_value`.
+
+**The attention sink note.** Wherever a weight row on screen gives position 0 at least
+`ATTENTION_SINK_THRESHOLD` (0.4) of its weight, `sink_callout` (ops 7 and 8, the per-head row
+on screen) or `layer_sink_callout` (op 11, the head-mean rows: "in N of L layers") adds
+`NOTEBOOK_TEXT['attention_sink']`. It reads one number off the captured row and nothing else,
+states its own rule, says the pattern is widely reported rather than the model "reading" the
+token, and carries `WEIGHTS_NOT_PROBABILITIES`. For the deciding position of the shipped runs,
+position 0 is the heaviest key in 29 of 36 layers (every layer from 7 on), at 0.44–0.93 of
+the head-averaged weight — unexplained, that looks like a bug.
+`test_the_attention_sink_note_follows_its_stated_rule` finds a (layer, head) on each side of
+the threshold from the captures themselves and asserts both sides exist.
 
 `layer_input` (`X`) is the one indirection worth knowing: a layer's input *is* captured, just
 under another name — the embedding output at layer 0, the previous layer's output after that.
@@ -619,6 +640,20 @@ they must not look identical to a tensor that survives all three gates. Each `Op
 declares the `tiers` it may show and a test enforces it, and `EVIDENCE_UNATTESTED` is
 confined to two places — a later generation step's scores, and the stopping score, which
 also comes from a non-prefill pass.
+
+**How a tier is drawn.** Only `EVIDENCE_INLINE_TIERS` (DERIVED and UNATTESTED, the two a
+reader must stop and weigh) keep an inline `EvidenceBadge`. OBSERVED is a solid green left
+edge on its value box, sentence or table; CONCEPTUAL is a dashed grey one. An `EvidenceBadge`
+on every line made the page read like an audit log. The one key to all four,
+`EvidenceLegend`, sits in the variable panel under `RoleLegend` (and again in the
+continuation's limits). Use `evidence_mark(kind)` (a badge, or None), `set_evidence(widget,
+kind)`, `evidence_frame(child, kind)`, `observed_line` / `described_line`, or `EvidenceEdge`
+— never a bare `EvidenceBadge(EVIDENCE_OBSERVED, …)`. Every one of them, badges included, sets
+the dynamic property `evidenceTier`, plus a tooltip and an accessible description, so the
+tier is never carried by colour alone. That property is what the tier tests read
+(`evidence_claims` in `test_recap`): a test that only looked for badges would have gone blind
+the moment OBSERVED lost its words. `test_observed_values_carry_an_edge_not_a_badge` holds
+the rendering rule. The rendering may change again; what each tier is allowed to show may not.
 
 Operation 8 is the only place an intermediate is *computed*: one scalar of `A @ V`, in
 float64, from two captured operands, badged derived and shown beside `DISPLAY_CALC_NOTE`.

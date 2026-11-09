@@ -445,6 +445,37 @@ PROMPT_SPAN_UNKNOWN = (
     "grouping is shown. Every token listed is still exactly what the model received."
 )
 
+# ── How provenance is drawn ──────────────────────────────────────────────────────
+# Only the two tiers a reader must stop and weigh carry words inline: DERIVED (TensorScope
+# worked it out) and UNATTESTED (real, but no gate re-derived it).  OBSERVED, which is most
+# numbers on the page, is a solid coloured left edge on its value box; CONCEPTUAL, whose
+# own text already says the value is absent, is a dashed grey edge.  Every edge also sets
+# a property, a tooltip and an accessible description, so the tier never lives in colour
+# alone.  The one key to all four is in the variable panel, beside the colour key.
+EVIDENCE_INLINE_TIERS = (EVIDENCE_DERIVED, EVIDENCE_UNATTESTED)
+
+EVIDENCE_MARKS = {
+    EVIDENCE_OBSERVED: "solid green left edge",
+    EVIDENCE_CONCEPTUAL: "dashed grey left edge",
+    EVIDENCE_DERIVED: "always named in words, like this",
+    EVIDENCE_UNATTESTED: "always named in words, like this",
+}
+
+EVIDENCE_LEGEND_TITLE = "where each number came from"
+
+# ── The attention sink ───────────────────────────────────────────────────────────
+# A shown weight row that gives position 0 at least this share of its weight gets a
+# callout.  Read off the captured row on screen and nothing else; the threshold is stated
+# in the copy so the reader knows exactly when the note appears and when it does not.
+ATTENTION_SINK_THRESHOLD = 0.4
+
+# Beside every attention-weight percentage, wherever one appears.  The test that enforces
+# it looks for this exact phrase.
+WEIGHTS_NOT_PROBABILITIES = (
+    "Attention weights decide how information is mixed; they are not next-token "
+    "probabilities."
+)
+
 SYMBOLIC_WEIGHTS_NOTE = (
     "The learned weight matrices appear as symbols because they were never part of this "
     "capture — only their outputs were. Nothing here stands in for their values."
@@ -1522,6 +1553,30 @@ NOTEBOOK_TEXT = {
         "You did not type this one. The chat template adds markers like it to say whose "
         "turn it is.",
     "focus_hint": "Choose a token to follow it through the operations below.",
+    "template_tokens_why":
+        "{template_token_count} of these {position_count} positions are tokens you did not "
+        "type. A chat model is trained on conversations, so before your text reaches it a "
+        "chat template wraps it in markers that say whose turn it is and where each turn "
+        "ends. The model reads those markers exactly like your words; they are shown faded "
+        "here only so your own tokens stand out.",
+
+    # The attention sink, wherever a shown weight row trips ATTENTION_SINK_THRESHOLD.
+    "attention_sink":
+        "Position 0, {spelling}, takes {share}. TensorScope adds this note whenever a "
+        "weight row on screen gives position 0 at least {threshold} of its weight. It is a "
+        "widely reported pattern in trained transformers, often called an attention sink: "
+        "weight a head has no better use for collects on the first token. It is not "
+        "evidence that the model is reading what that token says. "
+        + WEIGHTS_NOT_PROBABILITIES,
+    "attention_sink_layers":
+        "In {count} of {layer_count} layers, the head-averaged weight row for position "
+        "{query} gives position 0, {spelling}, at least {threshold} of its weight — from "
+        "{low} to {high}. TensorScope adds this note whenever a weight row on screen gives "
+        "position 0 at least {threshold}. It is a widely reported pattern in trained "
+        "transformers, often called an attention sink: weight a head has no better use for "
+        "collects on the first token. It is not evidence that the model is reading what "
+        "that token says. " + WEIGHTS_NOT_PROBABILITIES,
+    "mean_weight_share": "≈{percent} of the weight, averaged over the heads",
 
     # Followed-feature samples, ops 2, 4, 9 and 10.
     "tracked_features_caption":
@@ -1596,7 +1651,8 @@ NOTEBOOK_TEXT = {
     "mix_step_weights": "The weights this head gave",
     "mix_step_weights_body":
         "One weight per position this query may read; they add up to 1, so what follows "
-        "is an average. Only the largest are shown separately.",
+        "is an average. Only the largest are shown separately. "
+        + WEIGHTS_NOT_PROBABILITIES,
     "mix_step_values": "The values it is choosing between",
     "mix_step_values_body":
         "Each position contributes a whole vector of {head_dim} features. One feature is "
@@ -1686,6 +1742,7 @@ NOTEBOOK_TEXT = {
         "earlier positions; it does not recompute the prompt.",
     "phase_toggle_on": "Show the first generated-token pass in operations 4–11",
     "phase_toggle_off": "Back to the prompt pass",
+    "limits_marks_heading": "HOW TO READ THE PROVENANCE MARKS",
     "phase_toggle_note":
         "Only two passes kept their layer tensors: the prompt pass, and the pass that "
         "processed the first generated token.",
@@ -1693,6 +1750,9 @@ NOTEBOOK_TEXT = {
 
 # Fields a NOTEBOOK_TEXT entry needs beyond learn_facts(), supplied by its builder.
 NOTEBOOK_TEXT_FIELDS = {
+    "attention_sink": ("spelling", "share", "threshold"),
+    "attention_sink_layers": ("count", "query", "spelling", "threshold", "low", "high"),
+    "mean_weight_share": ("percent",),
     "kept_captured": ("names",),
     "kept_described": ("names",),
     "tracked_features_caption": ("count", "position"),

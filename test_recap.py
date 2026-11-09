@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import copy
 import hashlib
 import importlib.abc
 import itertools
@@ -36,7 +37,7 @@ import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PyQt5.QtCore import QCoreApplication, QEvent, QPoint, QRect, QSize, Qt
 from PyQt5.QtGui import QMouseEvent, QPainter, QPixmap
-from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QTableWidget
+from PyQt5.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QTableWidget
 
 import TensorScope as app
 import tensorscope_diagrams as diagrams
@@ -46,12 +47,13 @@ from tensorscope_common import (
     ResponseTextView, StepReveal,
 )
 from tensorscope_content import (
-    CHAPTERS, CONCEPTUAL_VARIABLES, CONTINUATION, EVIDENCE_CONCEPTUAL, EVIDENCE_KINDS,
-    EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE, NOTEBOOK_CHECKS,
-    NOTEBOOK_OPERATIONS, NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, PROVENANCE_ABSENT,
+    ATTENTION_SINK_THRESHOLD, CHAPTERS, CONCEPTUAL_VARIABLES, CONTINUATION,
+    EVIDENCE_CONCEPTUAL, EVIDENCE_INLINE_TIERS, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
+    EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE, NOTEBOOK_CHECKS, NOTEBOOK_OPERATIONS,
+    NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, PROMPT_SPAN_UNKNOWN, PROVENANCE_ABSENT,
     PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED, REFERENCE_TOPICS,
-    ROLE_LEGEND, TELEMETRY_UNAVAILABLE, TYPED_BAND, VARIABLE_ROLES, learn_facts,
-    prompt_token_bands, readable_spelling,
+    ROLE_LEGEND, TELEMETRY_UNAVAILABLE, TEMPLATE_BAND, TYPED_BAND, VARIABLE_ROLES,
+    WEIGHTS_NOT_PROBABILITIES, learn_facts, prompt_token_bands, readable_spelling,
 )
 import tensorscope_operations as operations
 from tensorscope_diagrams import CausalMaskTriangle, Diagram
@@ -109,6 +111,18 @@ def capture_digest(capture):
         result.update(str((array.dtype.str, array.shape)).encode())
         result.update(array.tobytes())
     return result.hexdigest()
+
+
+def evidence_claims(widget):
+    """Every provenance claim under `widget`, whatever it looks like on screen.
+
+    A badge, a value box's left edge, an edged sentence or table, a reveal step: each sets
+    the `evidenceTier` property, so this sees all of them.  Reading only `EvidenceBadge`s
+    stopped being enough the moment OBSERVED and CONCEPTUAL lost their words.
+    """
+    from PyQt5.QtWidgets import QWidget
+    return [(child, child.property('evidenceTier')) for child in widget.findChildren(QWidget)
+            if child.property('evidenceTier')]
 
 
 def open_every_disclosure(widget, *, rounds=8):
@@ -651,12 +665,22 @@ class SavedCaptureTests(unittest.TestCase):
             for operation in NOTEBOOK_OPERATIONS + [CONTINUATION]:
                 with self.subTest(run_id=run_id, operation=operation.key):
                     notebook.go_to(operation.key)
-                    open_every_disclosure(notebook.section(operation.key))
+                    section = notebook.section(operation.key)
+                    open_every_disclosure(section)
+                    for reveal in section.findChildren(StepReveal):
+                        reveal.reveal_all()
                     allowed = {EVIDENCE_KINDS[tier][0] for tier in operation.tiers}
-                    for badge in notebook.section(operation.key).findChildren(EvidenceBadge):
+                    # Badges still name their tier in words, and the words must agree with
+                    # the property: a badge cannot say one tier and claim another.
+                    for badge in section.findChildren(EvidenceBadge):
                         name = badge.text().split('  ·  ')[0]
                         self.assertIn(name, allowed,
                                       f'{operation.key} showed an undeclared tier')
+                        self.assertEqual(EVIDENCE_KINDS[badge.property('evidenceTier')][0], name)
+                    for widget, tier in evidence_claims(section):
+                        self.assertIn(tier, operation.tiers,
+                                      f'{operation.key} marked an undeclared tier '
+                                      f'on a {type(widget).__name__}')
             notebook.deleteLater()
 
     def test_the_unattested_tier_appears_only_where_it_belongs(self):
@@ -669,10 +693,145 @@ class SavedCaptureTests(unittest.TestCase):
                 open_every_disclosure(notebook.section(key))
                 found = [badge for badge in notebook.section(key).findChildren(EvidenceBadge)
                          if badge.text().startswith(unattested)]
+                found += [widget for widget, tier in evidence_claims(notebook.section(key))
+                          if tier == EVIDENCE_UNATTESTED and widget not in found]
                 with self.subTest(run_id=run_id, operation=key):
                     if key != 'continuation':
                         self.assertEqual(found, [], f'{key} claimed an unattested value')
             notebook.deleteLater()
+
+    def test_observed_values_carry_an_edge_not_a_badge(self):
+        """Only DERIVED and UNATTESTED keep words inline; the key to all four is in the
+        panel.  An observed number is still marked -- by its box's edge and property."""
+        inline = {EVIDENCE_KINDS[tier][0] for tier in EVIDENCE_INLINE_TIERS}
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            for key, _ in notebook.NAV:
+                notebook.go_to(key)
+                section = notebook.section(key)
+                open_every_disclosure(section)
+                for reveal in section.findChildren(StepReveal):
+                    reveal.reveal_all()
+                with self.subTest(run_id=run_id, section=key):
+                    for badge in section.findChildren(EvidenceBadge):
+                        if notebook.section('continuation').isAncestorOf(badge) and \
+                                badge.parentWidget().objectName() == 'evidenceLegend':
+                            continue                    # the key itself, in the limits
+                        self.assertIn(badge.text().split('  ·  ')[0], inline, key)
+                    for box in section.findChildren(QFrame):
+                        if box.objectName() == 'valueBox':
+                            self.assertTrue(box.property('evidenceTier'), key)
+                            self.assertIn(EVIDENCE_KINDS[box.property('evidenceTier')][0],
+                                          box.toolTip())
+            legend = notebook.panel.evidence_legend
+            with self.subTest(run_id=run_id, part='legend'):
+                spoken = ' '.join(legend.describe())
+                for name, _description in EVIDENCE_KINDS.values():
+                    self.assertIn(name, spoken)
+                self.assertTrue(notebook.panel.isAncestorOf(legend))
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_template_tokens_are_explained_and_faded_only_when_aligned(self):
+        """Faded chips and the count sentence need the alignment; without it, neither."""
+        for run_id, capture in self.captures.items():
+            bands = prompt_token_bands(capture.prompt, capture.prompt_tokens)
+            template = {index for start, end, name in (bands or []) if name == TEMPLATE_BAND
+                        for index in range(start, end)}
+            facts = learn_facts(capture)
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            section = notebook.section('input')
+            with self.subTest(run_id=run_id):
+                self.assertIsNotNone(bands, 'the fixture runs all align')
+                chips = [chip for chip in section.findChildren(QPushButton)
+                         if chip.objectName() == 'tokenChip']
+                self.assertEqual(len(chips), len(capture.prompt_tokens))
+                self.assertEqual({index for index, chip in enumerate(chips)
+                                  if chip.property('template')}, template)
+                self.assertIn(NOTEBOOK_TEXT['template_tokens_why'].format(**facts),
+                              section_text(section))
+            notebook.deleteLater()
+        # The unaligned branch, on a copy whose prompt the stored spellings do not contain.
+        capture = copy.copy(next(iter(self.captures.values())))
+        capture.prompt = 'text the stored spellings do not contain'
+        notebook = NotebookView(capture, tokens=app.TOKENS)
+        section = notebook.section('input')
+        shown = section_text(section)
+        self.assertIn(PROMPT_SPAN_UNKNOWN, shown)
+        self.assertNotIn('tokens you did not type', shown)
+        self.assertFalse(any(chip.property('template') for chip in section.findChildren(QPushButton)
+                             if chip.objectName() == 'tokenChip'))
+        notebook.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_the_attention_sink_note_follows_its_stated_rule(self):
+        """The note appears exactly when the weight row on screen gives position 0 at least
+        the threshold, says what the rule is, and is never the model 'reading' a token."""
+        threshold = f'{ATTENTION_SINK_THRESHOLD:.0%}'
+        both = {'above': 0, 'below': 0}
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            position = notebook.registry.position
+            cases = {}
+            for layer in sorted(capture.layers):
+                weights = np.asarray(capture.layers[layer].tensors['attention_weights'])
+                for head in range(weights.shape[1]):
+                    side = ('above' if float(weights[0, head, position, 0])
+                            >= ATTENTION_SINK_THRESHOLD else 'below')
+                    cases.setdefault(side, (layer, head))
+            for side, (layer, head) in cases.items():
+                both[side] += 1
+                notebook.select(layer_index=layer, head=head)
+                notebook.go_to('scores')
+                notes = [note for note in notebook.section('scores').findChildren(QLabel)
+                         if note.objectName() == 'sinkNote']
+                with self.subTest(run_id=run_id, side=side, layer=layer, head=head):
+                    if side == 'below':
+                        self.assertEqual(notes, [])
+                        continue
+                    self.assertEqual(len(notes), 1)
+                    text = notes[0].text()
+                    self.assertIn(f'at least {threshold}', text)
+                    self.assertIn(repr(readable_spelling(capture.prompt_tokens[0])), text)
+                    self.assertIn('not evidence that the model is reading', text)
+                    self.assertIn(WEIGHTS_NOT_PROBABILITIES, text)
+            # Op 11's form counts the layers whose head-mean row trips the same rule.
+            notebook.select(layer_index=min(capture.layers), head=0)
+            notebook.go_to('layers')
+            expected = sum(
+                1 for layer in capture.layers.values()
+                if np.asarray(layer.tensors['attention_weights'], dtype=np.float64)
+                [0, :, position, 0].mean() >= ATTENTION_SINK_THRESHOLD)
+            notes = [note.text() for note in notebook.section('layers').findChildren(QLabel)
+                     if note.objectName() == 'sinkNote']
+            with self.subTest(run_id=run_id, part='layers'):
+                if expected:
+                    self.assertEqual(len(notes), 1)
+                    self.assertTrue(notes[0].startswith(f'In {expected} of {len(capture.layers)} '))
+                else:
+                    self.assertEqual(notes, [])
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertTrue(both['above'] and both['below'],
+                        'the fixture must exercise both sides of the threshold')
+
+    def test_every_attention_percentage_sits_beside_the_not_probabilities_line(self):
+        """approx_share may appear outside operation 7 only with its caveat beside it."""
+        for capture in self.captures.values():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            for key, _ in notebook.NAV:
+                notebook.go_to(key)
+                section = notebook.section(key)
+                open_every_disclosure(section)
+                for reveal in section.findChildren(StepReveal):
+                    reveal.reveal_all()
+                readable = re.sub(r'<[^>]*>', '', section_text(section))
+                with self.subTest(section=key):
+                    if '%' in readable:
+                        self.assertIn('not next-token probabilities', readable)
+            notebook.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            break                         # one run: the copy is the same for all of them
 
     def test_legacy_runs_render_without_inventing_anything(self):
         """Selected by capability, not by id, so a thinner database fails loudly."""

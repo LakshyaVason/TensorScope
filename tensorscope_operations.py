@@ -38,16 +38,17 @@ from PyQt5.QtWidgets import (
 
 from tensor_widgets import AttentionExplorer, exact_scalar
 from tensorscope_common import (
-    AnnotatedValueRow, BandedTokenStrip, Disclosure, EvidenceBadge, PassTimeline,
-    PredictCheck, ResponseTextView, StepReveal, approx, approx_share, badge_row, badged,
-    bullets,
-    chip_text, head_slice, label, measure_label, read_only_table, replace_in, shape_line,
-    token_labels, token_table, PROSE_WIDTH,
+    AnnotatedValueRow, BandedTokenStrip, Disclosure, EvidenceBadge, EvidenceLegend,
+    PassTimeline, PredictCheck, ResponseTextView, StepReveal, approx, approx_share,
+    badge_row, badged, bullets, chip_text, described_line, evidence_frame, evidence_mark,
+    head_slice, label, measure_label, observed_line, read_only_table, replace_in,
+    set_evidence, shape_line, token_labels, token_table, PROSE_WIDTH,
 )
 from tensorscope_content import (
-    CONTINUATION, OPERATION_INDEX, CACHED_KV_NOTE, DISPLAY_CALC_NOTE, EOS_IS_A_SCORED_ENTRY, EVIDENCE_CONCEPTUAL,
-    EVIDENCE_DERIVED, EVIDENCE_KINDS, EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED,
-    LOGITS_UNAVAILABLE, NOTEBOOK_CHECKS, NOTEBOOK_TEXT, PROMPT_SPAN_UNKNOWN, TEMPLATE_BAND,
+    ATTENTION_SINK_THRESHOLD, CONTINUATION, OPERATION_INDEX, CACHED_KV_NOTE,
+    DISPLAY_CALC_NOTE, EOS_IS_A_SCORED_ENTRY, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED,
+    EVIDENCE_KINDS, EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE,
+    NOTEBOOK_CHECKS, NOTEBOOK_TEXT, PROMPT_SPAN_UNKNOWN, TEMPLATE_BAND,
     TELEMETRY_UNAVAILABLE, WHAT_WE_CANNOT_CONCLUDE, prompt_token_bands, readable_spelling,
     what_we_know,
 )
@@ -507,6 +508,38 @@ def _operation(key: str):
     return OPERATION_INDEX.get(key) or CONTINUATION
 
 
+def _threshold_text() -> str:
+    return f'{ATTENTION_SINK_THRESHOLD:.0%}'
+
+
+def sink_callout(ctx: NotebookContext, row, *, averaged: bool = False) -> QWidget | None:
+    """The attention-sink note, or None when the weight row on screen does not trip it.
+
+    Reads exactly one number: the row's weight on position 0, which is a captured value
+    (one head's row) or a head-mean of captured values (`averaged`, badged derived).  The
+    rule that decides whether the note appears is stated inside the note itself.
+    """
+    values = np.asarray(row, dtype=np.float64).reshape(-1)
+    if values.size == 0 or not np.isfinite(values[0]):
+        return None
+    share = float(values[0])
+    if share < ATTENTION_SINK_THRESHOLD:
+        return None
+    phrase = (ctx.say('mean_weight_share', percent=f'{share * 100:.1f}%') if averaged
+              else approx_share(share))
+    note = measure_label(ctx.say(
+        'attention_sink', spelling=repr(readable_spelling(ctx.spelling(0))), share=phrase,
+        threshold=_threshold_text()), width=PROSE_WIDTH + 40)
+    note.setObjectName('sinkNote')
+    note.setToolTip(f'Exact weight on position 0: {exact_scalar(row[0]) if not averaged else repr(share)}')
+    if averaged:
+        host, lines = _panel(4)
+        lines.addWidget(badge_row(EvidenceBadge(EVIDENCE_DERIVED, 'head-mean')))
+        lines.addWidget(note)
+        return host
+    return set_evidence(note, EVIDENCE_OBSERVED)
+
+
 def _tracked(ctx: NotebookContext, lines: QVBoxLayout, rows) -> None:
     """The followed features of one or more captured rows, under one derived badge.
 
@@ -561,7 +594,13 @@ def build_input(ctx: NotebookContext, section) -> QWidget:
 
     ctx.registry.context_changed.connect(follow)
     if ctx.bands is None:
+        # No alignment, so no claim about which tokens were typed: nothing is faded and
+        # no count is given.
         body.addWidget(label(PROMPT_SPAN_UNKNOWN, muted=True, small=True))
+    elif int(ctx.facts.get('template_token_count') or 0):
+        why = measure_label(ctx.say('template_tokens_why'))
+        why.setObjectName('templateTokensWhy')
+        body.addWidget(why)
     body.addWidget(label(ctx.say('control_markers'), muted=True, small=True))
 
     def selected() -> QWidget:
@@ -573,8 +612,7 @@ def build_input(ctx: NotebookContext, section) -> QWidget:
         stored = capture.prompt_tokens[index]
         band = next((name for start, end, name in (ctx.bands or [])
                      if start <= index < end), '')
-        lines.addWidget(badged(
-            EvidenceBadge(EVIDENCE_OBSERVED, 'saved tokenization'),
+        lines.addWidget(observed_line(
             f'Position {index}   ·   token ID {capture.prompt_token_ids[index]}   ·   '
             f'reads as {readable_spelling(stored)!r}   ·   stored {stored!r}'))
         if band == TEMPLATE_BAND:
@@ -905,12 +943,15 @@ def build_scores(ctx: NotebookContext, section) -> QWidget:
         # digits on the tooltip.  The bars above carry every other shown key.
         heaviest = max(allowed, key=lambda index: (float(weight_row[index]), -index))
         weight = weight_row[heaviest]
-        line = badged(EvidenceBadge(EVIDENCE_OBSERVED, 'attention_weights'), ctx.say(
+        line = observed_line(ctx.say(
             'heaviest_key', key=heaviest,
             spelling=repr(spellings[heaviest]) if heaviest < len(spellings) else '',
             weight=approx(weight), percent=f'{float(weight) * 100:.1f}%'))
         line.words.setToolTip(f'Exact stored value: {exact_scalar(weight)}')
         lines.addWidget(line)
+        sink = sink_callout(ctx, weight_row)
+        if sink is not None:
+            lines.addWidget(sink)
         total = float(np.asarray(weight_row, dtype=np.float64).sum())
         lines.addWidget(badged(
             EvidenceBadge(EVIDENCE_DERIVED, 'row total'),
@@ -1000,9 +1041,13 @@ def build_mix(ctx: NotebookContext, section) -> QWidget:
         products = [example['products'][index] for index in shown]
         rest_weight = float(example['weights'][rest].sum()) if rest else 0.0
         rest_product = float(example['products'][rest].sum()) if rest else 0.0
+        # The operands are observed and say so on their boxes; only the arithmetic done
+        # here for the display keeps a badge.
         lines.addWidget(badge_row(
-            EvidenceBadge(EVIDENCE_OBSERVED, 'both operands'),
             EvidenceBadge(EVIDENCE_DERIVED, 'the products and their total')))
+        sink = sink_callout(ctx, example['weights'])
+        if sink is not None:
+            lines.addWidget(sink)
         # One step at a time, at the reader's pace.  This is the one operation whose
         # result the model discarded, so it is the one worth walking rather than stating.
         lines.addWidget(StepReveal([
@@ -1130,13 +1175,17 @@ def layer_summary_rows(ctx: NotebookContext) -> list[dict]:
     for index in sorted(layers):
         tensors = layers[index].tensors
         weights, output = tensors.get('attention_weights'), tensors.get('layer_output')
-        entry = {'layer': index, 'key': None, 'weight': None, 'feature': None, 'value': None}
+        entry = {'layer': index, 'key': None, 'weight': None, 'feature': None, 'value': None,
+                 'sink': None, 'query': None}
         if weights is not None and np.asarray(weights).ndim == 4:
             view = np.asarray(weights)
             query = min(ctx.registry.position, view.shape[-2] - 1)
             mean = np.asarray(view[0, :, query, :], dtype=np.float64).mean(axis=0)
             entry['key'] = int(np.argmax(mean))
             entry['weight'] = float(mean[entry['key']])
+            # The head-mean row's weight on position 0, for the attention-sink note.
+            entry['sink'] = float(mean[0]) if mean.size else None
+            entry['query'] = int(query)
         if output is not None and np.asarray(output).ndim == 3:
             view = np.asarray(output)
             row = view[0, min(ctx.registry.position, view.shape[-2] - 1)]
@@ -1144,6 +1193,24 @@ def layer_summary_rows(ctx: NotebookContext) -> list[dict]:
             entry['value'] = row[entry['feature']]
         rows.append(entry)
     return rows
+
+
+def layer_sink_callout(ctx: NotebookContext, summary) -> QWidget | None:
+    """Op 11's form of the sink note: how many layers' head-mean rows trip the threshold."""
+    tripped = [entry['sink'] for entry in summary
+               if entry['sink'] is not None and entry['sink'] >= ATTENTION_SINK_THRESHOLD]
+    if not tripped:
+        return None
+    query = next(entry['query'] for entry in summary if entry['query'] is not None)
+    host, lines = _panel(4)
+    note = measure_label(ctx.say(
+        'attention_sink_layers', count=len(tripped), query=query,
+        spelling=repr(readable_spelling(ctx.spelling(0))), threshold=_threshold_text(),
+        low=f'{min(tripped) * 100:.1f}%', high=f'{max(tripped) * 100:.1f}%'),
+        width=PROSE_WIDTH + 40)
+    note.setObjectName('sinkNote')
+    lines.addWidget(note)
+    return host
 
 
 def build_layers(ctx: NotebookContext, section) -> QWidget:
@@ -1163,8 +1230,10 @@ def build_layers(ctx: NotebookContext, section) -> QWidget:
         spellings = ctx.key_spellings()
         summary = layer_summary_rows(ctx)
         lines.addWidget(badge_row(
-            EvidenceBadge(EVIDENCE_OBSERVED, 'attention_weights, layer_output'),
             EvidenceBadge(EVIDENCE_DERIVED, 'head-mean and rankings')))
+        sink = layer_sink_callout(ctx, summary)
+        if sink is not None:
+            lines.addWidget(sink)
         lines.addWidget(label(ctx.say('layer_table_caption'), muted=True, small=True))
         rows, tips, current = [], [], None
         for position, entry in enumerate(summary):
@@ -1210,13 +1279,12 @@ def _layer_summary(ctx: NotebookContext, index: int) -> QWidget:
     if layer is None:
         body.addWidget(label('Not in this capture.', muted=True))
         return host
-    body.addWidget(badge_row(EvidenceBadge(EVIDENCE_OBSERVED, f'layer {index}')))
     rows = []
     for name, tensor in layer.tensors.items():
         written, _ = shape_line(tensor, omit_batch=True)
         rows.append((name, written, str(tensor.dtype)))
-    body.addWidget(read_only_table(['Captured tensor', 'Shape', 'Stored dtype'],
-                                   sorted(rows), stretch=0))
+    body.addWidget(evidence_frame(read_only_table(['Captured tensor', 'Shape', 'Stored dtype'],
+                                                  sorted(rows), stretch=0), EVIDENCE_OBSERVED))
     return host
 
 
@@ -1270,8 +1338,7 @@ def build_decide(ctx: NotebookContext, section) -> QWidget:
 
     logits = capture.logits
     if logits is None:
-        body.addWidget(badge_row(EvidenceBadge(EVIDENCE_CONCEPTUAL, 'not retained')))
-        body.addWidget(label(LOGITS_UNAVAILABLE))
+        body.addWidget(described_line(LOGITS_UNAVAILABLE))
         body.addWidget(label(
             f'The token this run selected is still known — it is '
             f'{capture.tokens[0]!r}, vocabulary ID {capture.token_ids[0]} — because the '
@@ -1285,10 +1352,9 @@ def build_decide(ctx: NotebookContext, section) -> QWidget:
     flat = np.asarray(logits).reshape(-1)
     chosen = int(flat.argmax())
     body.addWidget(badge_row(
-        EvidenceBadge(EVIDENCE_OBSERVED, 'final_logits'),
         EvidenceBadge(EVIDENCE_DERIVED, 'the ranking, the argmax and the margin'),
         label(ctx.say('score_count', count=f'{flat.size:,}'), muted=True, small=True)))
-    body.addWidget(_candidates(ctx, flat))
+    body.addWidget(evidence_frame(_candidates(ctx, flat), EVIDENCE_OBSERVED))
     rule = label(ctx.say('selected_line', token_id=chosen, token=repr(capture.tokens[0])))
     rule.setObjectName('journeyEquation')
     body.addWidget(rule)
@@ -1466,13 +1532,15 @@ def _decision(ctx: NotebookContext, step: int) -> QWidget:
         f'vocabulary ID {capture.token_ids[step]}'))
     trace = capture.generation_trace
     if step >= len(trace):
-        body.addWidget(badge_row(EvidenceBadge(EVIDENCE_CONCEPTUAL, 'not recorded')))
-        body.addWidget(label(TELEMETRY_UNAVAILABLE))
+        body.addWidget(described_line(TELEMETRY_UNAVAILABLE))
         return host
     decision = trace[step]
     tier = EVIDENCE_OBSERVED if (step == 0 or decision.attested) else EVIDENCE_UNATTESTED
-    body.addWidget(badge_row(EvidenceBadge(tier, 'scores from the forward pass'),
-                             EvidenceBadge(EVIDENCE_DERIVED, 'the ranking')))
+    # Unattested keeps its words -- it is the tier a reader must not mistake for observed
+    # -- and observed scores say so with the edge on their table below.
+    marks = [mark for mark in (evidence_mark(tier, 'scores from the forward pass'),
+                               EvidenceBadge(EVIDENCE_DERIVED, 'the ranking')) if mark]
+    body.addWidget(badge_row(*marks))
     if tier is EVIDENCE_UNATTESTED:
         body.addWidget(label(
             'Real output of the real forward pass, but only the prompt pass was re-run '
@@ -1481,8 +1549,9 @@ def _decision(ctx: NotebookContext, step: int) -> QWidget:
     rows, tips, winner = _score_rows(
         [(entry['id'], entry.get('token', ''), float(entry['logit']))
          for entry in decision.top_candidates], highlight_id=decision.selected_token_id)
-    body.addWidget(read_only_table(['Rank', 'Token ID', 'Token', 'Score (logit)'], rows,
-                                   stretch=2, highlight=winner, tooltips=tips))
+    body.addWidget(evidence_frame(
+        read_only_table(['Rank', 'Token ID', 'Token', 'Score (logit)'], rows,
+                        stretch=2, highlight=winner, tooltips=tips), tier))
     margin = decision.margin
     if margin is not None:
         body.addWidget(label(ctx.say('margin_line', margin=approx(margin).lstrip('≈')),
@@ -1498,10 +1567,9 @@ def _stopping(ctx: NotebookContext) -> QWidget:
     body.addWidget(label('WHY IT STOPPED', muted=True))
     body.addWidget(label(f"{facts['stop_reason_text']} {EOS_IS_A_SCORED_ENTRY}"))
     if not facts['stop_token_known']:
-        body.addWidget(badge_row(EvidenceBadge(EVIDENCE_CONCEPTUAL, 'not recorded')))
-        body.addWidget(label(
+        body.addWidget(described_line(
             'This run does not record which entry won the final scoring step, so '
-            'TensorScope does not say.', muted=True, small=True))
+            'TensorScope does not say.'))
         return host
     # Unattested, not observed: this score came from a generation pass, and only the
     # prompt prefill is covered by the stock-eager comparison.
@@ -1524,8 +1592,7 @@ def _summary(ctx: NotebookContext) -> QWidget:
     facts = ctx.facts
     host, body = _panel(4)
     body.addWidget(label('THIS RUN, IN FULL', muted=True))
-    body.addWidget(badge_row(EvidenceBadge(EVIDENCE_OBSERVED, 'counts of stored values')))
-    body.addWidget(read_only_table(['Quantity', 'This run'], [
+    body.addWidget(evidence_frame(read_only_table(['Quantity', 'This run'], [
         ('Prompt token positions', facts['position_count']),
         ('Emitted response tokens', facts['generated_count']),
         ('Tokens after the first', facts['continuation_count']),
@@ -1534,7 +1601,7 @@ def _summary(ctx: NotebookContext) -> QWidget:
         ('Key/value heads', facts['kv_head_count']),
         ('Features per head', facts['head_dim']),
         ('Captured phases', facts['phase_count']),
-    ], stretch=1))
+    ], stretch=1), EVIDENCE_OBSERVED))
     return host
 
 
@@ -1544,10 +1611,10 @@ def _limits(ctx: NotebookContext) -> QWidget:
     body.addWidget(bullets(what_we_know(ctx.facts)))
     body.addWidget(label('WHAT IT DOES NOT', muted=True))
     body.addWidget(bullets(WHAT_WE_CANNOT_CONCLUDE))
-    body.addWidget(label('HOW TO READ THE BADGES', muted=True))
+    body.addWidget(label(ctx.say('limits_marks_heading'), muted=True))
+    body.addWidget(EvidenceLegend())
     for kind, (name, description) in EVIDENCE_KINDS.items():
-        body.addWidget(badge_row(EvidenceBadge(kind)))
-        body.addWidget(label(description, muted=True, small=True))
+        body.addWidget(label(f'{name}: {description}', muted=True, small=True))
     body.addWidget(label(CACHED_KV_NOTE, muted=True, small=True))
     return host
 

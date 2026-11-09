@@ -2304,8 +2304,26 @@ def self_test() -> None:
         capture.prompt = "text the stored spellings do not contain"
         assert learn_facts(capture)["prompt_span_known"] is False
         assert learn_facts(capture)["focus_position"] == len(capture.prompt_tokens) - 1
+        # No alignment, no claim about which tokens were typed: op 1 shows the notice and
+        # neither fades a chip nor counts template tokens.
+        from tensorscope_content import prompt_token_bands as _bands
+        assert _bands(capture.prompt, capture.prompt_tokens) is None
     finally:
         capture.prompt = unaligned_prompt
+
+    # Provenance marks: every tier has one, only DERIVED and UNATTESTED keep words, and the
+    # sink note states its own rule and the attention-weights caveat in both of its forms.
+    from tensorscope_content import (
+        ATTENTION_SINK_THRESHOLD, EVIDENCE_DERIVED, EVIDENCE_INLINE_TIERS, EVIDENCE_MARKS,
+        EVIDENCE_UNATTESTED, WEIGHTS_NOT_PROBABILITIES,
+    )
+    assert set(EVIDENCE_MARKS) == set(EVIDENCE_KINDS), set(EVIDENCE_MARKS) ^ set(EVIDENCE_KINDS)
+    assert set(EVIDENCE_INLINE_TIERS) == {EVIDENCE_DERIVED, EVIDENCE_UNATTESTED}
+    assert 0 < ATTENTION_SINK_THRESHOLD < 1
+    for key in ("attention_sink", "attention_sink_layers"):
+        assert NOTEBOOK_TEXT[key].endswith(WEIGHTS_NOT_PROBABILITIES), key
+        assert "{threshold}" in NOTEBOOK_TEXT[key] and "not evidence" in NOTEBOOK_TEXT[key], key
+    assert "{template_token_count}" in NOTEBOOK_TEXT["template_tokens_why"]
 
     # What the capture establishes, filtered by what this run actually holds.  A schema-2
     # run has no score vector and no recorded rule, so it must not be told it has both.

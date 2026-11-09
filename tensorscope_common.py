@@ -31,9 +31,9 @@ from PyQt5.QtWidgets import (
 
 from tensor_widgets import exact_scalar
 from tensorscope_content import (
-    EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_KINDS, EVIDENCE_OBSERVED,
-    EVIDENCE_UNATTESTED, NOTEBOOK_TEXT, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE,
-    readable_spelling,
+    EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_INLINE_TIERS, EVIDENCE_KINDS,
+    EVIDENCE_LEGEND_TITLE, EVIDENCE_MARKS, EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED,
+    NOTEBOOK_TEXT, ROLE_LEGEND, STRUCTURE_NOT_TIMING_NOTE, TEMPLATE_BAND, readable_spelling,
 )
 
 
@@ -352,12 +352,128 @@ class EvidenceBadge(QLabel):
         name, description = EVIDENCE_KINDS[kind]
         colour, tint = EVIDENCE_COLORS[kind]
         self.setObjectName('evidenceBadge')
+        self.setProperty('evidenceTier', kind)
         self.setText(name + (f'  ·  {note}' if note else ''))
         self.setToolTip(description)
         self.setStyleSheet(
             f'background: {tint}; color: {colour}; border: 1px solid {colour}; '
             'border-radius: 9px; padding: 2px 9px; font-size: 11px; font-weight: 600;')
         self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+
+# ── Evidence edges ────────────────────────────────────────────────────────────
+# OBSERVED and CONCEPTUAL are drawn as a left edge instead of a badge (see
+# EVIDENCE_INLINE_TIERS).  Every marked widget carries the same `evidenceTier` property a
+# badge does, so a test can collect every provenance claim on a page in one pass and hold
+# it against the operation's declared tiers, whatever form the claim takes on screen.
+
+def set_evidence(widget: QWidget, kind: str) -> QWidget:
+    """Mark `widget` as showing values of tier `kind`: property, tooltip, spoken text."""
+    name, description = EVIDENCE_KINDS[kind]
+    widget.setProperty('evidenceTier', kind)
+    existing = widget.toolTip()
+    # Appended, so a tooltip that leads with the exact stored value still leads with it.
+    widget.setToolTip((f'{existing}\n' if existing else '') + f'{name}: {description}')
+    widget.setAccessibleDescription(f'{name}. {description}')
+    style = widget.style()
+    if style is not None:
+        style.unpolish(widget)
+        style.polish(widget)
+    return widget
+
+
+def evidence_mark(kind: str, note: str = '') -> QWidget | None:
+    """The inline marker for a tier: a badge for the tiers that keep words, else None."""
+    if kind in EVIDENCE_INLINE_TIERS:
+        return EvidenceBadge(kind, note)
+    return None
+
+
+def evidence_frame(child: QWidget, kind: str) -> QFrame:
+    """Wrap `child` in a frame whose left edge carries tier `kind`.
+
+    For something that is not a value box -- a sentence, a table -- but still shows values
+    of one tier.  DERIVED and UNATTESTED still want their badge beside it; this adds the
+    edge, it does not replace the words.
+    """
+    frame = QFrame()
+    frame.setObjectName('evidenceEdge')
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(10, 2, 0, 2)
+    layout.setSpacing(4)
+    layout.addWidget(child)
+    return set_evidence(frame, kind)
+
+
+def observed_line(text: str) -> QFrame:
+    """A sentence stating captured values, marked by its edge rather than a badge."""
+    line = label(text, muted=True, small=True)
+    frame = evidence_frame(line, EVIDENCE_OBSERVED)
+    frame.words = line
+    return frame
+
+
+def described_line(text: str) -> QFrame:
+    """A sentence saying a value is absent from this capture: the conceptual edge."""
+    line = label(text)
+    frame = evidence_frame(line, EVIDENCE_CONCEPTUAL)
+    frame.words = line
+    return frame
+
+
+class EvidenceEdge(QFrame):
+    """A short edge standing alone, in a row of other widgets -- the timeline, the key."""
+
+    def __init__(self, kind: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName('evidenceEdgeMark')
+        self.setFixedSize(6, 18)
+        set_evidence(self, kind)
+
+
+def evidence_edge_rules() -> str:
+    """The stylesheet rules that draw every edge, from EVIDENCE_COLORS, for the shell."""
+    rules = []
+    for kind, (colour, _tint) in EVIDENCE_COLORS.items():
+        line = 'dashed' if kind == EVIDENCE_CONCEPTUAL else 'solid'
+        rules.append(
+            f'QFrame#valueBox[evidenceTier="{kind}"], QFrame#evidenceEdge[evidenceTier="{kind}"] '
+            f'{{ border-left: 3px {line} {colour}; }}')
+        rules.append(f'QFrame#evidenceEdgeMark[evidenceTier="{kind}"] '
+                     f'{{ border: none; border-left: 3px {line} {colour}; background: transparent; }}')
+    rules.append('QFrame#evidenceEdge { background: transparent; border-top: none; '
+                 'border-right: none; border-bottom: none; }')
+    return '\n'.join(rules)
+
+
+class EvidenceLegend(QWidget):
+    """The one key to all four provenance marks.  Lives in the variable panel."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('evidenceLegend')
+        rows = QVBoxLayout(self)
+        rows.setContentsMargins(22, 2, 22, 6)
+        rows.setSpacing(4)
+        rows.addWidget(label(EVIDENCE_LEGEND_TITLE, muted=True, small=True))
+        self._spoken = [EVIDENCE_LEGEND_TITLE]
+        for kind, (name, description) in EVIDENCE_KINDS.items():
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            badge = evidence_mark(kind)
+            row.addWidget(badge or EvidenceEdge(kind), 0, Qt.AlignTop)
+            # A badge already says its own name; an edge needs the name beside it.
+            words = label(EVIDENCE_MARKS[kind] if badge is not None
+                          else f'{name} — {EVIDENCE_MARKS[kind]}', small=True)
+            words.setToolTip(description)
+            row.addWidget(words, 1)
+            rows.addLayout(row)
+            self._spoken.append(f'{name} — {EVIDENCE_MARKS[kind]}')
+        self.setAccessibleName('Evidence key: ' + '; '.join(self._spoken[1:]))
+
+    def describe(self) -> list[str]:
+        return list(self._spoken)
 
 
 class RoleLegend(QWidget):
@@ -962,7 +1078,12 @@ class StepReveal(QWidget):
         heading.setObjectName('revealStepCaption')
         body.addWidget(heading)
         if step.get('tier'):
-            body.addWidget(badge_row(EvidenceBadge(step['tier'], step.get('note', ''))))
+            # The step's values mark their own tier on their boxes; the frame carries the
+            # claim too, and only the tiers that keep words get a badge.
+            set_evidence(frame, step['tier'])
+            mark = evidence_mark(step['tier'], step.get('note', ''))
+            if mark is not None:
+                body.addWidget(badge_row(mark))
         if step.get('body'):
             body.addWidget(label(step['body'], rich=bool(step.get('rich'))))
         build = step.get('build')
@@ -1093,7 +1214,12 @@ class AnnotatedValueRow(QWidget):
         heading = QHBoxLayout()
         heading.setContentsMargins(0, 0, 0, 0)
         heading.setSpacing(8)
-        heading.addWidget(EvidenceBadge(kind, note), 0, Qt.AlignVCenter)
+        # Only DERIVED and UNATTESTED keep their words; an observed row says so with the
+        # left edge of each box (see `set_evidence`), so the page is not an audit log.
+        self._kind = kind
+        mark = evidence_mark(kind, note)
+        if mark is not None:
+            heading.addWidget(mark, 0, Qt.AlignVCenter)
         if caption:
             heading.addWidget(label(caption, muted=True, small=True), 1)
         else:
@@ -1133,6 +1259,7 @@ class AnnotatedValueRow(QWidget):
         if exact:
             box.setToolTip(f'Exact stored value: {exact}')
             value.setToolTip(box.toolTip())
+        set_evidence(box, self._kind)
         return box
 
 
@@ -1287,10 +1414,10 @@ class BandedTokenStrip(QWidget):
                 heading = label(name.upper(), muted=True, small=True)
                 heading.setObjectName('bandHeading')
                 outer.addWidget(heading)
-            outer.addWidget(self._band(start, end))
+            outer.addWidget(self._band(start, end, template=name == TEMPLATE_BAND))
         self._sync()
 
-    def _band(self, start: int, end: int) -> QWidget:
+    def _band(self, start: int, end: int, *, template: bool = False) -> QWidget:
         holder = QWidget()
         grid = QGridLayout(holder)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -1300,8 +1427,12 @@ class BandedTokenStrip(QWidget):
             button = QPushButton(chip_text(token))
             button.setObjectName('tokenChip')
             button.setCheckable(True)
+            # Faded, not hidden: the model read these exactly like the typed tokens, and
+            # the stylesheet only lowers their contrast so the reader's own words stand out.
+            button.setProperty('template', bool(template))
             button.setToolTip(f'position {index + self._offset}  ·  stored {token!r}  ·  '
-                              f'reads as {readable_spelling(token)!r}')
+                              f'reads as {readable_spelling(token)!r}'
+                              + (f'  ·  {TEMPLATE_BAND.lower()}' if template else ''))
             button.clicked.connect(lambda _, i=index: self.select(i))
             grid.addWidget(button, position // self._columns, position % self._columns)
             self._buttons[index] = button
@@ -1550,7 +1681,13 @@ class PassTimeline(QWidget):
             capabilities.setWordWrap(False)
             layout.addWidget(capabilities, 0)
             if row.get('tier'):
-                layout.addWidget(EvidenceBadge(row['tier']), 0)
+                # Words only for the tiers that keep them; an edge for the rest, on the
+                # left where every other observed value has its edge.
+                mark = evidence_mark(row['tier'])
+                if mark is not None:
+                    layout.addWidget(mark, 0)
+                else:
+                    layout.insertWidget(0, EvidenceEdge(row['tier']), 0)
             outer.addWidget(line)
             self._buttons.append(button)
             self._lines.append(line)

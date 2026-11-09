@@ -31,8 +31,8 @@ from PyQt5.QtWidgets import (
 
 from tensor_widgets import TensorInspector
 from tensorscope_common import (
-    AnnotatedValueRow, Disclosure, EvidenceBadge, approx, axes_for, badge_row, clear_layout,
-    label, shape_line, token_labels,
+    AnnotatedValueRow, Disclosure, EvidenceLegend, approx, axes_for, badge_row, clear_layout,
+    evidence_frame, evidence_mark, label, shape_line, token_labels,
 )
 from tensorscope_content import (
     CONCEPTUAL_VARIABLES, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED, EVIDENCE_OBSERVED,
@@ -453,6 +453,10 @@ class VariablePanel(QWidget):
         self.legend = legend
         if legend is not None:
             content.addWidget(legend)
+        # The one key to the provenance marks.  Value boxes carry an edge rather than a
+        # badge, so the place a reader asks "what does that green edge mean?" has to say.
+        self.evidence_legend = EvidenceLegend()
+        content.addWidget(self.evidence_legend)
         self._slot = QVBoxLayout()
         self._slot.setContentsMargins(0, 0, 0, 0)
         self._slot.setSpacing(8)
@@ -485,8 +489,12 @@ class VariablePanel(QWidget):
         self._current = key
         self._clear()
         self._add(label(f'{resolved.symbol}   ·   {resolved.title}', title=True))
-        self._add(badge_row(EvidenceBadge(
-            resolved.tier, VariableChip.PROVENANCE_WORDS.get(resolved.provenance, ''))))
+        word = VariableChip.PROVENANCE_WORDS.get(resolved.provenance, '')
+        mark = evidence_mark(resolved.tier, word)
+        if mark is not None:
+            self._add(badge_row(mark))
+        else:
+            self._add(evidence_frame(label(word, muted=True, small=True), resolved.tier))
         if resolved.role:
             self._add(label(resolved.role))
         self._add(label('SHAPE IN THIS RUN', muted=True))

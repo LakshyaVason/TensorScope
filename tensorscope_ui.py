@@ -40,8 +40,8 @@ from PyQt5.QtWidgets import (
 )
 
 from tensorscope_common import (
-    COLORS, Card, ChapterProgress, ContentsButton, Disclosure, StageStack, chip_text, label,
-    role_colors,
+    COLORS, Card, ChapterProgress, ContentsButton, Disclosure, StageStack, chip_text,
+    evidence_edge_rules, label, role_colors,
 )
 from tensorscope_views import NotebookView, RawTensorDialog, ReferenceView
 
@@ -283,7 +283,8 @@ class ComputationRecap(QDialog):
             }}
             #ioAction {{ font-size: 13px; font-style: italic; color: {colors['text_secondary']}; }}
             #ioPlain {{ font-family: Consolas, 'Courier New', monospace; font-size: 13px; }}
-            #teachingNote {{
+            #templateTokensWhy {{ font-size: 13px; color: {colors['text_secondary']}; }}
+            #teachingNote, #sinkNote {{
                 padding: 10px 14px;
                 border: 1px solid {colors['border']};
                 border-left: 3px solid {colors['text_secondary']};
@@ -326,6 +327,11 @@ class ComputationRecap(QDialog):
                 color: {colors['text_primary']};
                 font-family: Consolas, 'Courier New', monospace;
                 font-size: 12px;
+            }}
+            QPushButton#tokenChip[template="true"] {{
+                color: {colors['text_muted']};
+                background: transparent;
+                border-style: dashed;
             }}
             QPushButton#tokenChip:hover {{ border-color: {colors['accent']}; }}
             QPushButton#tokenChip:checked {{
@@ -379,6 +385,7 @@ class ComputationRecap(QDialog):
                 border: 1px solid {colors['border']};
                 border-radius: 6px;
             }}
+            {evidence_edge_rules()}
             #valueBoxNumber {{
                 font-family: Consolas, 'Courier New', monospace; font-size: 14px;
                 font-weight: 600;
