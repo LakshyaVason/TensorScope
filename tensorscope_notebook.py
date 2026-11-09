@@ -32,17 +32,25 @@ import html
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QAction, QFrame, QMenu, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QAction, QFrame, QGridLayout, QMenu, QPushButton, QSizePolicy, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
+import numpy as np
+
 from tensorscope_common import (
-    CHROME, AnchoredScrollPage, RoleLegend, Section, chip_text, label,
+    CHROME, AnchoredScrollPage, RoleLegend, Section, approx, badge_row, badged, chip_text,
+    described_line, display_spelling, evidence_frame, label, measure_label, observed_line,
+    replace_in, set_evidence,
 )
 from tensorscope_content import (
-    CHAPTER_OF, CHAPTERS, CONTINUATION, NOTEBOOK_OPERATIONS, NOTEBOOK_TEXT, OPERATION_INDEX,
-    learn_facts, readable_spelling,
+    CHAPTER_OF, CHAPTERS, CONTINUATION, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED,
+    EVIDENCE_OBSERVED, LOGITS_UNAVAILABLE, NOTEBOOK_OPERATIONS, NOTEBOOK_TEXT, OPERATION_INDEX,
+    OVERVIEW_TIERS, TEMPLATE_BAND, TYPED_BAND, WEIGHTS_NOT_PROBABILITIES, learn_facts,
+    prompt_token_bands, readable_spelling,
 )
-from tensorscope_operations import BUILDERS, NotebookContext
+from tensorscope_operations import BUILDERS, NotebookContext, depth_rows, sink_callout
+from tensorscope_diagrams import LayerDepthView, PipelineStrip, ScoreDotPlot
 from tensorscope_variables import VariablePanel, VariableRegistry
 
 

@@ -24,9 +24,9 @@ never spends time on a tint.
 from __future__ import annotations
 
 import numpy as np
-from PyQt5.QtCore import QRect, QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QRect, QRectF, QSize, Qt, pyqtSignal, QPoint
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPolygonF
-from PyQt5.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QSizePolicy, QVBoxLayout, QWidget, QToolTip
 
 from tensorscope_common import CHROME, COLORS, OFFSCREEN, is_light, label, role_colors
 
@@ -65,6 +65,7 @@ class _Canvas(QWidget):
         self._diagram = diagram
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMinimumHeight(diagram.BODY_HEIGHT + 2 * diagram.PAD)
+        self.setMouseTracking(True)
 
     def sizeHint(self) -> QSize:
         pad = 2 * self._diagram.PAD
@@ -100,6 +101,13 @@ class _Canvas(QWidget):
     def mousePressEvent(self, event) -> None:
         if not self._diagram.handle_click(event.pos()):
             super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        text = self._diagram.tooltip_at(event.pos())
+        QToolTip.showText(event.globalPos(), text, self) if text else QToolTip.hideText()
+
+    def leaveEvent(self, event) -> None:
+        QToolTip.hideText()
 
 
 class Diagram(QWidget):
@@ -317,6 +325,14 @@ class Diagram(QWidget):
     def handle_click(self, point) -> bool:
         """Return True when the diagram consumed the click.  Default: it did not."""
         return False
+
+    def tooltip_at(self, point) -> str:
+        """The exact text a hover at `point` shows, or '' for none.
+
+        Kept separate from painting so the tests can read the value a reader sees without
+        reading pixels.  Default: no hover text.
+        """
+        return ''
 
     def flash(self) -> None:
         """A one-shot emphasis the reader asked for.  Pure decoration; never awaited."""
@@ -1819,11 +1835,278 @@ class PositionScope(Diagram):
             + super().describe()
 
 
+# ── Level 0 and Level 1 ──────────────────────────────────────────────────────
+
+class PipelineStrip(Diagram):
+    """The run as a pipeline: the shape a token's data takes from prompt to answer.
+
+    One box per stage, arrows between them, the real shape printed under each.  Each box is
+    clickable and emits `stageClicked` with its key, so the notebook can jump the reader to
+    the operation behind it.  The stages are `(key, title, shape_text)` -- the shape the
+    data has at that point in this run.
+    """
+
+    BODY_HEIGHT = 120
+
+    stageClicked = pyqtSignal(str)
+
+    def __init__(self, stages, *, tokens=None, caption: str = '', parent=None):
+        super().__init__(tokens=tokens, caption=caption, parent=parent)
+        # stages: a sequence of (key, title, shape_text) or (key, title, shape_text,
+        # discarded).  A discarded stage -- a shape the model computed and then threw away,
+        # such as the full vocabulary projection -- is drawn with a dashed outline so the
+        # reader sees it is not a value this capture kept.
+        self._stages = [
+            (str(row[0]), str(row[1]), str(row[2]), bool(row[3]) if len(row) > 3 else False)
+            for row in stages
+        ]
+        self._boxes: list[QRect] = []
+
+    def draw(self, painter: QPainter, rect: QRect) -> None:
+        line = self.text_height(8)
+        count = max(1, len(self._stages))
+        gap = 16
+        width = max(48, (rect.width() - gap * (count - 1)) // count)
+        top = rect.y() + 4
+        height = max(26, rect.height() - 2 * line - 14)
+        self._boxes = []
+        for index, (key, text, shape, discarded) in enumerate(self._stages):
+            box = QRect(rect.x() + index * (width + gap), top, width, height)
+            self._boxes.append(box)
+            colour = self.role('scores')
+            self.outline(painter, box, colour, radius=4, width=1.3,
+                         fill=None if discarded else self.wash(colour, 40),
+                         dashed=discarded)
+            self.write(painter, box.adjusted(4, 2, -4, -2), text, colour=self.ink(),
+                       points=7, align=Qt.AlignCenter | Qt.TextWordWrap)
+            self.write(painter, QRect(box.x(), box.bottom() + 2, box.width(), line),
+                       shape, colour=self.muted(), points=7,
+                       align=Qt.AlignCenter | Qt.TextWordWrap)
+            if index < count - 1:
+                self.arrow(painter, box.right() + 2, top + height // 2,
+                           box.right() + gap - 2, self.muted())
+        self.write(painter, QRect(rect.x(), rect.bottom() - line, rect.width(), line),
+                   'the shape the data took, from prompt to the first token',
+                   colour=self.muted())
+
+    def handle_click(self, point) -> bool:
+        for index, (key, *_rest) in enumerate(self._stages):
+            if index < len(self._boxes) and self._boxes[index].contains(point):
+                self.stageClicked.emit(key)
+                return True
+        return False
+
+    def describe(self) -> list[str]:
+        out = []
+        for _key, text, shape, _discarded in self._stages:
+            out.append(text)
+            out.append(shape)
+        out.append('the shape the data took, from prompt to the first token')
+        return out + super().describe()
+
+
+class LayerDepthView(Diagram):
+    """One row per layer: how much of this position's attention weight went to each key.
+
+    The head-mean of the captured `attention_weights` row for the deciding position, over
+    every key, one row per layer.  Typed positions are emphasised and the highlighted layer
+    is outlined, so the reader sees at a glance where the position's attention settled and
+    which layer put the most of it on the prompt.  Hovering a cell shows the exact head-mean.
+    """
+
+    BODY_HEIGHT = 180
+    MAX_ROWS = 16
+    MAX_COLS = 24
+
+    def __init__(self, matrix, layer_labels, key_labels, *, typed=frozenset(),
+                 highlight_row: int | None = None, tokens=None, caption: str = '',
+                 parent=None):
+        super().__init__(tokens=tokens, caption=caption, parent=parent)
+        self._matrix = np.asarray(matrix, dtype=np.float64)
+        if self._matrix.ndim != 2:
+            self._matrix = self._matrix.reshape(1, -1) if self._matrix.size else self._matrix[:0].reshape(0, 0)
+        self._layer_labels = list(layer_labels)
+        self._key_labels = list(key_labels)
+        self._typed = set(typed)
+        self._highlight = None if highlight_row is None else int(highlight_row)
+        self._grid = QRect()
+        self._row_rects: list[QRect] = []
+        line = self.text_height(8)
+        self.set_body_height(max(120, min(self._matrix.shape[0], self.MAX_ROWS) * 16
+                                  + 3 * line + 24))
+
+    def _drawn_counts(self) -> tuple[int, int]:
+        return (min(self._matrix.shape[0], self.MAX_ROWS),
+                min(self._matrix.shape[1], self.MAX_COLS))
+
+    def highlighted_row(self) -> int | None:
+        """The layer the outline is on, or None.  Read by the test that checks the Level 1
+        highlight equals an independently computed argmax."""
+        return self._highlight
+
+    def draw(self, painter: QPainter, rect: QRect) -> None:
+        line = self.text_height(8)
+        rows, cols = self._matrix.shape
+        shown_r, shown_c = self._drawn_counts()
+        side = 48
+        top = rect.y() + line + 6
+        self._grid = QRect(rect.x() + side, top,
+                           max(40, rect.width() - side - 4),
+                           max(30, rect.height() - 3 * line - 16))
+        self.write(painter, QRect(rect.x(), rect.y(), side, line),
+                   'layer', colour=self.muted(), points=8, bold=True,
+                   align=Qt.AlignLeft | Qt.AlignVCenter)
+        self.write(painter, QRect(self._grid.x(), rect.y(), self._grid.width(), line),
+                   'key position  →', colour=self.muted())
+        cell_h = self._grid.height() / max(1, shown_r)
+        cell_w = self._grid.width() / max(1, shown_c)
+        self._row_rects = []
+        typed_cols = [c for c in range(min(shown_c, len(self._key_labels)))
+                      if c in self._typed]
+        for r in range(shown_r):
+            real_r = r if rows <= self.MAX_ROWS else round(r * (rows - 1) / (shown_r - 1))
+            y = int(self._grid.y() + r * cell_h)
+            box = QRect(self._grid.x(), y, int(cell_w), int(cell_h))
+            self._row_rects.append(box)
+            is_hot = self._highlight is not None and real_r == self._highlight
+            self.outline(painter, box, self.role('norm') if is_hot else self.faint(),
+                         radius=2, width=2.0 if is_hot else 1.0)
+            for c in range(shown_c):
+                real_c = c if cols <= self.MAX_COLS else round(c * (cols - 1) / (shown_c - 1))
+                value = float(self._matrix[real_r, real_c]) if real_r < rows and real_c < cols else 0.0
+                cell = QRect(int(box.x() + c * cell_w) + 1, y + 1,
+                             max(2, int(cell_w) - 2), max(2, int(cell_h) - 2))
+                shade = int(40 + min(215, value * 260))
+                fill = QColor(shade, shade, shade)
+                painter.fillRect(cell, fill)
+                if c in typed_cols:
+                    self.outline(painter, cell, self.role('k'), radius=1, width=1.4)
+        # Row labels down the side, the highlighted one always.
+        small = cell_h >= 12
+        for r in range(shown_r):
+            real_r = r if rows <= self.MAX_ROWS else round(r * (rows - 1) / (shown_r - 1))
+            label_text = (self._layer_labels[real_r] if real_r < len(self._layer_labels)
+                          else str(real_r))
+            box = QRect(rect.x(), int(self._grid.y() + r * cell_h), side - 6, int(cell_h))
+            hot = self._highlight is not None and real_r == self._highlight
+            self.write(painter, box, label_text, colour=self.role('norm') if hot else self.muted(),
+                       points=7, bold=hot, align=Qt.AlignRight | Qt.AlignVCenter)
+        self.write(painter, QRect(self._grid.x(), self._grid.bottom() + 4,
+                                  self._grid.width(), line),
+                   'attention weight, averaged over heads (darker = more)',
+                   colour=self.muted())
+
+    def tooltip_at(self, point) -> str:
+        if not self._grid.contains(point):
+            return ''
+        rows, cols = self._matrix.shape
+        shown_r, shown_c = self._drawn_counts()
+        cell_h = self._grid.height() / max(1, shown_r)
+        cell_w = self._grid.width() / max(1, shown_c)
+        r = int((point.y() - self._grid.y()) / cell_h)
+        c = int((point.x() - self._grid.x()) / cell_w)
+        if not (0 <= r < shown_r and 0 <= c < shown_c):
+            return ''
+        real_r = r if rows <= self.MAX_ROWS else round(r * (rows - 1) / (shown_r - 1))
+        real_c = c if cols <= self.MAX_COLS else round(c * (cols - 1) / (shown_c - 1))
+        if not (0 <= real_r < rows and 0 <= real_c < cols):
+            return ''
+        layer = self._layer_labels[real_r] if real_r < len(self._layer_labels) else str(real_r)
+        key = self._key_labels[real_c] if real_c < len(self._key_labels) else str(real_c)
+        return f'Layer {layer} · key {key} · head-mean weight {float(self._matrix[real_r, real_c]):.6f}'
+
+    def describe(self) -> list[str]:
+        return (['layer'] + ['key position  →',
+                             'attention weight, averaged over heads (darker = more)']
+                + [f'{label}' for label in self._layer_labels]
+                + super().describe())
+
+
+class ScoreDotPlot(Diagram):
+    """The top scores on a raw score axis -- the logits that chose the token, as scores.
+
+    Never percentages: these are logits, and the axis is labelled 'score (logit)'.  The
+    selected token's dot is marked, so the reader sees which entry won and by how much.
+    """
+
+    BODY_HEIGHT = 120
+
+    def __init__(self, scores, labels, selected, *, tokens=None, caption: str = '',
+                 parent=None):
+        super().__init__(tokens=tokens, caption=caption, parent=parent)
+        self._scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        self._labels = [str(label) for label in labels]
+        self._selected = None if selected is None else int(selected)
+        self._dots: list[tuple[float, QRect]] = []
+
+    def draw(self, painter: QPainter, rect: QRect) -> None:
+        line = self.text_height(8)
+        n = self._scores.size
+        if n == 0:
+            self.write(painter, rect, 'No scores recorded.', colour=self.muted(),
+                       align=Qt.AlignCenter)
+            return
+        lo, hi = float(np.min(self._scores)), float(np.max(self._scores))
+        span = (hi - lo) or 1.0
+        axis_top = rect.y() + line + 6
+        axis_bottom = rect.bottom() - line - 4
+        axis_left = rect.x() + 44
+        axis_right = rect.right() - 8
+        # The axis line.
+        pen = QPen(self.muted(), 1.0)
+        painter.setPen(pen)
+        painter.drawLine(axis_left, axis_top, axis_left, axis_bottom)
+        painter.drawLine(axis_left, axis_bottom, axis_right, axis_bottom)
+        self.write(painter, QRect(rect.x(), rect.y(), axis_right - rect.x(), line),
+                   'score (logit)', colour=self.role('scores'), points=8, bold=True)
+        # Ticks at the ends.
+        self.write(painter, QRect(axis_left - 24, axis_bottom + 2, 48, line),
+                   f'{lo:.1f}', colour=self.muted(), points=7,
+                   align=Qt.AlignHCenter)
+        self.write(painter, QRect(axis_right - 24, axis_bottom + 2, 48, line),
+                   f'{hi:.1f}', colour=self.muted(), points=7,
+                   align=Qt.AlignHCenter)
+        self._dots = []
+        step = max(10, (axis_bottom - axis_top - 6) / n)
+        for index, value in enumerate(self._scores):
+            y = axis_bottom - (index + 0.5) * step
+            x = axis_left + int((value - lo) / span * (axis_right - axis_left))
+            is_selected = self._selected is not None and index == self._selected
+            radius = 5 if is_selected else 3
+            painter.setPen(QPen(self.role('scores') if is_selected else self.muted(),
+                                1.6 if is_selected else 1.0))
+            painter.setBrush(self.wash(self.role('scores'), 90 if is_selected else 50))
+            painter.drawEllipse(QPoint(x, int(y)), radius, radius)
+            label_text = self._labels[index] if index < len(self._labels) else ''
+            if label_text:
+                self.write(painter, QRect(x - 34, int(y) - 6, 72, 12), label_text,
+                           colour=self.ink() if is_selected else self.muted(), points=7,
+                           align=Qt.AlignHCenter | Qt.AlignVCenter)
+            self._dots.append((float(value), QRect(x - radius - 4, int(y) - 8,
+                                                   radius * 2 + 8, 16)))
+
+    def tooltip_at(self, point) -> str:
+        for value, box in self._dots:
+            if box.contains(point):
+                return f'score (logit) {value:.6f}'
+        return ''
+
+    def describe(self) -> list[str]:
+        if self._scores.size == 0:
+            return ['No scores recorded.'] + super().describe()
+        lo, hi = float(np.min(self._scores)), float(np.max(self._scores))
+        return ([f'{lo:.1f}', f'{hi:.1f}', 'score (logit)']
+                + [self._labels[i] for i in range(self._scores.size)
+                   if i < len(self._labels)]
+                + super().describe())
+
+
 # Every concrete diagram, for the gallery below and for the test that paints all of them.
 DIAGRAMS = (VectorStrip, MatrixGrid, EmbeddingLookupRow, MatMulShapes, HeadSplit, KVShare,
             QKCompare, CausalMaskTriangle, SoftmaxFlow, SoftmaxBars, AttentionGrid,
             ResidualBypass, GatedFFNPath, VocabularyProjection, LayerStack,
-            TrainingVsInference, StoppingLoop, DecisionChain, PositionScope)
+            TrainingVsInference, StoppingLoop, DecisionChain, PositionScope,
+            PipelineStrip, LayerDepthView, ScoreDotPlot)
 
 
 def gallery(tokens: dict | None = None) -> list[Diagram]:
@@ -1876,6 +2159,23 @@ def gallery(tokens: dict | None = None) -> list[Diagram]:
                        ('token', True)], tokens=tokens,
                       caption='Captured links solid, discarded links dashed.'),
         PositionScope(tokens=tokens, caption='Across positions, then within one.'),
+        PipelineStrip([('ids', 'token IDs', '[P]'),
+                       ('embed', 'embed', '[P × 2560]'),
+                       ('layers', 'N × layer', '[P × 2560]'),
+                       ('vocab', 'project', '[151,936]', True),
+                       ('token', 'token', '1', True)],
+                      tokens=tokens, caption='The shape this run took, prompt to answer.'),
+        LayerDepthView(np.triu(np.linspace(0.1, 0.9, 36).reshape(36, 1)
+                               * np.linspace(1.0, 0.2, 15).reshape(1, 15),
+                               k=0).astype(np.float64),
+                       layer_labels=[f'{i}' for i in range(36)],
+                       key_labels=[str(i) for i in range(15)],
+                       typed={0, 1, 2, 3, 4}, highlight_row=23, tokens=tokens,
+                       caption='Head-mean attention weight per layer, per key.'),
+        ScoreDotPlot(np.array([2.5, 3.1, 1.2, 4.8, 0.4, -1.1, 2.2, 1.9, 0.7, -0.3],
+                              dtype=np.float64),
+                     labels=[str(i) for i in range(10)], selected=3, tokens=tokens,
+                     caption='The top scores; the marked dot chose the token.'),
     ]
 
 
@@ -1903,6 +2203,9 @@ _FIGURE_WIDTHS = {
     StoppingLoop: 660,
     DecisionChain: 840,
     PositionScope: 700,
+    PipelineStrip: 800,
+    LayerDepthView: 760,
+    ScoreDotPlot: 620,
 }
 for _cls, _width in _FIGURE_WIDTHS.items():
     _cls.MAX_WIDTH = _width

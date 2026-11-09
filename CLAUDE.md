@@ -795,7 +795,7 @@ Target structure:
 | Phase | State | Commit |
 | --- | --- | --- |
 | 1 · copy and hierarchy | done, user reviewed, follow-ups applied | `3aed50b`, `a398a34` |
-| 2 · Level 0 and Level 1 | **next**; waiting for the user's OK to start | — |
+| 2 · Level 0 and Level 1 | **in progress, half-done**; committed unpushed, resume below | — |
 | 3 · operation cards | planned | — |
 | 4 · packaging and download page | out of scope; do not touch `build/` | — |
 
@@ -882,6 +882,52 @@ the `TensorScope.py` self-test, and this file.
      - The tier test covers the preface.
    - If the preface pushes `input` over the height bound, report the measured number and
      ask before raising anything.
+
+**Phase 2 resume point (work committed unpushed on branch `recap-zoom-levels`, mid-phase):**
+
+The scaffolding is done and the torch-free self-test passes. What is **committed but not
+finished**:
+
+- `tensorscope_content.py` — `OVERVIEW_TIERS` added; the Level 0/Level 1 `NOTEBOOK_TEXT`
+  captions and two `NOTEBOOK_TEXT_FIELDS` entries added; `map_depth_caption` fixed to use
+  `{final_token_text}` (not `{focus_token_text}`), since the depth view is at the deciding
+  position.
+- `tensorscope_diagrams.py` — the three diagrams (`PipelineStrip`, `LayerDepthView`,
+  `ScoreDotPlot`) are complete: both themes, in `DIAGRAMS` and `gallery()`, `_FIGURE_WIDTHS`
+  entries, `describe()`, hover tooltips, `stageClicked`. Nothing to do here.
+- `tensorscope_operations.py` — `depth_rows(ctx)` added (generalises `layer_summary_rows`,
+  uses the deciding position); imports for the three diagrams and `TYPED_BAND` added. The
+  `build_overview(ctx, on_stage)` helper is **NOT yet written**.
+- `tensorscope_notebook.py` — imports updated (numpy, the common helpers, the content
+  symbols, `depth_rows`/`sink_callout`, the three diagrams). `_destination()` is **NOT yet
+  rebuilt** — it still shows the old prompt-as-label + excerpt card.
+
+**To resume Phase 2:**
+1. Write `build_overview(ctx, on_stage)` in `tensorscope_operations.py` returning a column:
+   `outcome_heading` → dot plot (OBSERVED edge) or `LOGITS_UNAVAILABLE` (schema 2) →
+   `outcome_caption` → DERIVED badge + `outcome_margin` → schema-3 spellings-unrecorded note
+   → `map_heading` → `PipelineStrip` (stages `input`/`embed`/`layers`/`project`/`decide`,
+   wired to `on_stage`, projection+token discarded) → `map_pipeline_caption` →
+   `LayerDepthView` (matrix from `depth_rows`, DERIVED edge + badge) → `map_depth_caption` →
+   pick line (DERIVED) or `map_depth_no_bands` → `sink_callout(averaged=True)` on the
+   highlighted layer's row → `WEIGHTS_NOT_PROBABILITIES` if the sink note shows a percentage.
+2. Rebuild `_destination()` in `tensorscope_notebook.py`: YOU ASKED + prompt chips
+   (`prefaceChip`, QGridLayout, non-checkable, template + deciding properties) + THE MODEL
+   ANSWERED + excerpt + `build_overview(ctx, self.go_to)` + the follow sentence.
+3. Add `QPushButton#prefaceChip` QSS rules in `tensorscope_ui.py` (with `[template="true"]`
+   and `[deciding="true"]` variants). Do **not** reuse `tokenChip` (the op-1 chip-count test
+   counts it).
+4. Modify `test_recap.py`: split `test_an_operation_shows_only_the_evidence_tiers_it_declares`
+   so the preface is checked against `OVERVIEW_TIERS` (filter via
+   `preface.isAncestorOf(widget)`); add the DiagramTests and SavedCaptureTests from item 5.
+5. Gate: `--self-test`, `test_recap.py`, `test_threading.py`, all under
+   `QT_QPA_PLATFORM=offscreen`. Measure the `input` section height and the page total; if
+   over the existing bound, report the number and **ask before loosening**. Take screenshots
+   with `screens/shoot.py`, show them, and wait for the user's OK before Phase 3.
+
+Traps to keep in mind: writing a repo file from Python in text mode on Windows turns LF→CRLF
+— use the Edit tool, not Write-from-Python. And `label()`/`measure_label()` style text
+through `objectName`: every renamed label needs its own QSS rule.
 
 ### Phase 3 — operation cards
 

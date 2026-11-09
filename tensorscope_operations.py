@@ -48,14 +48,15 @@ from tensorscope_content import (
     ATTENTION_SINK_THRESHOLD, CONTINUATION, OPERATION_INDEX, CACHED_KV_NOTE,
     DISPLAY_CALC_NOTE, EOS_IS_A_SCORED_ENTRY, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED,
     EVIDENCE_KINDS, EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE,
-    NOTEBOOK_CHECKS, NOTEBOOK_TEXT, PROMPT_SPAN_UNKNOWN, TEMPLATE_BAND,
+    NOTEBOOK_CHECKS, NOTEBOOK_TEXT, PROMPT_SPAN_UNKNOWN, TEMPLATE_BAND, TYPED_BAND,
     TELEMETRY_UNAVAILABLE, WHAT_WE_CANNOT_CONCLUDE, prompt_token_bands, readable_spelling,
     what_we_know,
 )
 from tensorscope_diagrams import (
     AttentionGrid, CausalMaskTriangle, DecisionChain, EmbeddingLookupRow, GatedFFNPath,
-    HeadSplit, KVShare, LayerStack, MatMulShapes, MatrixGrid, PositionScope, QKCompare,
-    ResidualBypass, SoftmaxBars, VectorStrip, VocabularyProjection,
+    HeadSplit, KVShare, LayerDepthView, LayerStack, MatMulShapes, MatrixGrid, PipelineStrip,
+    PositionScope, QKCompare, ResidualBypass, ScoreDotPlot, SoftmaxBars, VectorStrip,
+    VocabularyProjection,
 )
 from tensorscope_variables import EquationRow, VariableChip
 
@@ -1206,6 +1207,46 @@ def layer_summary_rows(ctx: NotebookContext) -> list[dict]:
             row = view[0, min(ctx.registry.position, view.shape[-2] - 1)]
             entry['feature'] = int(np.argmax(np.abs(np.asarray(row, dtype=np.float64))))
             entry['value'] = row[entry['feature']]
+        rows.append(entry)
+    return rows
+
+
+def depth_rows(ctx: NotebookContext) -> list[dict]:
+    """The head-mean attention-weight matrix for the deciding position, one row per layer.
+
+    Generalises `layer_summary_rows` to the whole weight row: for each layer, the head-mean
+    of the captured weight row at the deciding (final) position, over every key.  A ranking
+    of stored values; the model reported nothing.  `weights` is the row, `typed_share` its
+    total weight on the typed positions (for the Level 1 highlight), and `sink` the weight
+    on position 0 (for the sink note).
+
+    The deciding position, not the followed one: Level 1 maps where the run's attention
+    settled, and the run decided at the final position.  The copy says so.
+    """
+    layers = ctx.registry.layers()
+    bands = ctx.bands
+    # The deciding position is the final prompt position, read off the run, not the
+    # reader's followed position -- which is what the rest of the page tracks and which may
+    # be an earlier token.  The depth view answers "where did the decision's attention go".
+    position = int(ctx.facts.get('final_position', ctx.registry.position))
+    typed = {index for start, end, name in (bands or [])
+             if name == TYPED_BAND for index in range(start, end)} if bands is not None else set()
+    rows = []
+    for index in sorted(layers):
+        weights = layers[index].tensors.get('attention_weights')
+        entry = {'layer': index, 'weights': None, 'typed_share': None, 'sink': None,
+                 'query': None}
+        if weights is not None and np.asarray(weights).ndim == 4:
+            view = np.asarray(weights)
+            query = min(position, view.shape[-2] - 1)
+            mean = np.asarray(view[0, :, query, :], dtype=np.float64).mean(axis=0)
+            entry['weights'] = mean
+            entry['sink'] = float(mean[0]) if mean.size else None
+            entry['query'] = int(query)
+            if typed:
+                keys = min(mean.size, max(typed) + 1)
+                entry['typed_share'] = float(mean[list(t for t in typed if t < keys)].sum()) \
+                    if mean.size else None
         rows.append(entry)
     return rows
 

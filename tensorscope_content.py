@@ -466,6 +466,11 @@ PROMPT_SPAN_UNKNOWN = (
 # alone.  The one key to all four is in the variable panel, beside the colour key.
 EVIDENCE_INLINE_TIERS = (EVIDENCE_DERIVED, EVIDENCE_UNATTESTED)
 
+# The tiers Level 0 and Level 1 may show in the input section's preface: the outcome's
+# scores and the first token are OBSERVED, the ranking and the margin are DERIVED, and the
+# pipeline's shape is CONCEPTUAL.  The tier test checks the preface against this.
+OVERVIEW_TIERS = (EVIDENCE_OBSERVED, EVIDENCE_DERIVED, EVIDENCE_CONCEPTUAL)
+
 EVIDENCE_MARKS = {
     EVIDENCE_OBSERVED: "solid green left edge",
     EVIDENCE_CONCEPTUAL: "dashed grey left edge",
@@ -1572,6 +1577,43 @@ NOTEBOOK_TEXT = {
         "ends. The model reads those markers exactly like your words; they are shown faded "
         "here only so your own tokens stand out.",
 
+    # Level 0 · Outcome, in the destination card.
+    "outcome_heading":
+        "The model scored every one of {vocab_size_phrase} and the highest was "
+        "{first_token_text}.",
+    "outcome_caption":
+        "The scores below are the logits at the final prompt position, position "
+        "{final_position}. The marked dot is the token the run emitted; the margin is the "
+        "difference between the two highest scores.",
+    "outcome_margin":
+        "The top score beats the next by {margin:.1f}.",
+    "outcome_spellings_unrecorded":
+        "This run did not record the spellings of these tokens, so they are labelled by "
+        "token ID.",
+    "outcome_no_logits":
+        "This run did not keep the score vector, so the ranking below is not shown. The "
+        "token it emitted was {first_token_text}.",
+
+    # Level 1 · Map, below the outcome.
+    "map_heading":
+        "How this run turned {position_count_text} tokens into one answer, and where the "
+        "attention settled.",
+    "map_pipeline_caption":
+        "The shape the data took. The projection to {vocab_size_phrase} and the choice of "
+        "one token are computed and discarded, so they are dashed.",
+    "map_depth_caption":
+        "For the deciding position, {final_token_text} at position {final_position}, how "
+        "much of its attention weight each layer put on each key, averaged over heads. "
+        "Typed positions are emphasised.",
+    "map_depth_pick":
+        "The layer outlined put the most total head-mean weight on the typed positions: "
+        "{pick_layer} at {pick_weight:.3f}.",
+    "map_depth_no_bands":
+        "The typed positions could not be lined up with the stored spellings, so no layer "
+        "is outlined.",
+    "map_depth_legend":
+        "Darker means more of this position's attention weight went to that key in that layer.",
+
     # The attention sink, wherever a shown weight row trips ATTENTION_SINK_THRESHOLD.
     # Op 7's own note already says attention weights are not next-token probabilities,
     # so the per-row form does not repeat it; op 11's form has no such neighbour and does.
@@ -1778,6 +1820,8 @@ NOTEBOOK_TEXT_FIELDS = {
     "attention_sink_rule": ("threshold",),
     "layer_feature_dominance": ("feature", "count"),
     "mean_weight_share": ("percent",),
+    "outcome_margin": ("margin",),
+    "map_depth_pick": ("pick_layer", "pick_weight"),
     "kept_captured": ("names",),
     "kept_described": ("names",),
     "tracked_features_caption": ("count", "position"),
