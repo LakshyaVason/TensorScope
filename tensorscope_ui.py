@@ -342,6 +342,31 @@ class ComputationRecap(QDialog):
                 font-weight: 700;
             }}
 
+            /* The prompt chips in the destination card.  Same shape as a token chip, but
+               not checkable -- they are the page's starting point, not a selection the
+               reader moves.  The deciding position is marked with a solid accent border. */
+            QPushButton#prefaceChip {{
+                text-align: center;
+                border: 1px solid {colors['border']};
+                border-radius: 5px;
+                padding: 3px 7px;
+                background: {colors['card_bg']};
+                color: {colors['text_primary']};
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 12px;
+            }}
+            QPushButton#prefaceChip[template="true"] {{
+                color: {colors[TEMPLATE_CHIP_INK]};
+                background: transparent;
+                border-style: dashed;
+            }}
+            QPushButton#prefaceChip[deciding="true"] {{
+                border: 1px solid {colors['accent']};
+                color: {colors['accent']};
+                font-weight: 700;
+            }}
+            QPushButton#prefaceChip:hover {{ border-color: {colors['accent']}; }}
+
             /* Lesson: stepwise reveal, optional checks, value boxes, bands */
             QFrame#revealStep {{
                 background: {colors['card_bg']};

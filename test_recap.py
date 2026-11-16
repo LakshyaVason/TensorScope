@@ -53,7 +53,7 @@ from tensorscope_content import (
     NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, PROMPT_SPAN_UNKNOWN, PROVENANCE_ABSENT,
     PROVENANCE_CAPTURED, PROVENANCE_DISPLAY, PROVENANCE_LEARNED, REFERENCE_TOPICS,
     ROLE_LEGEND, TELEMETRY_UNAVAILABLE, TEMPLATE_BAND, TYPED_BAND, VARIABLE_ROLES,
-    WEIGHTS_NOT_PROBABILITIES, display_spelling, learn_facts, prompt_token_bands,
+    WEIGHTS_NOT_PROBABILITIES, OVERVIEW_TIERS, display_spelling, learn_facts, prompt_token_bands,
     readable_spelling,
 )
 from tensorscope_common import chip_text
@@ -64,6 +64,7 @@ from tensorscope_variables import (
     EquationRow, VariableChip, VariablePanel, VariableRegistry,
 )
 from tensorscope_views import NotebookView, RawView, ReferenceView
+from tensorscope_notebook import SECTIONS
 
 
 def _database_argument():
@@ -674,16 +675,142 @@ class SavedCaptureTests(unittest.TestCase):
                     allowed = {EVIDENCE_KINDS[tier][0] for tier in operation.tiers}
                     # Badges still name their tier in words, and the words must agree with
                     # the property: a badge cannot say one tier and claim another.
+                    # The input section's preface carries its own tiers, checked separately;
+                    # a preface badge is not an operation badge.
                     for badge in section.findChildren(EvidenceBadge):
+                        if section.preface is not None and section.preface.isAncestorOf(badge):
+                            continue
                         name = badge.text().split('  ·  ')[0]
                         self.assertIn(name, allowed,
                                       f'{operation.key} showed an undeclared tier')
                         self.assertEqual(EVIDENCE_KINDS[badge.property('evidenceTier')][0], name)
                     for widget, tier in evidence_claims(section):
+                        if section.preface is not None and section.preface.isAncestorOf(widget):
+                            continue
                         self.assertIn(tier, operation.tiers,
                                       f'{operation.key} marked an undeclared tier '
                                       f'on a {type(widget).__name__}')
             notebook.deleteLater()
+
+    def test_the_destination_preface_stays_within_the_overview_tiers(self):
+        """The preface (Level 0 and Level 1) declares its own tiers, not an operation's."""
+        preface = SECTIONS[0].key
+        for run_id, capture in self.captures.items():
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            notebook.go_to(preface)
+            section = notebook.section(preface)
+            open_every_disclosure(section)
+            for reveal in section.findChildren(StepReveal):
+                reveal.reveal_all()
+            allowed = set(OVERVIEW_TIERS)
+            with self.subTest(run_id=run_id):
+                for badge in section.findChildren(EvidenceBadge):
+                    if section.preface is not None and section.preface.isAncestorOf(badge):
+                        name = badge.text().split('  ·  ')[0].lower()
+                        self.assertIn(name, allowed,
+                                      f'preface showed an undeclared tier {name!r}')
+                        self.assertEqual(EVIDENCE_KINDS[badge.property('evidenceTier')][0].lower(),
+                                         name)
+                for widget, tier in evidence_claims(section):
+                    if section.preface is not None and section.preface.isAncestorOf(widget):
+                        self.assertIn(tier, allowed,
+                                      f'preface marked an undeclared tier on '
+                                      f'{type(widget).__name__}')
+            notebook.deleteLater()
+
+    def test_the_outcome_degrades_with_the_runs_capabilities(self):
+        """Level 0 shows what this run kept: the scores, or only the emitted token.
+
+        The runs are grouped by what they captured, not by id, so a database that lacks a
+        run of a given capability fails loudly rather than silently passing on the ones it
+        has."""
+        no_logits, with_logits, with_trace = [], [], []
+        for run_id, capture in self.captures.items():
+            if capture.logits is None:
+                no_logits.append(capture)
+            else:
+                with_logits.append(capture)
+            if capture.generation_trace:
+                with_trace.append(capture)
+        self.assertTrue(no_logits, 'the database must contain a run with no logits to test')
+        self.assertTrue(with_logits, 'the database must contain a run with logits to test')
+        self.assertTrue(with_trace, 'the database must contain a run with a trace to test')
+
+        for run_id, capture in self.captures.items():
+            if capture.logits is None:
+                notebook = NotebookView(capture, tokens=app.TOKENS)
+                notebook.go_to(SECTIONS[0].key)
+                shown = section_text(notebook.section(SECTIONS[0].key).preface)
+                with self.subTest(run_id=run_id):
+                    self.assertIn(LOGITS_UNAVAILABLE, shown)
+                    self.assertIn(repr(capture.tokens[0]), shown)
+                    # No logits: the score-vector caption that names the final position is absent.
+                    self.assertNotIn('the logits at the final prompt position', shown)
+                notebook.deleteLater()
+
+        for run_id, capture in self.captures.items():
+            if capture.logits is None:
+                continue
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            notebook.go_to(SECTIONS[0].key)
+            shown = section_text(notebook.section(SECTIONS[0].key).preface)
+            with self.subTest(run_id=run_id):
+                # Logits present: the score-vector caption names the final position.
+                self.assertIn('the logits at the final prompt position', shown)
+                if not capture.generation_trace:
+                    self.assertIn('not record the spellings', shown)
+            notebook.deleteLater()
+
+    def test_the_depth_view_outlines_the_layer_heaviest_on_the_typed_tokens(self):
+        """The Level 1 highlight is an independently computed argmax, per run.
+
+        The outlined layer is the one whose head-mean weight row for the deciding position
+        puts the most total weight on the typed positions.  Recomputing that here, straight
+        from the captured arrays, is the oracle."""
+        for run_id, capture in self.captures.items():
+            bands = prompt_token_bands(capture.prompt, capture.prompt_tokens)
+            if bands is None:
+                continue
+            typed = [index for start, end, name in bands
+                     if name == TYPED_BAND for index in range(start, end)]
+            if not typed:
+                continue
+            notebook = NotebookView(capture, tokens=app.TOKENS)
+            notebook.go_to(SECTIONS[0].key)
+            views = notebook.section(SECTIONS[0].key).preface.findChildren(
+                diagrams.LayerDepthView)
+            with self.subTest(run_id=run_id):
+                self.assertTrue(views, 'the preface built no depth view')
+                shown = views[0].highlighted_row()
+                if shown is None:
+                    # No layer carried a finite typed share -- nothing to outline.
+                    continue
+                layers = capture.layers
+                final = int(learn_facts(capture)['final_position'])
+                best_layer, best_share = None, float('-inf')
+                for layer, captured in sorted(layers.items()):
+                    weights = captured.tensors['attention_weights']
+                    query = min(final, weights.shape[-2] - 1)
+                    mean = weights[0, :, query, :].astype(np.float64).mean(axis=0)
+                    keys = min(mean.size, max(typed) + 1)
+                    share = float(mean[[t for t in typed if t < keys]].sum())
+                    if share > best_share:
+                        best_layer, best_share = layer, share
+                self.assertEqual(shown, sorted(layers).index(best_layer))
+            notebook.deleteLater()
+
+    def test_clicking_a_pipeline_stage_jumps_to_that_operation(self):
+        """The Level 1 pipeline strip is navigation: a click moves the reader's section."""
+        capture = next(iter(self.captures.values()))
+        notebook = NotebookView(capture, tokens=app.TOKENS)
+        notebook.go_to(SECTIONS[0].key)
+        strip = notebook.section(SECTIONS[0].key).preface.findChild(diagrams.PipelineStrip)
+        self.assertIsNotNone(strip)
+        notebook.go_to('layers')
+        self.assertEqual(notebook.current_stage(), 'layers')
+        strip.stageClicked.emit('decide')
+        self.assertEqual(notebook.current_stage(), 'decide')
+        notebook.deleteLater()
 
     def test_the_unattested_tier_appears_only_where_it_belongs(self):
         """Two places only: a later generation step's scores, and the stopping score."""
@@ -1394,7 +1521,19 @@ class SavedCaptureTests(unittest.TestCase):
             with self.subTest(run_id=run_id):
                 self.assertIsNotNone(preface)
                 shown = section_text(preface)
-                self.assertIn(capture.prompt, shown)
+                # The prompt is rendered as one chip per token, not as a single string, so
+                # it is checked chip by chip.  Template chips are faded, the deciding token
+                # is marked; every prompt token is present exactly once, in order.
+                chips = [chip for chip in preface.findChildren(QPushButton)
+                         if chip.objectName() == 'prefaceChip']
+                self.assertEqual(len(chips), len(capture.prompt_tokens))
+                for index, token in enumerate(capture.prompt_tokens):
+                    self.assertEqual(chips[index].text(), chip_text(display_spelling(token)))
+                deciding = [chip for chip in chips if chip.property('deciding')]
+                self.assertEqual(len(deciding), 1)
+                self.assertEqual(deciding[0].text(),
+                                 chip_text(display_spelling(capture.prompt_tokens[int(
+                                     learn_facts(capture)['final_position'])])))
                 self.assertIn(repr(capture.tokens[0]), shown)
                 self.assertIn(learn_facts(capture)['response_excerpt'].split(' ')[1], shown)
                 self.assertIs(first.anchor(), preface)
@@ -1731,6 +1870,94 @@ class DiagramTests(unittest.TestCase):
             diagram.grab()
             with self.subTest(diagram=type(diagram).__name__):
                 self.assertEqual(diagram.findChildren(FigureCanvas), [])
+
+    # ── Level 0 and Level 1 diagrams ─────────────────────────────────────────
+
+    def test_the_pipeline_strip_paints_and_names_its_stages(self):
+        for theme_name, tokens in self.themes():
+            strip = diagrams.PipelineStrip(
+                [('input', 'input', 'IDs [15]'), ('embed', 'embedding', '[15 x 2560]'),
+                 ('layers', 'layers', '36 layers'),
+                 ('project', 'project', '151,936', True), ('decide', 'token', 'one token', True)],
+                tokens=tokens)
+            with self.subTest(theme=theme_name):
+                strip.resize(strip.sizeHint())
+                self.assertFalse(strip.grab().isNull())
+                described = strip.describe()
+                self.assertIn('input', described)
+                self.assertIn('151,936', described)
+                self.assertIn('one token', described)
+                self.assertTrue(all(text.strip() for text in described))
+
+    def test_a_pipeline_stage_click_emits_its_key(self):
+        strip = diagrams.PipelineStrip(
+            [('input', 'input', 'IDs [15]'), ('layers', 'layers', '36 layers'),
+             ('project', 'project', '151,936', True)], tokens=app._TOKENS_DARK)
+        strip.resize(strip.sizeHint())
+        strip.grab()
+        seen = []
+        strip.stageClicked.connect(seen.append)
+        box = strip._boxes[1]
+        strip.canvas.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, QPoint(box.center().x(), box.center().y()),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        self.assertEqual(seen, ['layers'])
+
+    def test_the_layer_depth_view_paints_and_reports_its_highlight(self):
+        matrix = np.array([[0.1, 0.7, 0.2], [0.5, 0.1, 0.4]], dtype=np.float64)
+        view = diagrams.LayerDepthView(
+            matrix, ['0', '1'], ['0', '1', '2'], typed={1}, highlight_row=0,
+            tokens=app._TOKENS_DARK)
+        view.resize(view.sizeHint())
+        self.assertFalse(view.grab().isNull())
+        self.assertEqual(view.highlighted_row(), 0)
+        described = view.describe()
+        self.assertIn('layer 0', described)
+        self.assertIn('layer 1', described)
+        self.assertTrue(all(text.strip() for text in described))
+
+    def test_the_depth_view_tooltip_returns_the_exact_head_mean(self):
+        matrix = np.array([[0.123456, 0.765432], [0.512, 0.488]], dtype=np.float64)
+        view = diagrams.LayerDepthView(matrix, ['0', '1'], ['0', '1'], tokens=app._TOKENS_DARK)
+        view.resize(view.sizeHint())
+        view.grab()
+        grid = view._grid
+        tip = view.tooltip_at(QPoint(grid.x() + 2, grid.y() + 2))
+        self.assertIn('0.123456', tip)
+        self.assertIn('Layer 0', tip)
+
+    def test_the_depth_view_degrades_on_empty_input(self):
+        view = diagrams.LayerDepthView(
+            np.zeros((0, 0), dtype=np.float64), [], [], tokens=app._TOKENS_DARK)
+        view.resize(view.sizeHint())
+        self.assertFalse(view.grab().isNull())
+        self.assertIsNone(view.highlighted_row())
+
+    def test_the_score_dot_plot_paints_scores_not_percentages(self):
+        plot = diagrams.ScoreDotPlot(
+            [2.5, 3.1, 1.2, 4.8, 0.4], ['the', ' color', '?', 'x', 'y'], selected=3,
+            tokens=app._TOKENS_DARK)
+        plot.resize(plot.sizeHint())
+        self.assertFalse(plot.grab().isNull())
+        described = plot.describe()
+        self.assertIn('score (logit)', described)
+        self.assertFalse(any('%' in text for text in described))
+        self.assertTrue(all(text.strip() for text in described))
+
+    def test_the_score_dot_plot_marks_the_selected_dot(self):
+        plot = diagrams.ScoreDotPlot(
+            [2.5, 3.1, 1.2, 4.8], ['a', 'b', 'c', 'd'], selected=1, tokens=app._TOKENS_DARK)
+        plot.resize(plot.sizeHint())
+        plot.grab()
+        self.assertEqual(plot._selected, 1)
+        tip = plot.tooltip_at(plot._dots[1][1].center())
+        self.assertIn('score (logit)', tip)
+
+    def test_the_score_dot_plot_degrades_on_empty_input(self):
+        plot = diagrams.ScoreDotPlot([], [], selected=None, tokens=app._TOKENS_DARK)
+        plot.resize(plot.sizeHint())
+        self.assertFalse(plot.grab().isNull())
+        self.assertIn('No scores recorded.', plot.describe())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

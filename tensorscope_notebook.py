@@ -49,7 +49,9 @@ from tensorscope_content import (
     OVERVIEW_TIERS, TEMPLATE_BAND, TYPED_BAND, WEIGHTS_NOT_PROBABILITIES, learn_facts,
     prompt_token_bands, readable_spelling,
 )
-from tensorscope_operations import BUILDERS, NotebookContext, depth_rows, sink_callout
+from tensorscope_operations import (
+    BUILDERS, NotebookContext, build_overview, depth_rows, sink_callout,
+)
 from tensorscope_diagrams import LayerDepthView, PipelineStrip, ScoreDotPlot
 from tensorscope_variables import VariablePanel, VariableRegistry
 
@@ -176,9 +178,35 @@ class NotebookView(AnchoredScrollPage):
         body.setContentsMargins(24, 18, 24, 20)
         body.setSpacing(4)
         body.addWidget(label(NOTEBOOK_TEXT['destination_asked'], muted=True))
-        prompt = label(self.capture.prompt or '(empty prompt)')
-        prompt.setObjectName('destinationPrompt')
-        body.addWidget(prompt)
+
+        # The prompt as chips, one per token.  Faded chips are the template text the reader
+        # did not type; the deciding position -- the one whose calculation the page follows
+        # -- is marked.  They are not checkable and do not move the selection: navigation is
+        # the job of the operation bodies below, and the reader's own prompt strip is there.
+        final = int(facts['final_position'])
+        template = {index for start, end, name in (self.context_builder.bands or [])
+                    if name == TEMPLATE_BAND for index in range(start, end)}
+        chips = QGridLayout()
+        chips.setContentsMargins(0, 0, 0, 0)
+        chips.setHorizontalSpacing(4)
+        chips.setVerticalSpacing(4)
+        columns = 8
+        for index, token in enumerate(self.capture.prompt_tokens):
+            button = QPushButton(chip_text(display_spelling(token)))
+            button.setObjectName('prefaceChip')
+            button.setCheckable(False)
+            if index in template:
+                button.setProperty('template', True)
+            if index == final:
+                button.setProperty('deciding', True)
+            button.setToolTip(f'position {index}  ·  reads as '
+                              f'{readable_spelling(token)!r}'
+                              + ('  ·  template' if index in template else ''))
+            chips.addWidget(button, index // columns, index % columns)
+        chip_holder = QWidget()
+        chip_holder.setLayout(chips)
+        body.addWidget(chip_holder)
+
         body.addSpacing(4)
         body.addWidget(label(NOTEBOOK_TEXT['destination_answered'], muted=True))
         excerpt = str(facts['response_excerpt'])
@@ -197,6 +225,12 @@ class NotebookView(AnchoredScrollPage):
         answer.setObjectName('destinationAnswer')
         body.addWidget(answer)
         body.addSpacing(6)
+
+        # Level 0 (outcome) and Level 1 (map): the scores behind the token and the shape the
+        # data took to get there.  The pipeline strip jumps the reader to an operation.
+        body.addWidget(build_overview(self.context_builder, self.go_to))
+        body.addSpacing(6)
+
         key = 'destination_follow' if facts['prompt_span_known'] else 'destination_unaligned'
         body.addWidget(label(NOTEBOOK_TEXT[key].format(**facts), small=True))
         return card

@@ -49,8 +49,8 @@ from tensorscope_content import (
     DISPLAY_CALC_NOTE, EOS_IS_A_SCORED_ENTRY, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED,
     EVIDENCE_KINDS, EVIDENCE_OBSERVED, EVIDENCE_UNATTESTED, LOGITS_UNAVAILABLE,
     NOTEBOOK_CHECKS, NOTEBOOK_TEXT, PROMPT_SPAN_UNKNOWN, TEMPLATE_BAND, TYPED_BAND,
-    TELEMETRY_UNAVAILABLE, WHAT_WE_CANNOT_CONCLUDE, prompt_token_bands, readable_spelling,
-    what_we_know,
+    TELEMETRY_UNAVAILABLE, WEIGHTS_NOT_PROBABILITIES, WHAT_WE_CANNOT_CONCLUDE,
+    prompt_token_bands, readable_spelling, what_we_know,
 )
 from tensorscope_diagrams import (
     AttentionGrid, CausalMaskTriangle, DecisionChain, EmbeddingLookupRow, GatedFFNPath,
@@ -1249,6 +1249,137 @@ def depth_rows(ctx: NotebookContext) -> list[dict]:
                     if mean.size else None
         rows.append(entry)
     return rows
+
+
+def _typed_positions(ctx: NotebookContext) -> set[int]:
+    """The prompt indices the reader's own text landed on, or the empty set when the typed
+    text could not be aligned with the stored spellings.  Read from `prompt_token_bands`,
+    which returns None rather than guess."""
+    typed: set[int] = set()
+    if ctx.bands is not None:
+        for start, end, name in ctx.bands:
+            if name == TYPED_BAND:
+                typed.update(range(start, end))
+    return typed
+
+
+def build_overview(ctx: NotebookContext, on_stage) -> QWidget:
+    """Level 0 (outcome) and Level 1 (map): what the run chose, and how it got there.
+
+    The destination card's preface, above the first operation.  Level 0 is the run's answer
+    and the scores behind it; Level 1 is the shape the data took and where its attention
+    settled.  It is read-only -- navigation is the job of the operation bodies below, so the
+    pipeline strip only jumps the reader to a section, it does not follow a selection.
+    """
+    capture = ctx.capture
+    facts = ctx.facts
+    host, body = _panel()
+
+    # ── Level 0 · Outcome ──────────────────────────────────────────────────
+    body.addWidget(label(ctx.say('outcome_heading'), muted=True, small=True))
+
+    logits = capture.logits
+    if logits is None:
+        # Schema 2: no score vector was kept, so only the emitted token is known.  The
+        # ranking and the margin are exactly what cannot be recovered here.
+        body.addWidget(described_line(LOGITS_UNAVAILABLE))
+        body.addWidget(label(ctx.say('outcome_no_logits',
+                                     first_token_text=facts['first_token_text']),
+                             muted=True, small=True))
+        body.addWidget(label(facts['selection_rule_sentence'], muted=True, small=True))
+    else:
+        flat = np.asarray(logits).reshape(-1)
+        chosen = int(flat.argmax())
+        order = np.argsort(-flat, kind='stable')[:10]
+        # Schema 4 recorded the run's own ranked candidates, so those are shown verbatim.
+        # Schema 3 kept the logits but not that list, so the ranking below is TensorScope's
+        # own and its entries can only be labelled by token ID.
+        trace = capture.generation_trace
+        if trace:
+            entries = [(entry['id'], entry.get('token', ''), float(entry['logit']))
+                       for entry in trace[0].top_candidates]
+            scores = [score for _, _, score in entries]
+            labels = [repr(str(token)) if token else str(identifier)
+                      for identifier, token, _ in entries]
+            selected = 0
+        else:
+            scores = [float(flat[index]) for index in order]
+            labels = [str(int(index)) for index in order]
+            selected = next((rank for rank, index in enumerate(order) if index == chosen), 0)
+        # The scores are captured logits; the ranking and the margin are TensorScope's own
+        # arithmetic, so the plot is OBSERVED and only the margin keeps a DERIVED badge.
+        body.addWidget(evidence_frame(
+            ScoreDotPlot(scores, labels, selected=selected, tokens=ctx.tokens),
+            EVIDENCE_OBSERVED))
+        if not trace:
+            body.addWidget(label(ctx.say('outcome_spellings_unrecorded'),
+                                 muted=True, small=True))
+        body.addWidget(label(ctx.say('outcome_caption'), muted=True, small=True))
+        if len(order) > 1:
+            margin = float(flat[order[0]]) - float(flat[order[1]])
+            body.addWidget(badged(
+                EvidenceBadge(EVIDENCE_DERIVED, 'the ranking and the margin'),
+                ctx.say('outcome_margin', margin=margin)))
+        body.addWidget(label(facts['selection_rule_sentence'], muted=True, small=True))
+
+    # ── Level 1 · Map ──────────────────────────────────────────────────────
+    body.addWidget(label(ctx.say('map_heading'), muted=True, small=True))
+
+    # The pipeline strip: the shape the data took from prompt to first token.  The
+    # projection to the vocabulary and the choice of one token are computed and discarded,
+    # so they are dashed and the reader can still jump to the operation behind each stage.
+    vocab = int(facts.get('vocab_size_raw') or 0)
+    strip = PipelineStrip([
+        ('input', 'input', f'IDs [{facts["position_count"]}]'),
+        ('embed', 'embedding', f'[{facts["position_count"]} x {facts["hidden_size"]}]'),
+        ('layers', 'layers', f'{int(facts["layer_count"])} layers'),
+        ('project', 'project', f'[{vocab:,}]' if vocab else 'not recorded', True),
+        ('decide', 'token', 'one token', True),
+    ], tokens=ctx.tokens)
+    strip.stageClicked.connect(on_stage)
+    body.addWidget(strip)
+    body.addWidget(label(ctx.say('map_pipeline_caption',
+                                 vocab_size_phrase=facts['vocab_size_phrase']),
+                         muted=True, small=True))
+
+    # The depth view: the deciding position's head-mean weight row, one row per layer.  The
+    # head-mean is a ranking of stored values, so the view and its outline are DERIVED.
+    rows = [row for row in depth_rows(ctx) if row['weights'] is not None]
+    matrix = [np.asarray(row['weights'], dtype=np.float64) for row in rows]
+    layer_labels = [str(row['layer']) for row in rows]
+    width = int(matrix[0].size) if matrix else 0
+    spellings = ctx.key_spellings()
+    key_labels = [spellings[i] if i < len(spellings) else str(i) for i in range(width)]
+    typed = _typed_positions(ctx)
+    # The layer outlined is the one whose head-mean row puts the most total weight on the
+    # typed positions; with no alignment there is nothing to line up, so nothing is outlined.
+    highlight = None
+    if typed and matrix:
+        shares = [(index, row['typed_share']) for index, row in enumerate(rows)
+                  if row['typed_share'] is not None and np.isfinite(row['typed_share'])]
+        if shares:
+            highlight = max(shares, key=lambda pair: pair[1])[0]
+    depth = LayerDepthView(matrix, layer_labels, key_labels, typed=typed,
+                           highlight_row=highlight, tokens=ctx.tokens)
+    body.addWidget(evidence_frame(depth, EVIDENCE_DERIVED))
+    body.addWidget(badge_row(EvidenceBadge(EVIDENCE_DERIVED, 'head-mean, one row per layer')))
+    body.addWidget(label(ctx.say('map_depth_caption'), muted=True, small=True))
+    if highlight is not None:
+        pick = rows[highlight]
+        body.addWidget(badged(EvidenceBadge(EVIDENCE_DERIVED, 'the layer outlined'),
+                              ctx.say('map_depth_pick', pick_layer=pick['layer'],
+                                      pick_weight=float(pick['typed_share']))))
+    else:
+        body.addWidget(label(ctx.say('map_depth_no_bands'), muted=True, small=True))
+
+    # The sink note reads one head-mean weight (a percentage), so it must carry the caveat
+    # that attention weights are not next-token probabilities.
+    if highlight is not None:
+        sink = sink_callout(ctx, rows[highlight]['weights'], averaged=True)
+        if sink is not None:
+            body.addWidget(sink)
+            body.addWidget(label(WEIGHTS_NOT_PROBABILITIES, muted=True, small=True))
+    return host
 
 
 def layer_sink_callout(ctx: NotebookContext, summary) -> QWidget | None:
