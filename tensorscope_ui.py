@@ -342,6 +342,31 @@ class ComputationRecap(QDialog):
                 font-weight: 700;
             }}
 
+            /* Prompt chips in the destination card.  The tokens you did not type are
+               faded, and the deciding position -- where the run chose its answer -- is
+               marked with the accent border.  Non-checkable, so no :checked state. */
+            QPushButton#prefaceChip {{
+                text-align: center;
+                border: 1px solid {colors['border']};
+                border-radius: 5px;
+                padding: 3px 7px;
+                background: {colors['card_bg']};
+                color: {colors['text_primary']};
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 12px;
+            }}
+            QPushButton#prefaceChip[template="true"] {{
+                color: {colors[TEMPLATE_CHIP_INK]};
+                background: transparent;
+                border-style: dashed;
+            }}
+            QPushButton#prefaceChip[deciding="true"] {{
+                border-color: {colors['accent']};
+                border-width: 2px;
+                font-weight: 700;
+            }}
+            QPushButton#prefaceChip:hover {{ border-color: {colors['accent']}; }}
+
             /* Lesson: stepwise reveal, optional checks, value boxes, bands */
             QFrame#revealStep {{
                 background: {colors['card_bg']};

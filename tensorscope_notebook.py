@@ -49,7 +49,9 @@ from tensorscope_content import (
     OVERVIEW_TIERS, TEMPLATE_BAND, TYPED_BAND, WEIGHTS_NOT_PROBABILITIES, learn_facts,
     prompt_token_bands, readable_spelling,
 )
-from tensorscope_operations import BUILDERS, NotebookContext, depth_rows, sink_callout
+from tensorscope_operations import (
+    BUILDERS, NotebookContext, build_overview, depth_rows, sink_callout,
+)
 from tensorscope_diagrams import LayerDepthView, PipelineStrip, ScoreDotPlot
 from tensorscope_variables import VariablePanel, VariableRegistry
 
@@ -168,21 +170,53 @@ class NotebookView(AnchoredScrollPage):
     # ── The destination ──────────────────────────────────────────────────────
 
     def _destination(self) -> QWidget:
-        """Where the page is going, before any of the steps that get there."""
+        """Where the page is going, before any of the steps that get there.
+
+        YOU ASKED / THE MODEL ANSWERED, then the whole run at a glance: the outcome the run
+        chose (Level 0) and the map of how it got there (Level 1), built by
+        `build_overview`.  The prompt is a row of chips, not a label -- the tokens you did
+        not type are faded, and the deciding position is marked -- so the reader sees at a
+        glance what reached the model before watching one row change through the steps.
+        """
         facts = self.facts
+        capture = self.capture
+        final = int(facts['final_position'])
+        bands = self.context_builder.bands
+        typed = {name for _start, _end, name in (bands or [])}
+
         card = QFrame()
         card.setObjectName('destinationCard')
         body = QVBoxLayout(card)
         body.setContentsMargins(24, 18, 24, 20)
         body.setSpacing(4)
         body.addWidget(label(NOTEBOOK_TEXT['destination_asked'], muted=True))
-        prompt = label(self.capture.prompt or '(empty prompt)')
-        prompt.setObjectName('destinationPrompt')
+
+        # The prompt as chips: the tokens you typed stand out, the template markers are
+        # faded, and the deciding position -- where the run's answer was chosen -- is
+        # marked.  Non-checkable: the Following control in the reading bar owns the
+        # selection, and these chips are only ever read.  They are `prefaceChip`, not
+        # `tokenChip`, so the op-1 chip-count test does not count them.
+        columns = 10
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+        for index, token in enumerate(capture.prompt_tokens):
+            chip = QPushButton(chip_text(display_spelling(token)))
+            chip.setObjectName('prefaceChip')
+            chip.setCheckable(False)
+            chip.setProperty('template', index not in typed)
+            chip.setProperty('deciding', index == final)
+            chip.setToolTip(f'position {index}')
+            grid.addWidget(chip, index // columns, index % columns)
+        grid.setColumnStretch(columns, 1)
+        prompt = QWidget()
+        prompt.setLayout(grid)
         body.addWidget(prompt)
         body.addSpacing(4)
+
         body.addWidget(label(NOTEBOOK_TEXT['destination_answered'], muted=True))
         excerpt = str(facts['response_excerpt'])
-        first = self.capture.tokens[0] if self.capture.tokens else ''
+        first = capture.tokens[0] if capture.tokens else ''
         # The first token, marked where it begins the excerpt: that is the token whose
         # calculation the page follows.  Only marked when it really is the excerpt's start.
         if first and excerpt.startswith(first):
@@ -196,6 +230,11 @@ class NotebookView(AnchoredScrollPage):
         answer = label(shown, rich=True)
         answer.setObjectName('destinationAnswer')
         body.addWidget(answer)
+        body.addSpacing(6)
+
+        # Level 0 and Level 1: the outcome and the map, before the steps that reach them.
+        body.addWidget(build_overview(self.context_builder, self.go_to))
+
         body.addSpacing(6)
         key = 'destination_follow' if facts['prompt_span_known'] else 'destination_unaligned'
         body.addWidget(label(NOTEBOOK_TEXT[key].format(**facts), small=True))
