@@ -2258,7 +2258,7 @@ def self_test() -> None:
     # ── The notebook's teaching structure ────────────────────────────────────
     # Four chapters over the thirteen anchors, in page order, titled exactly as promised.
     from tensorscope_content import (
-        CHAPTERS, NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, WHAT_WE_KNOW, default_focus_position,
+        CHAPTERS, NOTEBOOK_TEXT, NOTEBOOK_TEXT_FIELDS, WHAT_WE_KNOW, typed_focus_position,
         what_we_know,
     )
     assert [chapter.title for chapter in CHAPTERS] == [
@@ -2272,7 +2272,7 @@ def self_test() -> None:
         subject_facts = learn_facts(subject)
         for operation in NOTEBOOK_OPERATIONS + [CONTINUATION]:
             filled = {**subject_facts, **{field: 0 for field in operation.fields}}
-            for field in ("heading", "lede", "formula", "takeaway", "note", "action"):
+            for field in ("heading", "lede", "idea", "formula", "takeaway", "note", "action"):
                 getattr(operation, field).format(**filled)
             assert len(operation.lede) <= 260, (operation.key, len(operation.lede))
         for key, text in NOTEBOOK_TEXT.items():

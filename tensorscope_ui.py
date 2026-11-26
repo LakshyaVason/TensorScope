@@ -342,9 +342,9 @@ class ComputationRecap(QDialog):
                 font-weight: 700;
             }}
 
-            /* The prompt chips in the destination card.  Same shape as a token chip, but
-               not checkable -- they are the page's starting point, not a selection the
-               reader moves.  The deciding position is marked with a solid accent border. */
+# Prompt chips in the destination card.  The tokens you did not type are
+            # faded, and the deciding position -- where the run chose its answer -- is
+            # marked with the accent border.  Non-checkable, so no :checked state. */
             QPushButton#prefaceChip {{
                 text-align: center;
                 border: 1px solid {colors['border']};
@@ -361,8 +361,8 @@ class ComputationRecap(QDialog):
                 border-style: dashed;
             }}
             QPushButton#prefaceChip[deciding="true"] {{
-                border: 1px solid {colors['accent']};
-                color: {colors['accent']};
+                border-color: {colors['accent']};
+                border-width: 2px;
                 font-weight: 700;
             }}
             QPushButton#prefaceChip:hover {{ border-color: {colors['accent']}; }}

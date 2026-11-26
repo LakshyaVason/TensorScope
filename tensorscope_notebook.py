@@ -170,8 +170,19 @@ class NotebookView(AnchoredScrollPage):
     # ── The destination ──────────────────────────────────────────────────────
 
     def _destination(self) -> QWidget:
-        """Where the page is going, before any of the steps that get there."""
+        """Where the page is going, before any of the steps that get there.
+
+        YOU ASKED / THE MODEL ANSWERED, then the whole run at a glance: the outcome the run
+        chose (Level 0) and the map of how it got there (Level 1), built by
+        `build_overview`.  The prompt is a row of chips, not a label -- the tokens you did
+        not type are faded, and the deciding position is marked -- so the reader sees at a
+        glance what reached the model before watching one row change through the steps.
+        """
         facts = self.facts
+        capture = self.capture
+        final = int(facts['final_position'])
+        bands = self.context_builder.bands
+
         card = QFrame()
         card.setObjectName('destinationCard')
         body = QVBoxLayout(card)
@@ -179,38 +190,33 @@ class NotebookView(AnchoredScrollPage):
         body.setSpacing(4)
         body.addWidget(label(NOTEBOOK_TEXT['destination_asked'], muted=True))
 
-        # The prompt as chips, one per token.  Faded chips are the template text the reader
-        # did not type; the deciding position -- the one whose calculation the page follows
-        # -- is marked.  They are not checkable and do not move the selection: navigation is
-        # the job of the operation bodies below, and the reader's own prompt strip is there.
-        final = int(facts['final_position'])
+        # The prompt as chips: the tokens you typed stand out, the template markers are
+        # faded, and the deciding position -- where the run's answer was chosen -- is
+        # marked.  Non-checkable: the Following control in the reading bar owns the
+        # selection, and these chips are only ever read.  They are `prefaceChip`, not
+        # `tokenChip`, so the op-1 chip-count test does not count them.
         template = {index for start, end, name in (self.context_builder.bands or [])
                     if name == TEMPLATE_BAND for index in range(start, end)}
-        chips = QGridLayout()
-        chips.setContentsMargins(0, 0, 0, 0)
-        chips.setHorizontalSpacing(4)
-        chips.setVerticalSpacing(4)
-        columns = 8
-        for index, token in enumerate(self.capture.prompt_tokens):
-            button = QPushButton(chip_text(display_spelling(token)))
-            button.setObjectName('prefaceChip')
-            button.setCheckable(False)
-            if index in template:
-                button.setProperty('template', True)
-            if index == final:
-                button.setProperty('deciding', True)
-            button.setToolTip(f'position {index}  ·  reads as '
-                              f'{readable_spelling(token)!r}'
-                              + ('  ·  template' if index in template else ''))
-            chips.addWidget(button, index // columns, index % columns)
-        chip_holder = QWidget()
-        chip_holder.setLayout(chips)
-        body.addWidget(chip_holder)
-
+        columns = 10
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+        for index, token in enumerate(capture.prompt_tokens):
+            chip = QPushButton(chip_text(display_spelling(token)))
+            chip.setObjectName('prefaceChip')
+            chip.setCheckable(False)
+            chip.setProperty('template', index in template)
+            chip.setProperty('deciding', index == final)
+            grid.addWidget(chip, index // columns, index % columns)
+        grid.setColumnStretch(columns, 1)
+        prompt = QWidget()
+        prompt.setLayout(grid)
+        body.addWidget(prompt)
         body.addSpacing(4)
+
         body.addWidget(label(NOTEBOOK_TEXT['destination_answered'], muted=True))
         excerpt = str(facts['response_excerpt'])
-        first = self.capture.tokens[0] if self.capture.tokens else ''
+        first = capture.tokens[0] if capture.tokens else ''
         # The first token, marked where it begins the excerpt: that is the token whose
         # calculation the page follows.  Only marked when it really is the excerpt's start.
         if first and excerpt.startswith(first):
@@ -226,11 +232,10 @@ class NotebookView(AnchoredScrollPage):
         body.addWidget(answer)
         body.addSpacing(6)
 
-        # Level 0 (outcome) and Level 1 (map): the scores behind the token and the shape the
-        # data took to get there.  The pipeline strip jumps the reader to an operation.
+        # Level 0 and Level 1: the outcome and the map, before the steps that reach them.
         body.addWidget(build_overview(self.context_builder, self.go_to))
-        body.addSpacing(6)
 
+        body.addSpacing(6)
         key = 'destination_follow' if facts['prompt_span_known'] else 'destination_unaligned'
         body.addWidget(label(NOTEBOOK_TEXT[key].format(**facts), small=True))
         return card

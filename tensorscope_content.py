@@ -302,7 +302,7 @@ def prompt_token_bands(prompt: str, prompt_tokens: list[str]) -> list[tuple[int,
     return [band for band in bands if band[1] > band[0]]
 
 
-def default_focus_position(prompt: str, prompt_tokens: list[str]) -> int:
+def typed_focus_position(prompt: str, prompt_tokens: list[str]) -> int:
     """Which prompt position the notebook follows first.
 
     A token the reader typed is more interesting to follow than a chat-template marker, so
@@ -322,6 +322,14 @@ def default_focus_position(prompt: str, prompt_tokens: list[str]) -> int:
         if any(character.isalnum() for character in readable_spelling(tokens[index])):
             return index
     return typed[-1] if typed else len(tokens) - 1
+
+
+# The default followed position.  True means the notebook follows the deciding (final)
+# prompt position from the start -- where the first token is actually chosen -- rather than
+# the last word the reader typed.  This is the one switch designed to be reverted: the
+# redesign chose "follow the decision" over "follow the typed word" so the reader watches
+# the position that mattered, and op 12 then reads as `focus_is_final` by default.
+FOLLOW_DECIDING_POSITION = True
 
 
 # ── What can and cannot be concluded ─────────────────────────────────────────────
@@ -1221,7 +1229,8 @@ class Operation:
     """One anchored step of the worked notebook.
 
     Every operation is taught in the same order, and the fields are that order:
-    `lede` is the purpose in one sentence; `terms` is the clickable formula; `inputs`,
+    `lede` is the purpose in one sentence; `idea` is what the step is *for* in words a
+    reader can picture without the math; `terms` is the clickable formula; `inputs`,
     `action` and `outputs` say what entered, what happened and what came out; `note` is the
     one misunderstanding worth heading off at this step, if there is one; and `takeaway` is
     how the result is used next.  The full explanation lives on the reference page, behind
@@ -1233,6 +1242,7 @@ class Operation:
     nav: str
     heading: str
     lede: str
+    idea: str = ""
     formula: str = ""
     terms: tuple = ()
     variables: tuple = ()
@@ -1253,6 +1263,9 @@ NOTEBOOK_OPERATIONS = [
         "What this run actually received",
         "Your prompt reached the model as {position_count} token positions, one vocabulary "
         "ID each. {typed_token_summary}",
+        idea="A model does not read your words: it reads a list of ID numbers, one per "
+        "token. This step is that list, with the tokens you typed set apart from the ones "
+        "the chat template added.",
         terms=("text", "→", "[id₀, id₁, …]"),
         tiers=(EVIDENCE_OBSERVED,),
         topic="ids",
@@ -1266,6 +1279,8 @@ NOTEBOOK_OPERATIONS = [
         "From a token ID to a vector",
         "Each token ID picks one row of a learned table, giving the vector of "
         "{hidden_size_text} numbers the layers will compute with.",
+        idea="Every token starts as a single point in a {hidden_size_text}-dimensional "
+        "space. This step is the lookup that turns an ID into that starting vector.",
         terms=("E", "[", "selected token ID", "]", "→", "embedding"),
         variables=("embedding", "E"),
         tiers=(EVIDENCE_OBSERVED, EVIDENCE_CONCEPTUAL, EVIDENCE_DERIVED),
@@ -1285,6 +1300,8 @@ NOTEBOOK_OPERATIONS = [
         "One tensor for the whole sequence",
         "Stacking the {position_count_text} rows gives X, the single tensor the first layer "
         "reads: token positions down, features across.",
+        idea="One point per token is not enough to compute with: the whole sequence is "
+        "stacked into a single tensor so one operation can read every position at once.",
         formula="shape(X) = [{batch_size}, {position_count}, {hidden_size}]",
         variables=("layer_input",),
         tiers=(EVIDENCE_OBSERVED,),
@@ -1301,6 +1318,9 @@ NOTEBOOK_OPERATIONS = [
         "Putting each row on a predictable scale",
         "RMSNorm rescales each position's row on its own, so the layer's arithmetic starts "
         "from vectors of a predictable size.",
+        idea="Numbers that pass through many layers can drift to very different sizes, and "
+        "a projection fed wildly scaled inputs produces wildly scaled outputs. This step "
+        "puts each row on a predictable scale, on its own, before anything is compared.",
         formula="X_norm[i] = X[i] / √(mean(X[i]²) + ε)  ⊙  g",
         terms=("normalized_input", "=", "RMSNorm", "(", "layer_input", ")"),
         variables=("layer_input", "g", "epsilon", "rms", "normalized_input"),
@@ -1320,6 +1340,9 @@ NOTEBOOK_OPERATIONS = [
         "Three learned matrices read the same normalized row and produce a query (what this "
         "position looks for), a key (what it can be matched on) and a value (what it hands "
         "over).",
+        idea="The same normalized row is read by three learned matrices at once, producing "
+        "a query, a key and a value — three separate views of one token, which is what lets "
+        "attention be asymmetric.",
         formula="Q_raw = X_norm W_Qᵀ        K_raw = X_norm W_Kᵀ        "
                 "V_raw = X_norm W_Vᵀ",
         terms=("q", "=", "normalized_input", "@", "W_Q"),
@@ -1340,6 +1363,9 @@ NOTEBOOK_OPERATIONS = [
         "Splitting into heads and marking position",
         "The projections are regrouped into heads, Q and K are rotated by position, and the "
         "shared key/value heads are copied out to the query heads that use them.",
+        idea="The projected features are cut into heads that each run the whole "
+        "compare-and-mix on their own, at the same time, and the query and key are rotated "
+        "so the dot product can depend on where each token sits.",
         formula="Q_raw → reshape to [{query_head_count} × {head_dim}] → "
                 "rotate by position → Q",
         terms=("q", "→", "q_attended"),
@@ -1360,6 +1386,9 @@ NOTEBOOK_OPERATIONS = [
         "Deciding what to read",
         "Each head compares one position's query with the key of every position it may see, "
         "and softmax turns those scores into weights that add up to 1.",
+        idea="Attention decides what to read in two steps: first every query is compared "
+        "with every key to get a score, then those scores become weights that say how much "
+        "of each position to take.",
         formula="S = s·(Q Kᵀ) + M            A = softmax(S)",
         terms=("attention_scores", "→ softmax →", "attention_weights"),
         variables=("q_attended", "k_attended", "QK_raw", "M", "attention_scores",
@@ -1380,6 +1409,9 @@ NOTEBOOK_OPERATIONS = [
         "Collecting what was decided",
         "Each head takes a weighted average of the value vectors, so information from the "
         "positions it attended to flows into this one.",
+        idea="The weights from the step before are used to take a weighted average of the "
+        "values: a position with a heavy weight contributes most of its vector, one with a "
+        "weight near zero contributes almost nothing.",
         formula="Z_h = A_h V_h",
         terms=("Z_head", "=", "attention_weights", "@", "v_attended"),
         variables=("attention_weights", "v_attended", "Z_head"),
@@ -1398,6 +1430,9 @@ NOTEBOOK_OPERATIONS = [
         "Combining the heads",
         "Every head's result is laid side by side and one learned matrix maps them back to "
         "{hidden_size_text} features — the only point at which heads combine.",
+        idea="Each head worked out its own mix of the values independently; this is the one "
+        "step that lays those separate results side by side and maps them back to the "
+        "model's own width so they can be added to what came in.",
         formula="Z_joined = concat(Z_h)            O = Z_joined W_Oᵀ",
         terms=("attention_output", "=", "Z_joined", "@", "W_O"),
         variables=("Z_joined", "W_O", "attention_output"),
@@ -1415,6 +1450,9 @@ NOTEBOOK_OPERATIONS = [
         "Add, refine, add again",
         "The attention result is added to the layer's input, then a feed-forward network "
         "refines each position on its own and its result is added in turn.",
+        idea="Two additions around a refinement: the attention result is added to what came "
+        "in, then a feed-forward network refines each position on its own and its result is "
+        "added back — so information both travels around each branch and is changed by it.",
         formula="H = X + O            F = {ffn_description}            X_next = H + F",
         terms=("layer_output", "=", "H", "+", "F"),
         variables=("layer_input", "attention_output", "H", "H_norm", "W_gate", "W_up",
@@ -1436,6 +1474,9 @@ NOTEBOOK_OPERATIONS = [
         "That completed one layer of {layer_count}",
         "Operations 4 to 10 repeat once per layer, {layer_count} times in all, each with its "
         "own learned parameters, and the token positions stay separate rows throughout.",
+        idea="One layer of {layer_count} is not the whole story: the same block runs again "
+        "on its own output, {layer_count} times, each with its own learned parameters, and "
+        "the positions stay separate rows the whole way.",
         formula="X → layer 0 → layer 1 → … → "
                 "layer {remaining_layer_count} → X_final",
         variables=("layer_output",),
@@ -1453,6 +1494,9 @@ NOTEBOOK_OPERATIONS = [
         "After the last layer, the final prompt position's row is normalized once more and "
         "scored against every vocabulary entry, and the first token is picked from those "
         "scores.",
+        idea="After the last layer, the final position's row is scored against every "
+        "vocabulary entry at once, and the highest score wins — the model produces the "
+        "scores, and a simple rule picks from them.",
         formula="logits = RMSNorm(X_final[{position_count}−1]) W_Uᵀ        "
                 "selected_token_id = argmax(logits)",
         terms=("final_logits", "→ argmax →", "selected token ID"),
@@ -1786,6 +1830,46 @@ NOTEBOOK_TEXT = {
     "margin_line":
         "It leads the runner-up by ≈{margin} — a difference in score, not in probability.",
 
+    # The single concrete thing this run shows at each step — one highlighted line per
+    # operation card's "Your run" pane.  Each reads a number off a captured array and says
+    # what it means; where the run lacks the tensor the builder degrades to a neutral form.
+    "finding_input":
+        "You typed {typed_token_count} of these {position_count} positions; the rest are "
+        "markers the chat template added.",
+    "finding_embed":
+        "The {hidden_size_text} numbers of this token's embedding are its starting point; "
+        "no single coordinate means anything on its own.",
+    "finding_shape":
+        "The whole sequence is one tensor, {position_count_text} rows of {hidden_size_text} "
+        "features — the shape every layer reads and writes.",
+    "finding_norm":
+        "Every value changed, but no number moved between positions: normalization rescales "
+        "each row on its own.",
+    "finding_project":
+        "The width grows from {hidden_size_text} to {q_projection_width_text} for Q — a "
+        "learned matrix computed new numbers, so the projection is wider than the model.",
+    "finding_prepare":
+        "The {q_projection_width_text} query features are read as {query_head_count_text} "
+        "heads of {head_dim_text}; the same numbers, regrouped, not recomputed.",
+    "finding_scores":
+        "For the followed query, the heaviest key is position {heaviest_key} "
+        "({heaviest_spelling}), at {heaviest_percent} of this head's mixing weight.",
+    "finding_mix":
+        "This head's output is a weighted average of {mix_shown} positions, the rest "
+        "blended in; the weights add up to 1, so it is an average, not a sum.",
+    "finding_join":
+        "The {query_head_count_text} heads are laid side by side and mapped back to "
+        "{hidden_size_text} features — the only step at which the heads combine.",
+    "finding_block":
+        "Attention read across positions; the feed-forward network now reads this one "
+        "position on its own, through a gate that lets it express combinations, not sums.",
+    "finding_layers":
+        "Across the {layer_count} layers, the followed position's attention put the most "
+        "head-mean weight on position {most_attended} in layer {most_attended_layer}.",
+    "finding_decide":
+        "The winning score was {winner} and the runner-up {runner_up}; a difference in "
+        "score, and nothing turned either into a probability.",
+
     # The continuation.
     "answer_heading": "THE ANSWER — SELECT ANY TOKEN",
     "timeline_heading": "ONE PASS PER TOKEN",
@@ -1842,6 +1926,20 @@ NOTEBOOK_TEXT_FIELDS = {
     "timeline_next": ("previous", "number", "token"),
     "timeline_stop": ("previous",),
     "timeline_show_all": ("count",),
+    # The per-operation finding line: the fields each one interpolates.  All are read off
+    # captured arrays or `learn_facts()`, so the self-test can fill them with zeros.
+    "finding_input": ("typed_token_count", "position_count"),
+    "finding_embed": ("hidden_size_text",),
+    "finding_shape": ("position_count_text", "hidden_size_text"),
+    "finding_norm": (),
+    "finding_project": ("hidden_size_text", "q_projection_width_text"),
+    "finding_prepare": ("q_projection_width_text", "query_head_count_text", "head_dim_text"),
+    "finding_scores": ("heaviest_key", "heaviest_spelling", "heaviest_percent"),
+    "finding_mix": ("mix_shown",),
+    "finding_join": ("query_head_count_text", "hidden_size_text"),
+    "finding_block": (),
+    "finding_layers": ("layer_count", "most_attended", "most_attended_layer"),
+    "finding_decide": ("winner", "runner_up"),
 }
 
 
@@ -2034,9 +2132,12 @@ def learn_facts(capture: Any) -> dict[str, Any]:
     stop_logit = metadata.get("stop_token_logit")
 
     # The position the notebook follows, and the one that actually chose the token.  The
-    # decision section has to name both, and say which is which, whenever they differ.
-    focus = default_focus_position(getattr(capture, "prompt", ""), prompt_tokens)
+    # decision section has to name both, and say which is which, whenever they differ.  By
+    # default the notebook follows the deciding (final) position; `FOLLOW_DECIDING_POSITION`
+    # is the one switch that reverts it to the last typed word.
+    follow = typed_focus_position(getattr(capture, "prompt", ""), prompt_tokens)
     final = max(prompt_count - 1, 0)
+    focus = final if FOLLOW_DECIDING_POSITION else follow
 
     def spelled(index: int) -> str:
         return repr(readable_spelling(prompt_tokens[index])) if 0 <= index < len(prompt_tokens) else "''"

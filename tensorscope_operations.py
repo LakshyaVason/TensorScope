@@ -551,6 +551,139 @@ def _sink_rule(ctx: NotebookContext) -> QWidget:
     return rule
 
 
+def build_overview(ctx: NotebookContext, on_stage) -> QWidget:
+    """Level 0 (Outcome) and Level 1 (Map): the whole run at a glance.
+
+    Two glances sit above the worked steps, in the input section's preface.  Level 0 is the
+    decision the run made -- the top logits drawn as scores, and the margin between the two
+    highest.  Level 1 is how the run got there: the pipeline the data took, and, per layer,
+    where the deciding position's attention settled.  Neither reconstructs anything -- the
+    scores are the stored vector, the depth rows are head-means of stored weight rows -- so
+    both degrade honestly when the run lacks the tensor.
+
+    `on_stage` is wired to the page's `go_to`: clicking a pipeline box jumps the reader to
+    the operation behind it.  The deciding position, not the followed one: Level 1 maps
+    where the run's attention settled, and the run decided at the final prompt position.
+    """
+    facts = ctx.facts
+    host, body = _panel(12)
+
+    # ── Level 0 · Outcome ──────────────────────────────────────────────────
+    body.addWidget(label(ctx.say('outcome_heading',
+                                 first_token_text=facts['first_token_text'],
+                                 vocab_size_phrase=facts['vocab_size_phrase']),
+                         muted=True))
+
+    logits = getattr(ctx.capture, 'logits', None)
+    trace = getattr(ctx.capture, 'generation_trace', None) or []
+    if logits is None:
+        # Schema 2 kept no score vector, so there is no ranking to draw -- only the known
+        # first token, already named in the heading above.
+        body.addWidget(described_line(ctx.say('outcome_no_logits',
+                                              first_token_text=facts['first_token_text'])))
+    else:
+        flat = np.asarray(logits, dtype=np.float64).reshape(-1)
+        # The top entries, preferring the run's own recorded list so ties read the way it
+        # did, and labelled with the spelling it decoded -- when it kept one.  Schema 3 has
+        # the vector but not the decoded candidates, so those are labelled by token ID.
+        if trace and trace[0].top_candidates:
+            entries = [(int(c['id']), c.get('token', ''), float(c['logit']))
+                       for c in trace[0].top_candidates]
+            chosen = int(ctx.capture.token_ids[0]) if ctx.capture.token_ids else entries[0][0]
+            selected = next((i for i, (id_, *_rest) in enumerate(entries) if id_ == chosen), 0)
+            labels = [token or str(id_) for id_, token, _logit in entries]
+        else:
+            order = list(np.argsort(-flat, kind='stable')[:10])
+            entries = [(int(i), '', float(flat[i])) for i in order]
+            selected = 0
+            labels = [str(id_) for id_, _token, _logit in entries]
+            body.addWidget(label(ctx.say('outcome_spellings_unrecorded'),
+                                 muted=True, small=True))
+        # Raw logits on a raw axis -- never percentages; the ranking and margin below are
+        # the only derived part, and they are badged.
+        plot = ScoreDotPlot([logit for _id, _token, logit in entries], labels, selected,
+                            tokens=ctx.tokens,
+                            caption=ctx.say('outcome_caption',
+                                            final_position=int(facts['final_position'])))
+        body.addWidget(evidence_frame(plot, EVIDENCE_OBSERVED))
+        if len(entries) > 1:
+            margin = float(entries[0][2]) - float(entries[1][2])
+            body.addWidget(badge_row(
+                EvidenceBadge(EVIDENCE_DERIVED, 'the ranking, the argmax and the margin')))
+            body.addWidget(label(ctx.say('outcome_margin', margin=margin),
+                                 muted=True, small=True))
+
+    # ── Level 1 · Map ──────────────────────────────────────────────────────
+    body.addWidget(label(ctx.say('map_heading',
+                                 position_count_text=facts['position_count_text']),
+                         muted=True))
+    # The shape the data took.  The projection to the vocabulary and the choice of one token
+    # are computed and discarded, so those two stages are dashed.  Each box jumps to the
+    # operation behind it.
+    strip = PipelineStrip(
+        [('input', 'token IDs', '[P]'),
+         ('embed', 'embed', f'[P × {facts["hidden_size_text"]}]'),
+         ('layers', 'N × layer', f'[P × {facts["hidden_size_text"]}]'),
+         ('project', 'project', f'[{facts["vocab_size"]}]', True),
+         ('decide', 'choose', 'token', True)],
+        tokens=ctx.tokens, caption=ctx.say('map_pipeline_caption',
+                                           vocab_size_phrase=facts['vocab_size_phrase']))
+    strip.stageClicked.connect(on_stage)
+    body.addWidget(strip)
+
+    # The head-mean weight row for the deciding position, one row per layer.  Typed
+    # positions are emphasised and the layer that put the most of its weight on them is
+    # outlined -- a ranking of stored values, badged derived.
+    depth = [entry for entry in depth_rows(ctx) if entry['weights'] is not None]
+    matrix = (np.asarray([np.asarray(e['weights'], dtype=np.float64) for e in depth],
+                         dtype=np.float64) if depth else np.zeros((0, 0), dtype=np.float64))
+    key_labels = list(ctx.key_spellings())
+    if matrix.ndim == 2 and matrix.shape[1] < len(key_labels):
+        key_labels = key_labels[:matrix.shape[1]]
+
+    if not matrix.size:
+        body.addWidget(label('This run kept no attention weights to map.',
+                             muted=True, small=True))
+        return host
+
+    bands = ctx.bands
+    typed = {index for start, end, name in (bands or [])
+             if name == TYPED_BAND for index in range(start, end)} if bands is not None else set()
+    typed_rows = [(i, e['typed_share']) for i, e in enumerate(depth)
+                  if e['typed_share'] is not None]
+    highlight = max(typed_rows, key=lambda pair: pair[1])[0] if typed_rows else None
+
+    body.addWidget(badge_row(
+        EvidenceBadge(EVIDENCE_DERIVED, 'head-mean attention weight, one row per layer')))
+    body.addWidget(evidence_frame(
+        LayerDepthView(matrix, [str(e['layer']) for e in depth], key_labels,
+                       typed=typed, highlight_row=highlight, tokens=ctx.tokens,
+                       caption=ctx.say('map_depth_caption',
+                                       final_token_text=facts['final_token_text'],
+                                       final_position=int(facts['final_position']))),
+        EVIDENCE_DERIVED))
+
+    if highlight is not None:
+        body.addWidget(badge_row(
+            EvidenceBadge(EVIDENCE_DERIVED, 'the outlined layer')))
+        body.addWidget(label(ctx.say('map_depth_pick',
+                                     pick_layer=str(depth[highlight]['layer']),
+                                     pick_weight=float(depth[highlight]['typed_share'])),
+                             muted=True, small=True))
+    else:
+        # No alignment, so no typed positions and no layer to outline -- say why rather than
+        # leaving the outline's absence unexplained.
+        body.addWidget(label(ctx.say('map_depth_no_bands'), muted=True, small=True))
+
+    sink = sink_callout(ctx, matrix[highlight], averaged=True) if highlight is not None else None
+    if sink is not None:
+        body.addWidget(sink)
+        # The sink note reads a percentage off a head-mean row, so the weights-are-not-
+        # probabilities caveat belongs beside it here.
+        body.addWidget(label(WEIGHTS_NOT_PROBABILITIES, muted=True, small=True))
+    return host
+
+
 def _tracked(ctx: NotebookContext, lines: QVBoxLayout, rows) -> None:
     """The followed features of one or more captured rows, under one derived badge.
 
